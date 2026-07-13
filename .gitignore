@@ -1,0 +1,21 @@
+# Dataset (large audio files stay out of git)
+data/
+!data/.gitkeep
+!data/archives/.gitkeep
+!data/extracted/.gitkeep
+
+# Generated outputs
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+.venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
