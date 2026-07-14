@@ -35,11 +35,15 @@ class FusionModel(nn.Module):
             nn.Linear(256, num_classes),
         )
 
-    def forward_features(self, waveform: torch.Tensor, mfcc: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
+                         praat: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             waveform: (batch, samples) raw audio for the Deep Pathway.
             mfcc:     (batch, 39, frames) features for the Acoustic Pathway.
+            praat:    ignored — accepted so every model shares one call signature
+                      (see src/training/models.py). Phase 6's Model F is the only
+                      variant that consumes it.
         Returns:
             (batch, 896) fused embedding, pre-classification-head.
         """
@@ -47,12 +51,14 @@ class FusionModel(nn.Module):
         acoustic_embedding = self.acoustic_pathway(mfcc)      # (B, 128)
         return torch.cat([latent_embedding, acoustic_embedding], dim=1)
 
-    def forward(self, waveform: torch.Tensor, mfcc: torch.Tensor) -> torch.Tensor:
+    def forward(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
+                praat: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             waveform: (batch, samples) raw audio for the Deep Pathway.
             mfcc:     (batch, 39, frames) features for the Acoustic Pathway.
+            praat:    ignored — see forward_features.
         Returns:
             (batch, num_classes) classification logits.
         """
-        return self.classifier(self.forward_features(waveform, mfcc))
+        return self.classifier(self.forward_features(waveform, mfcc, praat))

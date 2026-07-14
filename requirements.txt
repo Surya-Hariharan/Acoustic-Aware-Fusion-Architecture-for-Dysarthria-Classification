@@ -1,12 +1,18 @@
-torch
-torchaudio
-soundfile
-transformers
-peft
-pandas
-numpy
-matplotlib
-seaborn
-scikit-learn
-tensorboard
-praat-parselmouth
+# GPU training: install torch/torchaudio from the CUDA-enabled index first, e.g.
+#   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+# then this file (plain PyPI has CPU-only wheels under these bare version numbers).
+torch==2.5.1
+torchaudio==2.5.1
+soundfile==0.14.0
+transformers==5.5.4
+peft==0.19.1
+pandas==2.3.3
+numpy==2.2.6
+scipy==1.15.3
+matplotlib==3.10.8
+seaborn==0.13.2
+scikit-learn==1.7.2
+tensorboard==2.21.0
+praat-parselmouth==0.4.7
+tqdm==4.67.3
+ipywidgets==8.1.8

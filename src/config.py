@@ -18,6 +18,7 @@ ARCHIVE_DIR  = DATA_DIR / "archives"            # place UASpeech .tgz files here
 AUDIO_DIR    = DATA_DIR / "extracted"           # extracted .wav files land here
 OUTPUT_DIR   = PROJECT_ROOT / "outputs"         # reports / CSVs
 FIGURE_DIR   = OUTPUT_DIR / "figures"           # saved plots
+ERROR_FIGURE_DIR = FIGURE_DIR / "errors"        # Phase 5: per-utterance error diagnostics
 MANIFEST_PATH = OUTPUT_DIR / "m6_manifest.csv"  # scanned+filtered+labeled M6 utterances
 PRAAT_FEATURES_PATH = OUTPUT_DIR / "praat_features.csv"  # Phase 4: per-utterance acoustic features
 
@@ -110,6 +111,14 @@ LORA_ALPHA         = 16
 LORA_DROPOUT       = 0.1
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj"]   # self-attention layers
 
+# Phase 6: attention-based fusion. The 768-dim deep and 128-dim acoustic frame
+# sequences are projected into a shared FUSION_ATTN_DIM space so cross-attention
+# between them is well-defined (queries and keys must share a dimension).
+FUSION_ATTN_DIM     = 256
+FUSION_ATTN_HEADS   = 4          # 256 / 4 = 64 dims per head
+FUSION_ATTN_DROPOUT = 0.1
+PRAAT_EMBED_DIM     = 256        # Praat pathway (Model F): 30 features -> one token
+
 # ---------------------------------------------------------------------------
 # Training (train.py)
 # ---------------------------------------------------------------------------
@@ -134,6 +143,6 @@ DEFAULT_SEED           = 42
 def ensure_directories() -> None:
     """Create every project directory that the pipeline writes to or reads from."""
     for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, OUTPUT_DIR, FIGURE_DIR,
-                       CHECKPOINT_DIR, LOG_DIR, PREDICTIONS_DIR, METRICS_DIR,
-                       CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR):
+                       ERROR_FIGURE_DIR, CHECKPOINT_DIR, LOG_DIR, PREDICTIONS_DIR,
+                       METRICS_DIR, CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR):
         directory.mkdir(parents=True, exist_ok=True)

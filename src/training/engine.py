@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.console import progress
 from src.training.metrics import compute_metrics
 
 
@@ -25,13 +26,15 @@ class EpochResult:
     y_pred: Optional[np.ndarray] = None
     y_prob: Optional[np.ndarray] = None
     speaker_ids: Optional[List[str]] = None
+    filenames: Optional[List[str]] = None     # utterance identity, for Phase 5
     embeddings: Optional[np.ndarray] = None
 
 
 def run_epoch(model: nn.Module, loader, criterion: nn.Module,
               optimizer: Optional[torch.optim.Optimizer], device: torch.device,
               scaler: torch.amp.GradScaler, grad_clip_norm: float, task: str,
-              train: bool, collect_embeddings: bool = False) -> EpochResult:
+              train: bool, collect_embeddings: bool = False,
+              description: str = "") -> EpochResult:
     """
     Run one full pass over `loader`.
 
@@ -47,24 +50,33 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
     amp_enabled = scaler.is_enabled()
 
     running_loss, num_samples = 0.0, 0
-    all_true, all_pred, all_prob, all_speakers, all_embeddings = [], [], [], [], []
+    all_true, all_pred, all_prob, all_embeddings = [], [], [], []
+    all_speakers, all_filenames = [], []
 
     grad_context = torch.enable_grad() if train else torch.no_grad()
+    batches = (progress(loader, description, total=len(loader), leave=False, unit="batch")
+               if description else loader)
+
     with grad_context:
-        for batch in loader:
+        for batch in batches:
             waveform = batch["waveform"].squeeze(1).to(device, non_blocking=True)
             mfcc = batch["mfcc"].to(device, non_blocking=True)
             labels = batch[label_key].to(device, non_blocking=True)
+
+            # Present only when the Dataset was built with a Praat table, i.e.
+            # for Phase 6's Model F. Every other model ignores it (see
+            # src/training/models.py), so the engine needs no per-model branching.
+            praat = batch["praat"].to(device, non_blocking=True) if "praat" in batch else None
 
             if train:
                 optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=device_type, enabled=amp_enabled):
                 if collect_embeddings:
-                    features = model.forward_features(waveform, mfcc)
+                    features = model.forward_features(waveform, mfcc, praat)
                     logits = model.classifier(features)
                 else:
-                    logits = model(waveform, mfcc)
+                    logits = model(waveform, mfcc, praat)
                 loss = criterion(logits, labels)
 
             if train:
@@ -84,6 +96,7 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
             all_pred.append(preds.cpu().numpy())
             all_prob.append((probs[:, 1] if task == "detection" else probs).cpu().numpy())
             all_speakers.extend(batch["speaker_id"])
+            all_filenames.extend(batch["filename"])
             if collect_embeddings:
                 all_embeddings.append(features.detach().float().cpu().numpy())
 
@@ -95,7 +108,8 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
     embeddings = np.concatenate(all_embeddings) if collect_embeddings else None
 
     return EpochResult(loss=avg_loss, metrics=metrics, y_true=y_true, y_pred=y_pred,
-                       y_prob=y_prob, speaker_ids=all_speakers, embeddings=embeddings)
+                       y_prob=y_prob, speaker_ids=all_speakers,
+                       filenames=all_filenames, embeddings=embeddings)
 
 
 def build_optimizer(model: nn.Module, lr_head: float, lr_backbone: float,

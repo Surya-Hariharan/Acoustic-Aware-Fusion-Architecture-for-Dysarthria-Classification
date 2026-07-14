@@ -57,16 +57,24 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
     cm = confusion_matrix(y_true, y_pred, labels=labels)
     specificity = _binary_specificity(cm) if task == "detection" else _macro_specificity(cm)
 
-    try:
-        if task == "detection":
-            auroc = roc_auc_score(y_true, y_prob)
-        else:
-            auroc = roc_auc_score(y_true, y_prob, labels=labels,
-                                  multi_class="ovr", average="macro")
-    except ValueError:
-        # Happens when a fold's test/val split doesn't contain every class
-        # (e.g. a tiny smoke-test subset) — AUROC is undefined, not zero.
+    # Every LOSO detection fold's held-out speaker is entirely one class (see
+    # src.training.runner), so y_true is single-valued on most folds — checking
+    # this up front avoids sklearn's UndefinedMetricWarning firing on every one
+    # of those (otherwise expected, not a bug) instead of only computing AUROC
+    # when it is actually defined.
+    if len(np.unique(y_true)) < 2:
         auroc = float("nan")
+    else:
+        try:
+            if task == "detection":
+                auroc = roc_auc_score(y_true, y_prob)
+            else:
+                auroc = roc_auc_score(y_true, y_prob, labels=labels,
+                                      multi_class="ovr", average="macro")
+        except ValueError:
+            # Multiclass: individual classes can still be absent even though
+            # more than one is present overall — undefined, not zero.
+            auroc = float("nan")
 
     return {
         "accuracy": float(accuracy),

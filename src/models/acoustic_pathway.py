@@ -36,6 +36,24 @@ class AcousticPathway(nn.Module):
         )
         self.pool = nn.AdaptiveAvgPool1d(1)                   # global average pool
 
+    def forward_sequence(self, mfcc: torch.Tensor) -> torch.Tensor:
+        """
+        The per-frame convolutional feature map, *before* the global average pool
+        that forward() applies — the acoustic counterpart to
+        DeepPathway.forward_sequence, and for the same Phase 6 reason.
+
+        Args:
+            mfcc: (batch, 39, frames) — or (batch, 1, 39, frames) from the dataset.
+        Returns:
+            (batch, frames', embed_dim) — the two MaxPool1d(2) stages quarter the
+            frame count, so a 401-frame MFCC becomes ~100 tokens of 128 dims.
+            Note the (B, T, C) layout: nn.MultiheadAttention(batch_first=True)
+            wants channels last, whereas Conv1d emits (B, C, T).
+        """
+        if mfcc.dim() == 4:                                   # (B, 1, 39, T)
+            mfcc = mfcc.squeeze(1)
+        return self.conv(mfcc).transpose(1, 2)                # (B, C, T) -> (B, T, C)
+
     def forward(self, mfcc: torch.Tensor) -> torch.Tensor:
         """
         Args:

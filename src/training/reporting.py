@@ -20,11 +20,18 @@ from sklearn.metrics import roc_curve
 from src import config
 
 
-def save_predictions(path: Path, speaker_ids, y_true: np.ndarray, y_pred: np.ndarray,
-                     y_prob: np.ndarray, task: str) -> None:
+def save_predictions(path: Path, filenames, speaker_ids, y_true: np.ndarray,
+                     y_pred: np.ndarray, y_prob: np.ndarray, task: str) -> None:
+    """Per-utterance predictions for one fold.
+
+    `filename` is the first column and is what makes Phase 5 possible: it joins
+    a row back to its audio file (for spectrograms) and to outputs/praat_features.csv
+    (for the error/feature correlation). speaker_id alone cannot do either.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     class_names = config.DETECTION_CLASS_NAMES if task == "detection" else config.SEVERITY_CLASS_NAMES
     df = pd.DataFrame({
+        "filename": filenames,
         "speaker_id": speaker_ids,
         "y_true": y_true,
         "y_true_label": [class_names[i] for i in y_true],
@@ -95,9 +102,19 @@ def save_roc_curve(path: Path, y_true: np.ndarray, y_prob: np.ndarray, task: str
     plt.close(fig)
 
 
-def save_embeddings(path: Path, embeddings: np.ndarray, y_true: np.ndarray, speaker_ids) -> None:
+def save_embeddings(path: Path, embeddings: np.ndarray, y_true: np.ndarray,
+                    speaker_ids, filenames=None) -> None:
+    """Test-fold embeddings, keyed by filename so Phase 5's embedding map can be
+    coloured by whether each point was classified correctly."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, embeddings=embeddings, y_true=y_true, speaker_ids=np.asarray(speaker_ids))
+    arrays = {
+        "embeddings": embeddings,
+        "y_true": y_true,
+        "speaker_ids": np.asarray(speaker_ids),
+    }
+    if filenames is not None:
+        arrays["filenames"] = np.asarray(filenames)
+    np.savez(path, **arrays)
 
 
 def aggregate_fold_metrics(metrics_dir: Path, run_name: str,

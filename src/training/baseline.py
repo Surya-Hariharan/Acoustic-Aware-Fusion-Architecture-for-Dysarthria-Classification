@@ -21,7 +21,8 @@ from sklearn.svm import LinearSVC
 from torch.utils.data import DataLoader
 
 from src import config
-from src.console import print_header, print_kv, print_subheader, print_table
+from src.console import (print_header, print_kv, print_metrics, print_subheader,
+                         print_table, progress)
 from src.dataset import UASpeechDataset
 from src.models.deep_pathway import DeepPathway
 from src.training.data import TASK_LABEL_COLUMN, TASK_LABEL_MAP
@@ -64,11 +65,10 @@ def extract_frozen_embeddings(df: pd.DataFrame, device: Optional[torch.device] =
     print_kv("Device", device)
 
     embeddings = []
-    for i, batch in enumerate(loader):
+    for batch in progress(loader, "Frozen wav2vec 2.0 forward", total=len(loader),
+                          unit="batch"):
         waveform = batch["waveform"].squeeze(1).to(device, non_blocking=True)
         embeddings.append(model(waveform).cpu().numpy())
-        if (i + 1) % 200 == 0:
-            print_kv(f"  batch {i + 1}/{len(loader)}", f"{(i + 1) * batch_size} utterances done")
     embeddings = np.concatenate(embeddings)
 
     np.savez(EMBEDDING_CACHE_PATH, embeddings=embeddings,
@@ -97,14 +97,15 @@ def run_svm_baseline(df: pd.DataFrame, task: str, embeddings: np.ndarray,
     print_kv("Task", task)
     print_kv("Run name", run_name)
 
-    fold_iter = build_folds(df, task)
+    fold_iter = list(build_folds(df, task))
     if max_folds is not None:
-        fold_iter = list(fold_iter)[:max_folds]
+        fold_iter = fold_iter[:max_folds]
 
     fold_metrics = []
     pooled_true, pooled_pred, pooled_prob = [], [], []
 
-    for fold_id, train_df, test_df in fold_iter:
+    for fold_id, train_df, test_df in progress(fold_iter, "Fitting SVM per LOSO fold",
+                                               total=len(fold_iter), unit="fold"):
         train_idx = [embed_index[p] for p in train_df["Filepath"]]
         test_idx = [embed_index[p] for p in test_df["Filepath"]]
         X_train, X_test = embeddings[train_idx], embeddings[test_idx]
@@ -121,9 +122,10 @@ def run_svm_baseline(df: pd.DataFrame, task: str, embeddings: np.ndarray,
 
         metrics = compute_metrics(y_test, y_pred, y_prob, task)
         speakers = test_df["Speaker_ID"].to_numpy()
+        filenames = test_df["Filename"].to_numpy()
 
         save_predictions(config.PREDICTIONS_DIR / run_name / f"{fold_id}.csv",
-                         speakers, y_test, y_pred, y_prob, task)
+                         filenames, speakers, y_test, y_pred, y_prob, task)
         save_metrics(config.METRICS_DIR / run_name / f"{fold_id}.json",
                     {"fold": fold_id, **metrics})
         save_confusion_matrix(
@@ -137,7 +139,6 @@ def run_svm_baseline(df: pd.DataFrame, task: str, embeddings: np.ndarray,
         pooled_true.append(y_test)
         pooled_pred.append(y_pred)
         pooled_prob.append(y_prob)
-        print(f"    fold {fold_id}: " + ", ".join(f"{k}={v:.3f}" for k, v in metrics.items()))
 
     if not fold_metrics:
         print_kv("Result", "No folds matched max_folds; nothing was fit.")
@@ -160,8 +161,7 @@ def run_svm_baseline(df: pd.DataFrame, task: str, embeddings: np.ndarray,
 
     print_subheader("Per-fold mean +/- std")
     print_table(summary.reset_index().rename(columns={"index": "metric"}))
-    print_subheader("Pooled across all folds (the base-paper-comparable numbers)")
-    for name, value in pooled_metrics.items():
-        print_kv(name, f"{value:.4f}")
+    print_metrics(pooled_metrics,
+                  title="Pooled across all folds (the base-paper-comparable numbers)")
 
     return summary, pooled_metrics
