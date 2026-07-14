@@ -1,8 +1,12 @@
 torch
 torchaudio
+soundfile
 transformers
 peft
 pandas
 numpy
 matplotlib
 seaborn
+scikit-learn
+tensorboard
+praat-parselmouth

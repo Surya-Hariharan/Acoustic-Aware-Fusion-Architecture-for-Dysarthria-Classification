@@ -35,6 +35,18 @@ class FusionModel(nn.Module):
             nn.Linear(256, num_classes),
         )
 
+    def forward_features(self, waveform: torch.Tensor, mfcc: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            waveform: (batch, samples) raw audio for the Deep Pathway.
+            mfcc:     (batch, 39, frames) features for the Acoustic Pathway.
+        Returns:
+            (batch, 896) fused embedding, pre-classification-head.
+        """
+        latent_embedding = self.deep_pathway(waveform)        # (B, 768)
+        acoustic_embedding = self.acoustic_pathway(mfcc)      # (B, 128)
+        return torch.cat([latent_embedding, acoustic_embedding], dim=1)
+
     def forward(self, waveform: torch.Tensor, mfcc: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -43,7 +55,4 @@ class FusionModel(nn.Module):
         Returns:
             (batch, num_classes) classification logits.
         """
-        latent_embedding = self.deep_pathway(waveform)        # (B, 768)
-        acoustic_embedding = self.acoustic_pathway(mfcc)      # (B, 128)
-        fused = torch.cat([latent_embedding, acoustic_embedding], dim=1)
-        return self.classifier(fused)
+        return self.classifier(self.forward_features(waveform, mfcc))

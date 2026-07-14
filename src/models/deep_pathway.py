@@ -18,20 +18,33 @@ from src import config
 
 
 class DeepPathway(nn.Module):
-    """wav2vec 2.0 with LoRA on self-attention, mean-pooled to a 768-dim vector."""
+    """wav2vec 2.0, mean-pooled to a 768-dim vector.
 
-    def __init__(self):
+    use_lora=True  (default) injects LoRA adapters into the self-attention
+                   projections and leaves the rest of the backbone frozen —
+                   the team spec's adaptable Deep Pathway.
+    use_lora=False loads the plain backbone with every parameter frozen —
+                   reproduces the base paper's frozen wav2vec 2.0 feature
+                   extractor, used as an ablation baseline.
+    """
+
+    def __init__(self, use_lora: bool = True):
         super().__init__()
         backbone = Wav2Vec2Model.from_pretrained(config.WAV2VEC_MODEL_NAME)
 
-        lora_config = LoraConfig(
-            r=config.LORA_RANK,
-            lora_alpha=config.LORA_ALPHA,
-            lora_dropout=config.LORA_DROPOUT,
-            target_modules=config.LORA_TARGET_MODULES,
-            bias="none",
-        )
-        self.wav2vec = get_peft_model(backbone, lora_config)
+        if use_lora:
+            lora_config = LoraConfig(
+                r=config.LORA_RANK,
+                lora_alpha=config.LORA_ALPHA,
+                lora_dropout=config.LORA_DROPOUT,
+                target_modules=config.LORA_TARGET_MODULES,
+                bias="none",
+            )
+            self.wav2vec = get_peft_model(backbone, lora_config)
+        else:
+            for param in backbone.parameters():
+                param.requires_grad = False
+            self.wav2vec = backbone
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """

@@ -18,6 +18,17 @@ ARCHIVE_DIR  = DATA_DIR / "archives"            # place UASpeech .tgz files here
 AUDIO_DIR    = DATA_DIR / "extracted"           # extracted .wav files land here
 OUTPUT_DIR   = PROJECT_ROOT / "outputs"         # reports / CSVs
 FIGURE_DIR   = OUTPUT_DIR / "figures"           # saved plots
+MANIFEST_PATH = OUTPUT_DIR / "m6_manifest.csv"  # scanned+filtered+labeled M6 utterances
+PRAAT_FEATURES_PATH = OUTPUT_DIR / "praat_features.csv"  # Phase 4: per-utterance acoustic features
+
+# Training pipeline outputs (train.py)
+CHECKPOINT_DIR       = OUTPUT_DIR / "checkpoints"
+LOG_DIR              = OUTPUT_DIR / "logs"
+PREDICTIONS_DIR      = OUTPUT_DIR / "predictions"
+METRICS_DIR          = OUTPUT_DIR / "metrics"
+CONFUSION_MATRIX_DIR = OUTPUT_DIR / "confusion_matrix"
+ROC_DIR              = OUTPUT_DIR / "roc"
+EMBEDDINGS_DIR       = OUTPUT_DIR / "embeddings"
 
 ARCHIVE_FILES = [
     "UASpeech_normalized_C.tgz",                # healthy controls
@@ -99,8 +110,30 @@ LORA_ALPHA         = 16
 LORA_DROPOUT       = 0.1
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj"]   # self-attention layers
 
+# ---------------------------------------------------------------------------
+# Training (train.py)
+# ---------------------------------------------------------------------------
+NUM_CLASSES = {"detection": 2, "severity": 4}
+
+# The manifest carries text labels; these are the fixed class orderings used
+# for confusion matrices, ROC curves, and one-hot/softmax indexing.
+DETECTION_CLASS_NAMES = ["Healthy Control", "Dysarthric Patient"]
+SEVERITY_CLASS_NAMES  = ["Very Low", "Low", "Mid", "High"]
+
+DEFAULT_EPOCHS        = 20
+DEFAULT_BATCH_SIZE    = 8
+DEFAULT_LR_HEAD       = 1e-3     # classifier head / acoustic pathway / LoRA adapters
+DEFAULT_LR_BACKBONE   = 1e-4     # wav2vec 2.0 backbone (only when fine-tuned)
+DEFAULT_WEIGHT_DECAY  = 1e-2
+DEFAULT_PATIENCE      = 5        # early stopping, in epochs without improvement
+DEFAULT_GRAD_CLIP_NORM = 1.0
+DEFAULT_VAL_FRACTION  = 0.1      # held out from each fold's train split
+DEFAULT_SEED           = 42
+
 
 def ensure_directories() -> None:
     """Create every project directory that the pipeline writes to or reads from."""
-    for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, OUTPUT_DIR, FIGURE_DIR):
+    for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, OUTPUT_DIR, FIGURE_DIR,
+                       CHECKPOINT_DIR, LOG_DIR, PREDICTIONS_DIR, METRICS_DIR,
+                       CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR):
         directory.mkdir(parents=True, exist_ok=True)

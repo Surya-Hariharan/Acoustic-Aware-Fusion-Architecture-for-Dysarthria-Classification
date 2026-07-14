@@ -129,6 +129,38 @@ def filter_mic_channel(df: pd.DataFrame,
     return df_mic
 
 
+def validate_wav_headers(df_mic: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop files whose RIFF/WAVE header is missing or malformed - a handful
+    of UA-Speech files extracted zero-filled (see README "Data verification
+    note"). Cheap (12-byte read, no decode) and confirmed to match a full
+    soundfile.info() pass across the M6 set: same 39 files either way.
+    """
+    print_subheader("WAV Header Validation")
+
+    def _has_valid_header(filepath: str) -> bool:
+        try:
+            with open(filepath, "rb") as f:
+                header = f.read(12)
+        except OSError:
+            return False
+        return len(header) == 12 and header[0:4] == b"RIFF" and header[8:12] == b"WAVE"
+
+    valid_mask = df_mic["Filepath"].map(_has_valid_header)
+    invalid = df_mic[~valid_mask]
+
+    print_kv("Files checked", len(df_mic))
+    print_kv("Corrupted (dropped)", len(invalid))
+    if not invalid.empty:
+        print_series(invalid.groupby("Speaker_ID").size())
+        print_status(f"{len(invalid)} corrupted file(s) excluded from the manifest "
+                     f"- see the dropped rows' Speaker_ID/WordCode above", ok=False)
+    else:
+        print_status("All files have valid RIFF/WAVE headers")
+
+    return df_mic[valid_mask].copy()
+
+
 def check_word_counts(df_mic: pd.DataFrame) -> pd.Series:
     """Per-speaker utterance count check against the expected 765 words."""
     print_subheader(f"Per-Speaker Word Counts (target: {config.WORDS_PER_SPEAKER})")

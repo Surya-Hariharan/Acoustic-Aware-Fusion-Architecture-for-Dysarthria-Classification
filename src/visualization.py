@@ -12,8 +12,11 @@ import seaborn as sns
 
 from src import config
 from src.console import print_header, print_kv
+from src.praat import FEATURE_COLUMNS
 
 sns.set_style("whitegrid")
+
+PRAAT_GROUP_ORDER = ["Healthy", "Very Low", "Low", "Mid", "High"]
 
 
 def _finish(fig, filename: str, show: bool) -> str:
@@ -97,6 +100,40 @@ def plot_dataset_dashboard(df: pd.DataFrame, show: bool = False) -> str:
 
     fig.tight_layout()
     return _finish(fig, "uaspeech_dashboard.png", show)
+
+
+def plot_praat_feature_comparison(features_df: pd.DataFrame, show: bool = False) -> str:
+    """Grid of box plots: every Praat feature, split Healthy/Very Low/Low/Mid/High."""
+    df = features_df.copy()
+    df["Group_Order"] = df["Severity"].replace("N/A (Control)", "Healthy")
+
+    n_cols = 3
+    n_rows = -(-len(FEATURE_COLUMNS) // n_cols)  # ceil division
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows))
+    axes = axes.flatten()
+
+    for ax, feature in zip(axes, FEATURE_COLUMNS):
+        sns.boxplot(x="Group_Order", y=feature, data=df, order=PRAAT_GROUP_ORDER,
+                   hue="Group_Order", palette="viridis", legend=False, ax=ax)
+        ax.set_title(feature, fontsize=11)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.tick_params(axis="x", rotation=30)
+
+    for ax in axes[len(FEATURE_COLUMNS):]:
+        ax.axis("off")
+
+    fig.suptitle("Praat Acoustic Features by Severity Group", fontsize=18, y=1.01)
+    fig.tight_layout()
+    return _finish(fig, "praat_severity_comparison.png", show)
+
+
+def build_praat_group_summary(features_df: pd.DataFrame) -> pd.DataFrame:
+    """Mean +/- std per Praat feature per severity group, ordered Healthy -> High."""
+    df = features_df.copy()
+    df["Group_Order"] = df["Severity"].replace("N/A (Control)", "Healthy")
+    summary = df.groupby("Group_Order")[list(FEATURE_COLUMNS)].agg(["mean", "std"])
+    return summary.reindex(PRAAT_GROUP_ORDER)
 
 
 def run_eda(df: pd.DataFrame, show: bool = False) -> None:
