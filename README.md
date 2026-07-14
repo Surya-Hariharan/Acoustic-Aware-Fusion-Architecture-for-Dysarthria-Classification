@@ -22,7 +22,7 @@ LoRA keeps the backbone adaptable without overfitting on a small clinical corpus
 
 ## Dataset
 
-UA-Speech: 765 isolated words per speaker across three blocks (B1–B3), captured by an eight-microphone array at 16 kHz. The audio is **not** redistributed here — obtain it from the dataset authors and place the archives in `data/archives/`.
+UA-Speech: 765 isolated words per speaker across three blocks (B1–B3), captured by an eight-microphone array at 16 kHz. The audio is **not** redistributed here — obtain it from the dataset authors and place the archives in `data/archives/`. Corpus reference material (word-level MLF alignments, the lexicon/word list, the base-paper PDF, the corpus's own license and readme) lives in `data/uaspeech_corpus_docs/`, kept separate from the audio the pipeline actually scans.
 
 Following the base-paper protocol, this project uses **microphone channel M6 only**, across all blocks and all word categories, with no word-type filtering.
 
@@ -69,7 +69,9 @@ notebooks/
   01_data_pipeline.ipynb       Interactive driver; imports src/, no duplicated logic
 data/
   archives/                    Place the UA-Speech .tgz archives here
-  extracted/                   Extracted .wav files land here
+  extracted/                   Extracted .wav files land here (one folder per speaker)
+  uaspeech_corpus_docs/        Corpus reference material: mlf/, doc/ (lexicon, wordlist,
+                                base-paper PDF), readme_UASpeech.txt, UASPEECH_LICENSE.txt
 outputs/                       Generated figures and the M6 manifest (gitignored)
 src/
   config.py                    Paths, speaker ground truth, label maps, hyperparameters
@@ -117,4 +119,12 @@ Both paths scan the extracted audio, verify the 28-speaker ground truth, write E
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The licence covers this source code only; the UA-Speech database carries its own separate licence and data use agreement.
+MIT — see [LICENSE](LICENSE). The licence covers this source code only; the UA-Speech database carries its own separate licence and data use agreement (see `data/uaspeech_corpus_docs/UASPEECH_LICENSE.txt` once the corpus is downloaded — academic/government research use only, no redistribution).
+
+## Acknowledgments
+
+With thanks and regards to the creators and maintainers of the UA-Speech corpus — H. Kim, M. Hasegawa-Johnson, A. Perlman, J. Gunderson, T. Huang, K. Watkin, and S. Frame at the University of Illinois at Urbana-Champaign — for building and sharing this dataset for dysarthric speech research:
+
+> H. Kim, M. Hasegawa-Johnson, A. Perlman, J. Gunderson, T. Huang, K. Watkin, and S. Frame, "Dysarthric Speech Database for Universal Access Research," *Interspeech*, 2008.
+
+This project would not be possible without their work, or without the participants who contributed their speech recordings to advance assistive-technology research.

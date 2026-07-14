@@ -4,6 +4,10 @@ data/
 !data/archives/.gitkeep
 !data/extracted/.gitkeep
 
+# Safety net: never commit raw corpus audio/alignment files, wherever they land
+*.wav
+*.mlf
+
 # Generated outputs
 outputs/
 
