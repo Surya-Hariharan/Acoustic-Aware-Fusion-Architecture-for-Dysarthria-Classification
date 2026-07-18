@@ -36,6 +36,7 @@ PITCH_KEYS = ("f0_mean", "f0_max", "f0_min", "f0_std", "f0_range")
 JITTER_SHIMMER_KEYS = ("jitter_local", "jitter_rap", "jitter_ppq5", "jitter_ddp",
                        "shimmer_local", "shimmer_apq3", "shimmer_apq11", "shimmer_dda")
 HNR_KEYS = ("hnr_mean", "hnr_std", "hnr_min")
+CPPS_KEYS = ("cpps",)
 FORMANT_KEYS = ("f1_mean", "f2_mean", "f3_mean",
                 "f1_std", "f2_std", "f3_std", "f2_f1_ratio")
 INTENSITY_KEYS = ("intensity_mean", "intensity_max", "intensity_min", "intensity_std")
@@ -45,6 +46,7 @@ FEATURE_COLUMNS = (
     *PITCH_KEYS,
     *JITTER_SHIMMER_KEYS,
     *HNR_KEYS,
+    *CPPS_KEYS,
     *FORMANT_KEYS,
     *INTENSITY_KEYS,
     *RHYTHM_KEYS,
@@ -135,6 +137,28 @@ def extract_hnr_features(sound: parselmouth.Sound) -> Dict[str, float]:
         }
     except Exception:
         return {k: np.nan for k in HNR_KEYS}
+
+
+def extract_cpps_features(sound: parselmouth.Sound) -> Dict[str, float]:
+    """Cepstral Peak Prominence, smoothed (dB): the height of the rahmonic
+    peak above a regression line through the cepstrum's noise floor.
+
+    This is the one voice-quality measure in the set that does NOT depend on
+    a reliable glottal-pulse or pitch track - jitter/shimmer/voice_breaks all
+    fall back to NaN when _safe_point_process() can't lock onto periodicity,
+    which happens disproportionately on the most severely dysarthric clips
+    (see shimmer_apq11's ~4.5% NaN rate here). CPPS is computed directly off
+    the power cepstrum, so it stays measurable exactly where the periodicity-
+    based measures break down, and low CPPS is one of the most consistently
+    replicated acoustic correlates of breathy/dysphonic voice quality in the
+    voice-disorder literature."""
+    try:
+        cepstrogram = call(sound, "To PowerCepstrogram", 60, 0.002, 5000, 50)
+        cpps = call(cepstrogram, "Get CPPS", True, 0.02, 0.0005, 60, 330,
+                    0.05, "Parabolic", 0.001, 0, "Straight", "Robust")
+        return {"cpps": float(cpps)}
+    except Exception:
+        return {k: np.nan for k in CPPS_KEYS}
 
 
 def extract_formant_features(sound: parselmouth.Sound) -> Dict[str, float]:
@@ -236,6 +260,7 @@ def extract_praat_features(filepath: str) -> Dict[str, float]:
         features.update({k: np.nan for k in PITCH_KEYS})
     features.update(extract_jitter_shimmer_features(sound, point_process))
     features.update(extract_hnr_features(sound))
+    features.update(extract_cpps_features(sound))
     features.update(extract_formant_features(sound))
     features.update(extract_intensity_features(sound))
     features.update(extract_rhythm_features(sound, pitch, point_process))
@@ -311,7 +336,7 @@ def praat_group_significance(features_df: pd.DataFrame) -> pd.DataFrame:
     are bounded and heavily skewed, so an ANOVA's normality assumption does not
     hold. NaNs are dropped per feature (a clip Praat could not measure should not
     count as a zero), and p is Bonferroni-corrected across the feature set, since
-    testing ~28 features at once would otherwise manufacture significance.
+    testing the full feature set at once would otherwise manufacture significance.
 
     Returns one row per feature - H, p, p_adj, significant, n_used - sorted most
     significant first. This is what makes "these measures separate the severity

@@ -14,16 +14,17 @@ what remains for them is GPU time, not code.
 | 1 — Training pipeline | done | done |
 | 2 — ICASSP baseline | done | detection done; severity + full-scale pending |
 | 3 — Ablation study | done (six variants) | pending — needs the full 28-fold GPU run |
-| 4 — Praat analysis | done (30 features + significance test) | **re-run needed** — see below |
+| 4 — Praat analysis | done (31 features + significance test) | **re-run needed** — see below |
 | 5 — Error analysis | done | pending — needs a re-trained run (see below) |
 | 6 — Attention fusion | steps 1–2 done (Models E, F) | pending — needs the full run |
 
 **Two ordering dependencies to know about before running anything:**
 
-1. `outputs/praat_features.csv` was generated when `src/praat.py` extracted 18
-   features; it now extracts 30. The cache is detected as stale and
-   re-extracted automatically, but Stage 1 of `notebooks/03_praat_analysis.ipynb`
-   must be re-run once (~25–30 min) — and **Model F cannot train until it is**.
+1. `outputs/praat_features.csv` was last regenerated at the 30-feature schema;
+   `src/praat.py` now extracts 31 (CPPS was added — see Phase 4). The cache is
+   detected as stale by column set and re-extracted automatically, but Stage 1
+   of `notebooks/03_praat_analysis.ipynb` must be re-run once (~25–30 min) —
+   and **Model F cannot train until it is**.
 2. Predictions now carry a `filename` column, without which Phase 5 cannot join
    an error back to its audio or to the Praat features. Prediction CSVs written
    before this change (the smoke test, `baseline_svm_detection`) lack it, so
@@ -128,15 +129,16 @@ diffed on the metric set Phase 1 already computes: accuracy, precision, recall
 
 ## Phase 4 — Praat acoustic analysis (code done)
 
-`src/praat.py` extracts **30** features per utterance from the ORIGINAL audio
+`src/praat.py` extracts **31** features per utterance from the ORIGINAL audio
 (not the VAD-trimmed, zero-padded 4-second window the pathways train on —
-jitter, shimmer, HNR and formants are only meaningful on natural speech):
+jitter, shimmer, HNR, CPPS and formants are only meaningful on natural speech):
 
 | Group | Features |
 |---|---|
 | Pitch | `f0_mean/max/min/std/range` — std and range capture monopitch |
 | Perturbation | jitter `local/rap/ppq5/ddp`, shimmer `local/apq3/apq11/dda` |
 | Noise | `hnr_mean/std/min` |
+| Voice quality | `cpps` — cepstral peak prominence (smoothed); unlike jitter/shimmer it does not depend on a reliable pitch-period track, so it stays measurable on the most severely dysarthric clips where periodicity-based measures go NaN |
 | Articulation | `f1/f2/f3` mean+std, `f2_f1_ratio` (vowel-space centralization) |
 | Loudness | `intensity_mean/max/min/std` |
 | Rhythm | `speech_rate`, `pause_duration`, `voice_breaks` |
@@ -148,14 +150,36 @@ jitter, shimmer, HNR and formants are only meaningful on natural speech):
       table across Healthy / Very Low / Low / Mid / High.
 - [x] Stage 3: `praat_group_significance()` — Kruskal–Wallis H per feature
       (non-parametric; these distributions are bounded and skewed, so ANOVA's
-      normality assumption doesn't hold), Bonferroni-corrected across the 30
-      features. This is what makes "these measures separate the severity
+      normality assumption doesn't hold), Bonferroni-corrected across the
+      feature set. This is what makes "these measures separate the severity
       groups" a claim rather than an eyeball of the box plots.
-- [ ] **Re-run Stage 1** — the cached CSV holds the older 18-feature schema.
-      It is now detected as stale and re-extracted automatically (~25–30 min).
+- [ ] **Re-run Stage 1** — the cached CSV holds the pre-CPPS 30-feature
+      schema. It is now detected as stale by column set and re-extracted
+      automatically (~25–30 min).
 - Acceptance: `outputs/praat_features.csv` keyed by `Filename`/`Speaker_ID`
   (joinable against `m6_manifest.csv`), plus the comparison figure,
   `praat_severity_group_summary.csv`, and `praat_significance.csv`.
+- **Why Praat at all, alongside a foundation model:** the deep pathway's
+  768-dim embedding encodes contextual phonetic information learned from
+  a pretraining objective with no clinical grounding; MFCC and the Praat
+  features encode deterministic spectral-envelope and voice-source measures
+  that the speech-pathology literature already ties to specific articulatory
+  and phonatory impairments (monopitch, vocal-fold instability, vowel-space
+  centralization, breathy voice quality). The fusion is not "we added MFCC
+  because it's standard" — it's pairing a representation that is powerful
+  but opaque with one that is weaker in isolation but interpretable by name,
+  and testing whether the combination beats either alone (Phase 3's
+  ablation is exactly that test).
+- **Explainability, not just accuracy:** `compare_error_vs_correct()` in
+  `src/error_analysis.py` (Phase 5) already does the "Praat correlation"
+  version of model explainability a clinical-AI reviewer will ask for —
+  correlating misclassifications against jitter/shimmer/HNR/CPPS/formants
+  with Mann–Whitney U and Cliff's delta, so a claim like "the model's errors
+  cluster at low HNR and high jitter" is a statistical result, not a
+  narrative. `attention_weights()` in Phase 6 (step 1) is the second leg:
+  which pathway the model actually attended to per prediction. Together
+  these are the paper's explainability story; SHAP/integrated-gradients
+  (step 4) would be a third, currently deferred.
 
 ## Phase 5 — Error analysis (code done)
 

@@ -179,7 +179,7 @@ class AttentionFusionModel(nn.Module):
 class AttentionFusionPraatModel(nn.Module):
     """
     Ablation Model F: Model E plus a third pathway carrying Phase 4's handcrafted
-    Praat features (F0, jitter, shimmer, HNR, formants, intensity, rhythm).
+    Praat features (F0, jitter, shimmer, HNR, CPPS, formants, intensity, rhythm).
 
     The two learned pathways see only the audio. The Praat features are the
     clinically-named measurements a speech pathologist would actually reach for,
@@ -188,7 +188,8 @@ class AttentionFusionPraatModel(nn.Module):
     independent evidence, which is the whole argument for a third pathway rather
     than a richer head.
 
-    The 30 features are encoded into a single 256-dim token and appended to the
+    The features are encoded into a single 256-dim token (dimension fixed by
+    `num_praat_features`, currently `len(FEATURE_COLUMNS)`) and appended to the
     context of *both* cross-attention blocks:
 
         deep     attends over [acoustic frames ; praat token]

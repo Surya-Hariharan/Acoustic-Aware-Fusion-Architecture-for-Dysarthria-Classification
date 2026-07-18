@@ -117,7 +117,7 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj"]   # self-attention layers
 FUSION_ATTN_DIM     = 256
 FUSION_ATTN_HEADS   = 4          # 256 / 4 = 64 dims per head
 FUSION_ATTN_DROPOUT = 0.1
-PRAAT_EMBED_DIM     = 256        # Praat pathway (Model F): 30 features -> one token
+PRAAT_EMBED_DIM     = 256        # Praat pathway (Model F): FEATURE_COLUMNS -> one token
 
 # ---------------------------------------------------------------------------
 # Training (train.py)
