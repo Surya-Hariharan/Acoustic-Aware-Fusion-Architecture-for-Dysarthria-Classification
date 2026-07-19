@@ -62,9 +62,16 @@ SEVERITY_MAP = {
     "M08": "High",     "F05": "High",
 }
 
-# Speakers dropped to balance severity classes at 3 speakers each
-# (assumption pending team confirmation — see README "Pipeline Summary")
-DROPPED_FOR_BALANCE = ["M12", "M08", "F05"]     # 1 Very Low, 2 High
+# Speakers dropped to balance severity classes at 3 speakers each.
+# Matches the base paper's exclusion criterion exactly (Javanmardi et al.,
+# ICASSP 2023, arXiv:2309.14107): "one male speaker from 'very low' level of
+# intelligibility and two male speakers from 'high' level of intelligibility"
+# were left out to reach 3-per-class / 81 (3^4) leave-one-per-class-out folds.
+# M12 is the dropped Very Low male; M08 and M09 are the two dropped High
+# males (the paper doesn't name which two, so this pair is still a choice,
+# but — unlike the previous ["M12","M08","F05"] — it no longer contradicts
+# the paper by dropping the female High speaker F05 instead of a male one).
+DROPPED_FOR_BALANCE = ["M12", "M08", "M09"]     # 1 Very Low, 2 High (all male)
 
 # ---------------------------------------------------------------------------
 # Dataset protocol

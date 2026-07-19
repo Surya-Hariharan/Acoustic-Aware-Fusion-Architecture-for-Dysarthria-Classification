@@ -225,10 +225,19 @@ def progress(iterable, description: str, total: Optional[int] = None,
     Wrapped in one place so every long-running loop (feature extraction, epochs,
     embedding passes) reports identically, and so tqdm stays a single import to
     swap if it is ever unavailable.
+
+    Deliberately `tqdm.std.tqdm` (plain ANSI text), not `tqdm.auto` /
+    `tqdm.notebook`. The ipywidgets-backed notebook bar only updates live in a
+    *connected* kernel — once a notebook is saved, reopened, or viewed statically
+    (VS Code preview, GitHub, this repo's committed execution outputs), only the
+    frozen 0% snapshot from bar-creation is shown. Plain-text `\r` updates are
+    written straight into the cell's stream output, so both Jupyter/VS Code (which
+    replay `\r` correctly) and static renderers show the true final bar.
     """
-    from tqdm.auto import tqdm
+    from tqdm import tqdm
 
     return tqdm(iterable, desc=f"  {description}", total=total, leave=leave,
-                unit=unit, ncols=90, bar_format=(
+                unit=unit, ncols=100, mininterval=0.1, file=sys.stdout,
+                bar_format=(
                     "{desc:<34} {percentage:3.0f}%|{bar}| "
-                    "{n_fmt}/{total_fmt} [{elapsed}<{remaining}]"))
+                    "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"))

@@ -33,6 +33,7 @@ from src.training.runner import build_folds
 from src.training.utils import resolve_device
 
 EMBEDDING_CACHE_PATH = config.EMBEDDINGS_DIR / "frozen_wav2vec_base.npz"
+ALL_LAYERS_CACHE_PATH = config.EMBEDDINGS_DIR / "frozen_wav2vec_all_layers.npz"
 
 
 @torch.no_grad()
@@ -74,6 +75,50 @@ def extract_frozen_embeddings(df: pd.DataFrame, device: Optional[torch.device] =
     np.savez(EMBEDDING_CACHE_PATH, embeddings=embeddings,
             filepaths=df["Filepath"].to_numpy())
     print_kv("Frozen embeddings", f"extracted and cached to {EMBEDDING_CACHE_PATH}")
+    return embeddings
+
+
+@torch.no_grad()
+def extract_frozen_embeddings_all_layers(df: pd.DataFrame, device: Optional[torch.device] = None,
+                                         batch_size: int = 16, num_workers: int = 0,
+                                         use_cache: bool = True) -> np.ndarray:
+    """
+    (N, 13, 768) frozen wav2vec 2.0 embedding per row of df — one vector per
+    hidden-state layer (CNN feature-extractor output + 12 transformer
+    layers), via DeepPathway.forward_all_layers(). extract_frozen_embeddings()
+    only pools the final layer, which can't reproduce the base paper's
+    per-layer comparison (Table 1: layer 1 wins detection; Table 3: layer 13
+    wins severity) — this is what sweep_svm_baseline_layers() needs instead.
+    """
+    config.ensure_directories()
+    if use_cache and ALL_LAYERS_CACHE_PATH.exists():
+        cached = np.load(ALL_LAYERS_CACHE_PATH, allow_pickle=True)
+        cached_paths = cached["filepaths"]
+        if set(df["Filepath"]).issubset(set(cached_paths)):
+            index = {path: i for i, path in enumerate(cached_paths)}
+            order = [index[p] for p in df["Filepath"]]
+            print_kv("Frozen per-layer embeddings", f"loaded from cache ({ALL_LAYERS_CACHE_PATH})")
+            return cached["embeddings"][order]
+
+    device = device or resolve_device()
+    model = DeepPathway(use_lora=False).to(device).eval()
+    loader = DataLoader(UASpeechDataset(df), batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=(device.type == "cuda"))
+
+    print_header("Extracting Frozen wav2vec 2.0 Embeddings (All 13 Layers)")
+    print_kv("Utterances", len(df))
+    print_kv("Device", device)
+
+    embeddings = []
+    for batch in progress(loader, "Frozen wav2vec 2.0 forward (13 layers)",
+                          total=len(loader), unit="batch"):
+        waveform = batch["waveform"].squeeze(1).to(device, non_blocking=True)
+        embeddings.append(model.forward_all_layers(waveform).cpu().numpy())
+    embeddings = np.concatenate(embeddings)  # (N, 13, 768)
+
+    np.savez(ALL_LAYERS_CACHE_PATH, embeddings=embeddings,
+            filepaths=df["Filepath"].to_numpy())
+    print_kv("Frozen per-layer embeddings", f"extracted and cached to {ALL_LAYERS_CACHE_PATH}")
     return embeddings
 
 
@@ -165,3 +210,41 @@ def run_svm_baseline(df: pd.DataFrame, task: str, embeddings: np.ndarray,
                   title="Pooled across all folds (the base-paper-comparable numbers)")
 
     return summary, pooled_metrics
+
+
+def sweep_svm_baseline_layers(df: pd.DataFrame, task: str, all_layer_embeddings: np.ndarray,
+                              max_folds: Optional[int] = None) -> pd.DataFrame:
+    """
+    Run the frozen-wav2vec + SVM baseline once per hidden-state layer, so the
+    reproduction can be checked against the base paper's own per-layer
+    result: layer 1 wins detection (93.95% acc), layer 13/final wins
+    severity (44.56% acc, 4-class). all_layer_embeddings is the (N, 13, 768)
+    output of extract_frozen_embeddings_all_layers(); layer 0 is the CNN
+    feature-extractor output, layers 1-12 are the transformer layers.
+
+    Writes outputs/metrics/baseline_svm_<task>_layer<i>/ per layer (same
+    predictions/metrics/confusion-matrix/ROC layout as run_svm_baseline) plus
+    a combined outputs/metrics/baseline_svm_<task>_layer_sweep.csv ranking
+    every layer by pooled accuracy.
+    """
+    num_layers = all_layer_embeddings.shape[1]
+    rows = []
+    for layer in range(num_layers):
+        run_name = f"baseline_svm_{task}_layer{layer}"
+        print_subheader(f"Layer {layer} / {num_layers - 1}")
+        _, pooled_metrics = run_svm_baseline(
+            df, task, all_layer_embeddings[:, layer, :], run_name=run_name, max_folds=max_folds)
+        if pooled_metrics:
+            rows.append({"layer": layer, **pooled_metrics})
+
+    summary = pd.DataFrame(rows).sort_values("accuracy", ascending=False).reset_index(drop=True)
+    config.ensure_directories()
+    summary.to_csv(config.METRICS_DIR / f"baseline_svm_{task}_layer_sweep.csv", index=False)
+
+    print_subheader(f"Layer sweep summary ({task}) — best layer first")
+    print_table(summary)
+    if len(summary):
+        best = summary.iloc[0]
+        print_kv("Best layer", f"{int(best['layer'])} (accuracy={best['accuracy']:.4f})")
+
+    return summary

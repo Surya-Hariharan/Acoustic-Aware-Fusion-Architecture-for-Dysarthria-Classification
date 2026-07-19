@@ -78,6 +78,25 @@ class DeepPathway(nn.Module):
         """
         return self.forward_sequence(waveform).mean(dim=1)
 
+    def forward_all_layers(self, waveform: torch.Tensor) -> torch.Tensor:
+        """
+        Every hidden-state layer (CNN feature-extractor output + all 12
+        transformer layers), each mean-pooled over time — the base paper
+        (Javanmardi et al., ICASSP 2023) sweeps per-layer embeddings and
+        finds different layers win for detection (layer 1) vs. severity
+        (layer 13/final), so forward()'s final-layer-only pooling can't
+        reproduce that comparison. Only meaningful with use_lora=False,
+        since LoRA fine-tunes the backbone that produces these layers.
+
+        Args:
+            waveform: (batch, samples) raw 16 kHz audio.
+        Returns:
+            (batch, 13, 768) mean-pooled embedding per layer.
+        """
+        outputs = self.wav2vec(waveform, output_hidden_states=True)
+        hidden_states = torch.stack(outputs.hidden_states, dim=1)  # (B, 13, T, 768)
+        return hidden_states.mean(dim=2)
+
     def trainable_parameter_summary(self) -> str:
         """Human-readable count of trainable (LoRA) vs frozen parameters."""
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
