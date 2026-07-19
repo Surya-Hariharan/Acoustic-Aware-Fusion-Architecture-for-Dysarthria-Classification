@@ -10,6 +10,7 @@ training logic itself.
 """
 
 import json
+import time
 import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -226,9 +227,17 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     return {"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics}, test_result
 
 
-def run_training(df: pd.DataFrame, cfg: TrainingConfig) -> Tuple[pd.DataFrame, Dict[str, float]]:
+def run_training(df: pd.DataFrame, cfg: TrainingConfig,
+                 deadline: Optional[float] = None) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
     Run every requested fold for cfg.task/cfg.model, then aggregate.
+
+    `deadline`, if given, is a time.monotonic() timestamp: once reached, no
+    new fold is started (already-completed folds still load instantly from
+    disk via _load_completed_fold) and the run stops cleanly, printing how
+    many folds it got through. Re-calling run_training() later resumes from
+    the next fold — this is what lets a multi-hour job run in bounded,
+    unattended-safe sessions instead of one continuous multi-day pass.
 
     Returns (per_fold_summary_df, pooled_metrics_dict). Every fold's
     checkpoint/log/predictions/metrics/confusion-matrix/ROC/embedding is
@@ -292,6 +301,10 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig) -> Tuple[pd.DataFrame, D
         # model variants is realistically hours-to-days) can be interrupted
         # and restarted without redoing folds that already finished.
         cached = _load_completed_fold(run_name, fold_id, cfg.task)
+        if cached is None and deadline is not None and time.monotonic() >= deadline:
+            print_note(f"Time budget reached after {i - 1}/{n_folds} folds — "
+                      "stopping early. Re-run this cell to resume.")
+            break
         if cached is not None:
             metrics_dict, y_true, y_pred, y_prob, speakers = cached
             print_kv(f"Fold {fold_id}", "already completed — loaded from disk, skipping retrain")
