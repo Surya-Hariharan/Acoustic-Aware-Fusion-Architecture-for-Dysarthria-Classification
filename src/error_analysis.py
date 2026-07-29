@@ -8,7 +8,6 @@ failures share.
 
 Consumes what Phase 1/2 already write:
   outputs/predictions/<run>/<fold>.csv   per-utterance predictions (keyed by filename)
-  outputs/embeddings/<run>/<fold>.npz    test-fold embeddings
   outputs/praat_features.csv             Phase 4 acoustic features (keyed by Filename)
   outputs/m6_manifest.csv                Filepath / Word / Severity metadata
 
@@ -17,7 +16,8 @@ that column existed cannot be analysed - load_run_predictions says so explicitly
 rather than failing on a missing column somewhere deep in a merge.
 
 Like src/praat.py, this module owns its own plots: the diagnostics here are a
-Phase 5 concern, not the EDA that src/visualization.py covers.
+Phase 5 concern, not the EDA that src/visualization.py covers, and not the
+embedding-space/attention/SHAP introspection that src/model_analysis.py covers.
 """
 
 from pathlib import Path
@@ -29,7 +29,6 @@ import pandas as pd
 import parselmouth
 import seaborn as sns
 from scipy.stats import mannwhitneyu
-from sklearn.manifold import TSNE
 
 from src import config
 from src.console import print_kv
@@ -151,6 +150,39 @@ def error_summary(preds: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     return summary
 
 
+def fp_fn_breakdown(preds: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-class false positives / false negatives, one-vs-rest.
+
+    error_summary()'s "confusions" table already carries the raw which-class-
+    for-which-class counts; this collapses that into the FP/FN framing
+    directly (rate of the actual class missed vs. rate of the predicted class
+    that was wrong), which a which-class-for-which-class table doesn't state
+    on its own. Sorted worst-first by the rate that matters clinically: how
+    often an actual case of this class was missed.
+    """
+    classes = sorted(set(preds["y_true_label"]) | set(preds["y_pred_label"]))
+    records = []
+    for cls in classes:
+        is_true = preds["y_true_label"] == cls
+        is_pred = preds["y_pred_label"] == cls
+        tp = int((is_true & is_pred).sum())
+        fp = int((~is_true & is_pred).sum())
+        fn = int(is_true.sum()) - tp
+        n_true = int(is_true.sum())
+        n_pred = int(is_pred.sum())
+        records.append({
+            "class": cls,
+            "tp": tp, "fp": fp, "fn": fn,
+            "n_true": n_true,
+            "false_positive_rate": fp / n_pred if n_pred else np.nan,
+            "false_negative_rate": fn / n_true if n_true else np.nan,
+        })
+    return (pd.DataFrame.from_records(records)
+            .sort_values("false_negative_rate", ascending=False)
+            .reset_index(drop=True))
+
+
 def _confidence(preds: pd.DataFrame) -> pd.Series:
     """Probability the model assigned to the class it predicted.
 
@@ -197,7 +229,7 @@ def compare_error_vs_correct(preds: pd.DataFrame) -> pd.DataFrame:
     if not available:
         raise ValueError(
             "No Praat feature columns on these predictions - call attach_metadata() "
-            "with praat_features first (see notebooks/03_praat_analysis.ipynb)."
+            "with praat_features first (see notebooks/02_feature_analysis.ipynb)."
         )
 
     is_correct = preds["correct"].astype(bool)
@@ -375,81 +407,6 @@ def plot_error_feature_distributions(preds: pd.DataFrame, comparison: pd.DataFra
     fig.tight_layout()
 
     out_path = config.FIGURE_DIR / f"error_features_{run_name}.png"
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-    return str(out_path)
-
-
-# ---------------------------------------------------------------------------
-# Embedding map
-# ---------------------------------------------------------------------------
-def load_run_embeddings(run_name: str) -> pd.DataFrame:
-    """Every test-fold embedding for a run, as a DataFrame with a `filename` key
-    and an `embedding` column of vectors."""
-    run_dir = config.EMBEDDINGS_DIR / run_name
-    if not run_dir.exists():
-        raise FileNotFoundError(f"No embeddings for run '{run_name}' at {run_dir}.")
-
-    frames = []
-    for path in sorted(run_dir.glob("*.npz")):
-        data = np.load(path, allow_pickle=True)
-        if "filenames" not in data:
-            raise ValueError(
-                f"{path} has no 'filenames' array — it was written before "
-                f"utterance identity was carried through. Re-run '{run_name}'."
-            )
-        frames.append(pd.DataFrame({
-            "filename": data["filenames"],
-            "y_true": data["y_true"],
-            "embedding": list(data["embeddings"]),
-        }))
-    return pd.concat(frames, ignore_index=True)
-
-
-def plot_embedding_map(run_name: str, preds: pd.DataFrame, task: str = "detection",
-                       max_points: int = 3000, seed: int = 42,
-                       show: bool = False) -> str:
-    """
-    t-SNE of the learned embeddings, coloured by true class, with misclassified
-    points marked.
-
-    Answers whether the errors are scattered (genuinely ambiguous utterances) or
-    clustered (a coherent region of the space the model has mislabelled) - the
-    latter is a much more actionable finding.
-    """
-    embeddings = load_run_embeddings(run_name)
-    merged = embeddings.merge(preds[["filename", "correct", "y_true_label"]],
-                              on="filename", how="inner")
-    if merged.empty:
-        raise ValueError(f"No embedding rows for '{run_name}' matched its predictions.")
-
-    if len(merged) > max_points:
-        merged = merged.sample(max_points, random_state=seed).reset_index(drop=True)
-
-    matrix = np.vstack(merged["embedding"].to_numpy())
-    coords = TSNE(n_components=2, random_state=seed,
-                  perplexity=min(30, max(5, len(merged) // 4))).fit_transform(matrix)
-    merged["x"], merged["y"] = coords[:, 0], coords[:, 1]
-
-    correct = merged[merged["correct"].astype(bool)]
-    wrong = merged[~merged["correct"].astype(bool)]
-
-    fig, ax = plt.subplots(figsize=(9, 8))
-    sns.scatterplot(data=correct, x="x", y="y", hue="y_true_label", palette="viridis",
-                    s=14, alpha=0.45, linewidth=0, ax=ax)
-    ax.scatter(wrong["x"], wrong["y"], marker="x", s=42, c="#c44e52",
-               linewidths=1.2, label=f"misclassified (n={len(wrong)})")
-
-    ax.set_title(f"{run_name} — t-SNE of test embeddings ({task})", fontsize=14)
-    ax.set_xlabel("t-SNE 1")
-    ax.set_ylabel("t-SNE 2")
-    ax.legend(loc="best", fontsize=9)
-    fig.tight_layout()
-
-    out_path = config.FIGURE_DIR / f"embedding_map_{run_name}.png"
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     if show:
         plt.show()

@@ -388,8 +388,8 @@ def load_praat_table(cache_path: Optional[Path] = None) -> pd.DataFrame:
     cache_path = cache_path or config.PRAAT_FEATURES_PATH
     if not Path(cache_path).exists():
         raise FileNotFoundError(
-            f"Praat features not found at {cache_path}. Run Stage 1 of "
-            "notebooks/03_praat_analysis.ipynb (extract_praat_features_batch) "
+            f"Praat features not found at {cache_path}. Run Stage 3 of "
+            "notebooks/02_feature_analysis.ipynb (extract_praat_features_batch) "
             "to generate them - the Praat-fusion model cannot train without it."
         )
     table = pd.read_csv(cache_path)
@@ -398,7 +398,7 @@ def load_praat_table(cache_path: Optional[Path] = None) -> pd.DataFrame:
         raise ValueError(
             f"{cache_path} is missing {len(missing)} feature column(s) "
             f"(e.g. {missing[:3]}). It was written by an older version of "
-            "src/praat.py - delete it and re-run notebooks/03_praat_analysis.ipynb."
+            "src/praat.py - delete it and re-run notebooks/02_feature_analysis.ipynb."
         )
     return table.set_index("Filename")
 

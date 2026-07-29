@@ -134,6 +134,29 @@ def build_praat_group_summary(features_df: pd.DataFrame) -> pd.DataFrame:
     return summary.reindex(SEVERITY_GROUPS)
 
 
+def plot_feature_correlation(features_df: pd.DataFrame, columns=FEATURE_COLUMNS,
+                             show: bool = False) -> str:
+    """Correlation heatmap across the Praat feature set.
+
+    Groups like jitter (local/rap/ppq5/ddp) and shimmer are expected to
+    correlate strongly with each other since they all measure the same
+    underlying instability from slightly different formulas - this is what
+    lets a reader see redundant feature groups at a glance before treating
+    them as independent evidence in Phase 6's Praat pathway.
+    """
+    corr = features_df[list(columns)].corr()
+
+    fig, ax = plt.subplots(figsize=(0.45 * len(columns) + 3, 0.45 * len(columns) + 2))
+    sns.heatmap(corr, cmap="coolwarm", center=0, vmin=-1, vmax=1,
+               square=True, linewidths=0.3, ax=ax,
+               cbar_kws={"shrink": 0.7, "label": "Pearson r"})
+    ax.set_title("Praat Feature Correlation Matrix", fontsize=14)
+    ax.tick_params(axis="x", rotation=90)
+    ax.tick_params(axis="y", rotation=0)
+    fig.tight_layout()
+    return _finish(fig, "praat_feature_correlation.png", show)
+
+
 def run_eda(df: pd.DataFrame, show: bool = False) -> None:
     """Generate and save all EDA figures."""
     config.ensure_directories()

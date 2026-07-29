@@ -2,7 +2,7 @@
 Training orchestration: fold iteration, per-fold train/validate/checkpoint,
 and cross-fold aggregation.
 
-This is the function notebooks/02_training.ipynb calls — it is reusable
+This is the function notebooks/03_training.ipynb calls — it is reusable
 logic (the same loop drives every model variant and both tasks), not a
 one-off analysis step, so it lives in src/ rather than the notebook. The
 notebook supplies a TrainingConfig and reads results; it never contains

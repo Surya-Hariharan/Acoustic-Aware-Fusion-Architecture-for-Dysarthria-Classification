@@ -2,7 +2,7 @@
 
 Phase 1 (the training pipeline) is implemented and Phase 2 (baseline
 reproduction) is underway — both are notebook-driven: `src/` holds only
-functions and architecture, `notebooks/02_training.ipynb` is what actually
+functions and architecture, `notebooks/03_training.ipynb` is what actually
 trains and stores models, matching the convention `notebooks/01_data_pipeline.ipynb`
 already established for the data pipeline. Phases 4, 5 and 6 are now **built**;
 what remains for them is GPU time, not code.
@@ -22,20 +22,20 @@ what remains for them is GPU time, not code.
 
 1. `outputs/praat_features.csv` was last regenerated at the 30-feature schema;
    `src/praat.py` now extracts 31 (CPPS was added — see Phase 4). The cache is
-   detected as stale by column set and re-extracted automatically, but Stage 1
-   of `notebooks/03_praat_analysis.ipynb` must be re-run once (~25–30 min) —
+   detected as stale by column set and re-extracted automatically, but Stage 3
+   of `notebooks/02_feature_analysis.ipynb` must be re-run once (~25–30 min) —
    and **Model F cannot train until it is**.
 2. Predictions now carry a `filename` column, without which Phase 5 cannot join
    an error back to its audio or to the Praat features. Prediction CSVs written
    before this change (the smoke test, `baseline_svm_detection`) lack it, so
-   **Phase 5 needs at least one model re-run** before `notebooks/04` will work.
+   **Phase 5 needs at least one model re-run** before `notebooks/05_error_analysis.ipynb` will work.
    `load_run_predictions` fails with that exact message rather than silently
    half-working.
 
 ## Phase 1 — Training pipeline (done)
 
 `src/training/runner.py` cross-validates any of six model variants on
-either task; `notebooks/02_training.ipynb` is the front end that calls it:
+either task; `notebooks/03_training.ipynb` is the front end that calls it:
 
 ```python
 from src.training.runner import TrainingConfig, run_training
@@ -67,7 +67,7 @@ fold holds out one speaker per class.
 
 Useful `TrainingConfig` fields for iterating cheaply before a real run:
 `max_folds`, `folds` (a list of specific fold IDs), `limit_samples` (caps
-rows per split), `epochs=1` — notebook 02's Stage 1 combines all of these
+rows per split), `epochs=1` — notebook 03's Stage 1 combines all of these
 into a pipeline sanity check. TensorBoard: `tensorboard --logdir outputs/logs`.
 
 A full 28-fold LOSO run of `deep_lora`/`fusion` fine-tunes wav2vec 2.0 on
@@ -95,12 +95,14 @@ summary, pooled = run_svm_baseline(df_m6, task="detection", embeddings=embedding
       fit a Platt-calibrated `LinearSVC` per LOSO fold, report pooled
       accuracy/F1/recall/precision/specificity/AUROC exactly like Phase 1's
       pooling.
-- [x] `notebooks/02_training.ipynb` Stage 4 compares the baseline against
-      `deep_frozen`, `deep_lora`, `acoustic`, and `fusion` in one table
-      (`outputs/metrics/phase2_comparison.csv`) — at demonstration scale by
-      default (`max_folds=3`, `limit_samples=300`, `epochs=5`); rerun with
-      those caps removed for the real comparison once GPU time is budgeted.
-- [ ] Full-scale run of Stage 4 (all 28 folds, full training splits,
+- [x] `notebooks/03_training.ipynb` Stages 5–8 (MFCC-only / Wav2Vec2-only /
+      Fusion training, then the comparison table) compare the baseline
+      against `deep_frozen`, `deep_lora`, `acoustic`, and `fusion` in one
+      table (`outputs/metrics/phase2_comparison.csv`) — at demonstration
+      scale by default (`max_folds=3`, `limit_samples=300`, `epochs=5`);
+      rerun with those caps removed for the real comparison once GPU time
+      is budgeted.
+- [ ] Full-scale run of Stages 5–8 (all 28 folds, full training splits,
       epochs=20+) to replace the demonstration-scale numbers.
 - [ ] Same comparison for the severity task (`task="severity"` — both
       `baseline.py` and `runner.py` already support it unchanged).
@@ -120,9 +122,10 @@ diffed on the metric set Phase 1 already computes: accuracy, precision, recall
 (sensitivity), specificity, F1, AUROC.
 
 - [ ] Run all six variants to completion (full folds, no `limit_samples`).
-      `ABLATION_MODELS` in notebook 02's Stage 4 already lists them.
+      `MFCC_FAMILY` / `WAV2VEC_FAMILY` / `FUSION_FAMILY` in notebook 03's
+      Stages 5–7 already list them.
 - [ ] `outputs/metrics/*.summary.csv` + pooled JSONs → one results table
-      (Stage 4/5 of notebook 02 already produces the shape of this table
+      (Stages 5–8 of notebook 03 already produce the shape of this table
       at demo scale — rerun at full scale).
 - Acceptance: a single table with all six models × all six metrics,
   pooled LOSO numbers plus per-fold mean ± std.
@@ -146,14 +149,18 @@ jitter, shimmer, HNR, CPPS and formants are only meaningful on natural speech):
 - [x] `src/praat.py`: one function per feature group, taking a filepath and
       returning a flat dict — mirrors `src/preprocessing.py`'s MFCC extraction.
       Never raises: anything Praat can't compute on a clip comes back NaN.
-- [x] `notebooks/03_praat_analysis.ipynb` Stage 2: box-plot grid + group-means
+- [x] `notebooks/02_feature_analysis.ipynb` Stage 4: box-plot grid + group-means
       table across Healthy / Very Low / Low / Mid / High.
-- [x] Stage 3: `praat_group_significance()` — Kruskal–Wallis H per feature
+- [x] Stage 6: `praat_group_significance()` — Kruskal–Wallis H per feature
       (non-parametric; these distributions are bounded and skewed, so ANOVA's
       normality assumption doesn't hold), Bonferroni-corrected across the
       feature set. This is what makes "these measures separate the severity
       groups" a claim rather than an eyeball of the box plots.
-- [ ] **Re-run Stage 1** — the cached CSV holds the pre-CPPS 30-feature
+- [x] Stage 5: `plot_feature_correlation()` — correlation heatmap across the
+      full feature set, so redundant feature groups (e.g. the four jitter
+      sub-measures) are visible before Phase 6's Praat pathway treats every
+      column as independent evidence.
+- [ ] **Re-run Stage 3** — the cached CSV holds the pre-CPPS 30-feature
       schema. It is now detected as stale by column set and re-extracted
       automatically (~25–30 min).
 - Acceptance: `outputs/praat_features.csv` keyed by `Filename`/`Speaker_ID`
@@ -176,15 +183,17 @@ jitter, shimmer, HNR, CPPS and formants are only meaningful on natural speech):
   correlating misclassifications against jitter/shimmer/HNR/CPPS/formants
   with Mann–Whitney U and Cliff's delta, so a claim like "the model's errors
   cluster at low HNR and high jitter" is a statistical result, not a
-  narrative. `attention_weights()` in Phase 6 (step 1) is the second leg:
-  which pathway the model actually attended to per prediction. Together
-  these are the paper's explainability story; SHAP/integrated-gradients
-  (step 4) would be a third, currently deferred.
+  narrative. `attention_weights()`, visualized in
+  `notebooks/04_model_analysis.ipynb`, is the second leg: which pathway the
+  model actually attended to per prediction. Together with that notebook's
+  SHAP feature-importance section, these are the paper's explainability
+  story; integrated gradients on the deep pathway itself remains deferred.
 
 ## Phase 5 — Error analysis (code done)
 
-`src/error_analysis.py` + `notebooks/04_error_analysis.ipynb`. Consumes
-`outputs/predictions/*.csv`, `outputs/embeddings/*.npz`, and Phase 4's features.
+`src/error_analysis.py` + `notebooks/05_error_analysis.ipynb`. Consumes
+`outputs/predictions/*.csv` and Phase 4's features. (Embedding-space
+projection moved to `notebooks/04_model_analysis.ipynb` — see Phase 6 below.)
 
 This phase was **blocked by a data bug**, now fixed: predictions were keyed only
 by `speaker_id`, so a misclassified row could not be traced to its audio file or
@@ -200,9 +209,13 @@ to the Praat features. `save_predictions`/`save_embeddings` now carry a
       because on ~21k utterances a p-value is significant for effects far too
       small to matter. Directly answers "do errors cluster at low HNR / high
       jitter / short duration?".
-- [x] Error rate broken down by severity group, speaker, class, and word; plus a
-      t-SNE embedding map marking the misclassifications — scattered errors mean
-      boundary ambiguity, clustered errors mean a mislabelled region of the space.
+- [x] Error rate broken down by severity group, speaker, class, and word, plus
+      an explicit per-class false-positive/false-negative breakdown
+      (`fp_fn_breakdown()`).
+- [x] Embedding-space view of the same errors (t-SNE/PCA/UMAP, scattered vs.
+      clustered misclassifications) now lives in
+      `notebooks/04_model_analysis.ipynb` (`src/model_analysis.py`) — it
+      answers "what has the model learned", not "what did it get wrong".
 - [ ] Needs one model re-run first (see the ordering note at the top).
 - Acceptance: concrete failure patterns, not just an aggregate accuracy number.
 
@@ -237,8 +250,13 @@ into a shared 256-dim space before attending.
    `forward(waveform, mfcc, praat)` signature across all models.
 3. [ ] **Multi-task heads** (detection + severity, shared encoder) — deferred;
    changes the training loop's label handling.
-4. [ ] **Explainability** (SHAP / integrated gradients) — deferred, once there's
-   a trained model worth explaining. `attention_weights()` is the start.
+4. [x] **Explainability** — `attention_weights()` visualized directly
+   (`notebooks/04_model_analysis.ipynb`, Model E only — Model F's tri-modal
+   blocks don't yet expose an equivalent hook), plus SHAP feature-importance
+   over the Phase 4 Praat feature set via a RandomForest surrogate
+   (`src.model_analysis.compute_shap_values`) rather than running SHAP
+   through the wav2vec 2.0 forward pass itself. Integrated gradients on the
+   deep pathway remains deferred.
 
 - Acceptance for step 1: `model="attention_fusion"` trains and evaluates through
   the existing `run_training()` unmodified, and its pooled LOSO metrics sit in

@@ -76,10 +76,16 @@ ROADMAP.md                      Phases 2-6: baseline reproduction, ablation, Pra
                                  analysis, error analysis, novel contribution
 notebooks/
   01_data_pipeline.ipynb        Interactive data-pipeline driver; imports src/
-  02_training.ipynb             Interactive training driver: pipeline sanity check,
-                                 Phase 2 baseline reproduction and comparison
-  03_praat_analysis.ipynb       Phase 4: extract + analyze the Praat acoustic features
-  04_error_analysis.ipynb       Phase 5: misclassifications correlated against Praat features
+  02_feature_analysis.ipynb     MFCC + Phase 4 Praat feature extraction, EDA, feature
+                                 correlation, severity-group significance
+  03_training.ipynb             Interactive training driver: pipeline sanity check,
+                                 Phase 2 baseline reproduction, MFCC-only/Wav2Vec2-only/
+                                 Fusion training, automatic experiment comparison
+  04_model_analysis.ipynb       Phase 6 interpretability: ablation chart, embedding
+                                 space (t-SNE/PCA/UMAP), attention maps, SHAP
+  05_error_analysis.ipynb       Phase 5: misclassifications correlated against Praat features
+  06_results.ipynb              Cross-experiment aggregation, significance tests,
+                                 ROC/PR comparison, publication export
 data/
   archives/                     Place the UA-Speech .tgz archives here
   extracted/                    Extracted .wav files land here (one folder per speaker)
@@ -96,9 +102,13 @@ src/
   praat.py                      Phase 4: 31 Praat features (F0, jitter, shimmer, HNR, CPPS,
                                  formants, intensity, rhythm) + severity-group significance test
   error_analysis.py             Phase 5: per-error diagnostics, Praat-correlation explainability
+  model_analysis.py             Phase 6: ablation chart, embedding projections (t-SNE/PCA/UMAP),
+                                 attention heatmaps, SHAP feature importance
+  results.py                    Cross-experiment aggregation, paired significance tests,
+                                 ROC/PR overlay, publication styling, paper export
   dataset.py                    UASpeechDataset
   splits.py                     LOSO folds (detection), balanced 81-fold (severity)
-  visualization.py              EDA + Praat-feature figures
+  visualization.py              EDA + Praat-feature figures + feature correlation heatmap
   models/
     deep_pathway.py             wav2vec 2.0 (+ optional LoRA) -> 768-dim
     acoustic_pathway.py         1D-CNN over MFCC -> 128-dim
@@ -133,13 +143,27 @@ Copy `UASpeech_normalized_C.tgz` and `UASpeech_normalized_FM.tgz` into `data/arc
 # 1. Data pipeline
 jupyter notebook notebooks/01_data_pipeline.ipynb
 
-# 2. Training
-jupyter notebook notebooks/02_training.ipynb
+# 2. Feature analysis (MFCC + Praat)
+jupyter notebook notebooks/02_feature_analysis.ipynb
+
+# 3. Training
+jupyter notebook notebooks/03_training.ipynb
+
+# 4. Model analysis (ablation chart, embeddings, attention, SHAP)
+jupyter notebook notebooks/04_model_analysis.ipynb
+
+# 5. Error analysis
+jupyter notebook notebooks/05_error_analysis.ipynb
+
+# 6. Results (aggregation, significance tests, publication export)
+jupyter notebook notebooks/06_results.ipynb
 ```
 
-Notebook 1 scans the extracted audio, verifies the 28-speaker ground truth, writes EDA figures to `outputs/figures/`, filters to M6, checks per-speaker word counts, attaches severity labels, summarizes both split protocols, builds the dataset, and writes `outputs/m6_manifest.csv`.
+Notebook 1 scans the extracted audio, verifies the 28-speaker ground truth, filters to M6, checks per-speaker word counts, attaches severity labels, summarizes both split protocols, builds the dataset, and writes `outputs/m6_manifest.csv`.
 
-Notebook 2 loads that manifest (regenerating it if missing) and drives `src/training/runner.py`'s `run_training(df, TrainingConfig(...))`:
+Notebook 2 loads that manifest, runs the dataset-wide EDA (moved here from notebook 1, since it's exploratory feature analysis, not pipeline construction), extracts the Phase 4 Praat features, and reports feature statistics/correlation/severity-group significance.
+
+Notebook 3 loads the manifest (regenerating it if missing) and drives `src/training/runner.py`'s `run_training(df, TrainingConfig(...))`:
 
 ```python
 from src.training.runner import TrainingConfig, run_training
@@ -149,7 +173,7 @@ cfg = TrainingConfig(task="detection", model="fusion")   # LOSO, 28 folds
 summary, pooled = run_training(df_m6, cfg)
 ```
 
-`model` is one of `acoustic`, `deep_frozen`, `deep_lora`, `fusion`, `attention_fusion`, `attention_fusion_praat` (see [ROADMAP.md](ROADMAP.md) for what each maps to in the ablation study — the last two are `notebooks/03_praat_analysis.ipynb`'s Praat features and Phase 6's cross-attention contribution). Every fold writes a checkpoint, TensorBoard log (`tensorboard --logdir outputs/logs`), predictions CSV, metrics JSON, confusion matrix, ROC curve, and fused embedding under `outputs/`; run-level metrics are reported both as a per-fold mean ± std and pooled across all folds. `TrainingConfig(..., max_folds=1, epochs=1, limit_samples=24)` gives a fast pipeline sanity check before a real run — notebook 2's Stage 1 does exactly this. Phase 2's baseline reproduction (frozen wav2vec 2.0 + linear SVM, via `src/training/baseline.py`) lives in the same notebook.
+`model` is one of `acoustic`, `deep_frozen`, `deep_lora`, `fusion`, `attention_fusion`, `attention_fusion_praat` (see [ROADMAP.md](ROADMAP.md) for what each maps to in the ablation study — the last two are `notebooks/02_feature_analysis.ipynb`'s Praat features and Phase 6's cross-attention contribution). Every fold writes a checkpoint, TensorBoard log (`tensorboard --logdir outputs/logs`), predictions CSV, metrics JSON, confusion matrix, ROC curve, and fused embedding under `outputs/`; run-level metrics are reported both as a per-fold mean ± std and pooled across all folds. `TrainingConfig(..., max_folds=1, epochs=1, limit_samples=24)` gives a fast pipeline sanity check before a real run — notebook 3's Stage 1 does exactly this. Phase 2's baseline reproduction (frozen wav2vec 2.0 + linear SVM, via `src/training/baseline.py`) lives in the same notebook, which groups every ablation variant into three families (MFCC-only, Wav2Vec2-only, Fusion) so each can be run, resumed, or extended independently.
 
 ## Status
 
@@ -158,12 +182,12 @@ summary, pooled = run_training(df_m6, cfg)
 | Data pipeline and preprocessing | — | Complete and verified |
 | Deep Pathway (wav2vec 2.0, optional LoRA) | Deep Pathway Lead | Trainable via `run_training()`, not yet trained to convergence |
 | Acoustic Pathway (1D-CNN over MFCC) | Acoustic Pathway Lead | Trainable via `run_training()`, not yet trained to convergence |
-| Fusion: training loop, checkpointing, metrics, logging (Phase 1) | Fusion Architect | Complete — see `src/training/runner.py` + `notebooks/02_training.ipynb` |
+| Fusion: training loop, checkpointing, metrics, logging (Phase 1) | Fusion Architect | Complete — see `src/training/runner.py` + `notebooks/03_training.ipynb` |
 | Baseline reproduction (Phase 2) | — | Frozen wav2vec + SVM implemented (`src/training/baseline.py`); full-scale comparison run pending |
 | Ablation study (Phase 3) | — | All six variants implemented; full 28-fold GPU run pending |
-| Praat acoustic analysis (Phase 4) | — | Code complete: 31 features, significance test — see `src/praat.py` |
+| Praat acoustic analysis (Phase 4) | — | Code complete: 31 features, significance test, feature correlation — see `src/praat.py` |
 | Error analysis (Phase 5) | — | Code complete: per-error diagnostics + Praat-correlation explainability — needs a re-trained run |
-| Attention fusion + Praat pathway (Phase 6, steps 1-2) | — | Code complete (Models E, F); full-scale run + multi-task heads/SHAP (steps 3-4) pending |
+| Attention fusion + Praat pathway (Phase 6, steps 1-2) | — | Code complete (Models E, F); full-scale run + multi-task heads (step 3) pending. Explainability (step 4) done: attention maps + SHAP feature importance in `notebooks/04_model_analysis.ipynb` |
 
 ## License
 
