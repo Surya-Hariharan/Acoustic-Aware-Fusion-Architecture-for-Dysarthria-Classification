@@ -28,6 +28,7 @@ from sklearn.metrics import (auc, average_precision_score, precision_recall_curv
 from src import config
 from src.console import print_kv
 from src.error_analysis import load_run_predictions
+from src.style import apply_style, color_for_run
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,39 @@ def load_all_experiment_summaries() -> pd.DataFrame:
             "see notebooks/03_training.ipynb)."
         )
     return pd.DataFrame(rows).set_index("run_name").sort_index()
+
+
+def style_comparison_table(df: pd.DataFrame, higher_is_better: bool = True,
+                           cmap: str = "RdYlGn", decimals: int = 4):
+    """
+    A benchmark comparison table (phase2_comparison.csv,
+    phase3_severity_comparison.csv, load_all_experiment_summaries()'s output,
+    ...) as a per-column colour-graded pandas Styler — red-to-green heat per
+    metric column plus the best value per column bolded — instead of a flat
+    grid of decimals the reader has to scan by eye to find the winner.
+    Notebook display only: this returns a Styler for `display()`/bare
+    notebook-cell output, not a DataFrame — call `.data` on the result (or
+    just keep using the original df) for anything that needs to be
+    machine-read, exported to CSV, or compared programmatically.
+
+    higher_is_better=True (the default) colours the highest value in each
+    column green — true for every metric this project reports (accuracy,
+    precision, recall, specificity, f1, auroc). Pass False for a metric
+    where lower is better (e.g. test_loss) so the colour scale doesn't
+    imply the opposite of what the number means.
+    """
+    numeric_cols = df.select_dtypes("number").columns
+    effective_cmap = cmap if higher_is_better else f"{cmap}_r"
+
+    return (df.style
+           .format({c: f"{{:.{decimals}f}}" for c in numeric_cols})
+           .background_gradient(cmap=effective_cmap, subset=numeric_cols, axis=0)
+           .highlight_max(subset=numeric_cols, axis=0,
+                          props="font-weight: bold; text-decoration: underline;"
+                          if higher_is_better else "")
+           .highlight_min(subset=numeric_cols, axis=0,
+                          props="font-weight: bold; text-decoration: underline;"
+                          if not higher_is_better else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -124,15 +158,16 @@ def plot_roc_pr_comparison(run_names: List[str], task: str = "detection",
     fig_pr, ax_pr = plt.subplots(figsize=(6, 6))
 
     for run_name in run_names:
+        color = color_for_run(run_name)
         preds = load_run_predictions(run_name)
         y_true = preds["y_true"].to_numpy()
         y_prob = preds["prob_positive"].to_numpy()
 
         fpr, tpr, _ = roc_curve(y_true, y_prob)
-        ax_roc.plot(fpr, tpr, label=f"{run_name} (AUC={auc(fpr, tpr):.3f})")
+        ax_roc.plot(fpr, tpr, color=color, label=f"{run_name} (AUC={auc(fpr, tpr):.3f})")
 
         precision, recall, _ = precision_recall_curve(y_true, y_prob)
-        ax_pr.plot(recall, precision,
+        ax_pr.plot(recall, precision, color=color,
                   label=f"{run_name} (AP={average_precision_score(y_true, y_prob):.3f})")
 
     ax_roc.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1)
@@ -165,26 +200,17 @@ def plot_roc_pr_comparison(run_names: List[str], task: str = "detection",
 # ---------------------------------------------------------------------------
 def set_publication_style() -> None:
     """
-    Consistent IEEE-draft-friendly styling (serif fonts, restrained grid,
-    no top/right spines), applied once at this notebook's top so every
-    figure it produces looks like one system — and so that styling stays
-    scoped to this notebook rather than silently changing every other
-    notebook's plots via a shared global rcParams mutation.
+    src.style.apply_style()'s baseline (the same one every other figure in
+    the project now uses — see src/style.py), plus a serif override and a
+    higher screen DPI for the final paper-facing figures this notebook
+    produces. Call this last, after any other module's plotting functions
+    have already run in the same session, since it overrides on top of
+    apply_style() rather than replacing it.
     """
+    apply_style()
     plt.rcParams.update({
         "font.family": "serif",
-        "font.size": 11,
-        "axes.titlesize": 13,
-        "axes.labelsize": 11,
-        "legend.fontsize": 9,
-        "xtick.labelsize": 9,
-        "ytick.labelsize": 9,
         "figure.dpi": 150,
-        "savefig.dpi": 300,
-        "axes.grid": True,
-        "grid.alpha": 0.3,
-        "axes.spines.top": False,
-        "axes.spines.right": False,
     })
 
 

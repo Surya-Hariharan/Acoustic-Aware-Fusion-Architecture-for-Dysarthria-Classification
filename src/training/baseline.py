@@ -27,6 +27,7 @@ from src.dataset import UASpeechDataset
 from src.models.deep_pathway import DeepPathway
 from src.training.data import TASK_LABEL_COLUMN, TASK_LABEL_MAP
 from src.training.metrics import compute_confusion_matrix, compute_metrics
+from src.training.checkpoint import save_sklearn_model
 from src.training.reporting import (aggregate_fold_metrics, save_confusion_matrix,
                                     save_metrics, save_predictions, save_roc_curve)
 from src.training.runner import build_folds
@@ -38,7 +39,7 @@ ALL_LAYERS_CACHE_PATH = config.EMBEDDINGS_DIR / "frozen_wav2vec_all_layers.npz"
 
 @torch.no_grad()
 def extract_frozen_embeddings(df: pd.DataFrame, device: Optional[torch.device] = None,
-                              batch_size: int = 16, num_workers: int = 0,
+                              batch_size: int = 16, num_workers: int = 4,
                               use_cache: bool = True) -> np.ndarray:
     """
     768-dim frozen wav2vec 2.0 embedding per row of df — the base paper's
@@ -80,7 +81,7 @@ def extract_frozen_embeddings(df: pd.DataFrame, device: Optional[torch.device] =
 
 @torch.no_grad()
 def extract_frozen_embeddings_all_layers(df: pd.DataFrame, device: Optional[torch.device] = None,
-                                         batch_size: int = 16, num_workers: int = 0,
+                                         batch_size: int = 16, num_workers: int = 4,
                                          use_cache: bool = True) -> np.ndarray:
     """
     (N, 13, 768) frozen wav2vec 2.0 embedding per row of df — one vector per
@@ -169,6 +170,10 @@ def run_svm_baseline(df: pd.DataFrame, task: str, embeddings: np.ndarray,
         speakers = test_df["Speaker_ID"].to_numpy()
         filenames = test_df["Filename"].to_numpy()
 
+        # A fold's fitted SVM was previously discarded after scoring it -
+        # saving it here is what lets a reviewer reload the exact estimator
+        # behind a reported fold's numbers instead of only its predictions.
+        save_sklearn_model(config.CHECKPOINT_DIR / run_name / f"{fold_id}_svm.pkl", svm)
         save_predictions(config.PREDICTIONS_DIR / run_name / f"{fold_id}.csv",
                          filenames, speakers, y_test, y_pred, y_prob, task)
         save_metrics(config.METRICS_DIR / run_name / f"{fold_id}.json",

@@ -1,8 +1,27 @@
-"""Checkpoint save/load for one fold's training run."""
+"""
+Checkpoint save/load — one function pair per model family, since a PyTorch
+module and an sklearn estimator serialize completely differently and forcing
+both through one format would make one of them non-idiomatic:
+
+  PyTorch  (Deep/Acoustic/Fusion pathways)  -> save_checkpoint/load_checkpoint,
+             torch.save() of a state_dict + optimizer/scheduler/scaler state
+             (.pt) - the standard PyTorch format; NOT raw pickle of the whole
+             module, which is what makes a checkpoint load safely across
+             torch versions and lets load_checkpoint restore optimizer state
+             for resumed training, not just inference.
+  sklearn  (Phase 2 SVM baseline, SHAP RandomForest surrogate) ->
+             save_sklearn_model/load_sklearn_model, joblib (.pkl) - the
+             standard scikit-learn format, and more efficient than stdlib
+             pickle for the numpy arrays inside a fitted estimator.
+
+.h5 (Keras/TensorFlow's format) is not used anywhere in this project since
+nothing here is a Keras model.
+"""
 
 from pathlib import Path
 from typing import Optional
 
+import joblib
 import torch
 
 
@@ -33,3 +52,17 @@ def load_checkpoint(path: Path, model: torch.nn.Module,
     if scaler is not None:
         scaler.load_state_dict(checkpoint["scaler_state"])
     return checkpoint
+
+
+def save_sklearn_model(path: Path, model) -> None:
+    """Persist a fitted sklearn estimator (LinearSVC/CalibratedClassifierCV,
+    RandomForestClassifier, ...) via joblib. Used for Phase 2's per-fold SVM
+    baseline and the SHAP surrogate models — neither was saved anywhere
+    before, so refitting was the only way to reuse either one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, path)
+
+
+def load_sklearn_model(path: Path):
+    """Inverse of save_sklearn_model — returns the fitted estimator as-is."""
+    return joblib.load(path)

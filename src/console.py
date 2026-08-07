@@ -180,8 +180,6 @@ def print_architecture(model, model_name: str = "") -> None:
     stating numerically: the backbone stays frozen while a small set of
     rank-decomposition adapters carries the adaptation to pathological speech.
     """
-    import torch.nn as nn
-
     print_subheader(f"Architecture — {model_name or model.__class__.__name__}")
 
     total = sum(p.numel() for p in model.parameters())
@@ -203,8 +201,8 @@ def print_architecture(model, model_name: str = "") -> None:
     print_kv("TOTAL trainable", f"{trainable:,} / {total:,} "
                                 f"({100.0 * trainable / total:.2f}%)")
     if trainable < total:
-        print_note(f"The frozen remainder is wav2vec 2.0's pre-trained backbone — "
-                   f"only the adapters and head learn.")
+        print_note("The frozen remainder is wav2vec 2.0's pre-trained backbone — "
+                   "only the adapters and head learn.")
 
 
 def print_fold_progress(fold_id: str, index: int, total: int,

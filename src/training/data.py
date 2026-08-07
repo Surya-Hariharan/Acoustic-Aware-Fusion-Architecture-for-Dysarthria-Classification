@@ -108,13 +108,22 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     def dataset(df: pd.DataFrame) -> UASpeechDataset:
         return UASpeechDataset(df, praat_table=praat_table, praat_stats=praat_stats)
 
+    # __getitem__ does real CPU work per utterance (torchaudio.load, resample,
+    # VAD trim, MFCC + deltas) - with num_workers=0 that runs synchronously in
+    # the main process, so the GPU sits idle waiting on it between every
+    # batch. This is the usual reason a training run shows ~0% GPU
+    # utilization even though the model itself is correctly on cuda:
+    # persistent_workers + prefetch_factor let background worker processes
+    # prepare the next batch while the current one trains on the GPU.
+    loader_kwargs = dict(num_workers=num_workers, pin_memory=pin_memory)
+    if num_workers > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
+
     train_loader = DataLoader(
         dataset(train_df), batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory, drop_last=len(train_df) > batch_size)
+        drop_last=len(train_df) > batch_size, **loader_kwargs)
     val_loader = DataLoader(
-        dataset(val_df), batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin_memory)
+        dataset(val_df), batch_size=batch_size, shuffle=False, **loader_kwargs)
     test_loader = DataLoader(
-        dataset(test_df), batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin_memory)
+        dataset(test_df), batch_size=batch_size, shuffle=False, **loader_kwargs)
     return train_loader, val_loader, test_loader

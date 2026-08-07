@@ -137,7 +137,12 @@ DETECTION_CLASS_NAMES = ["Healthy Control", "Dysarthric Patient"]
 SEVERITY_CLASS_NAMES  = ["Very Low", "Low", "Mid", "High"]
 
 DEFAULT_EPOCHS        = 20
-DEFAULT_BATCH_SIZE    = 8
+# 16, not 8: AMP is already on for every CUDA run (src/training/runner.py),
+# and LoRA fine-tuning only backpropagates through a few hundred-K adapter
+# params, not the frozen backbone — 8 was leaving GPU throughput unused
+# without buying any regularization benefit worth the slower 28/81-fold
+# sweep. Drop back to 8 (or lower) only if a fold OOMs on your GPU.
+DEFAULT_BATCH_SIZE    = 16
 DEFAULT_LR_HEAD       = 1e-3     # classifier head / acoustic pathway / LoRA adapters
 DEFAULT_LR_BACKBONE   = 1e-4     # wav2vec 2.0 backbone (only when fine-tuned)
 DEFAULT_WEIGHT_DECAY  = 1e-2

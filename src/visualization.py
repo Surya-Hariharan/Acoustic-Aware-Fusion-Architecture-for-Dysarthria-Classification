@@ -13,8 +13,9 @@ import seaborn as sns
 from src import config
 from src.console import print_header, print_kv
 from src.praat import FEATURE_COLUMNS, SEVERITY_GROUPS, severity_group
+from src.style import apply_style
 
-sns.set_style("whitegrid")
+apply_style()
 
 
 def _finish(fig, filename: str, show: bool) -> str:

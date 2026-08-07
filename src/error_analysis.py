@@ -36,8 +36,9 @@ from src.praat import (FEATURE_COLUMNS, PITCH_CEILING, PITCH_FLOOR,
                        severity_group)
 from src.preprocessing import (build_mfcc_transform, extract_mfcc_features,
                                load_and_preprocess)
+from src.style import CORRECT_COLOR, ERROR_COLOR, apply_style
 
-sns.set_style("whitegrid")
+apply_style()
 
 # Praat's own default: below this many voiced frames a pitch contour is not
 # worth plotting.
@@ -345,7 +346,7 @@ def plot_utterance_diagnostics(row, show: bool = False,
     fig.suptitle(
         f"{row['filename']}  —  true: {row['y_true_label']}  |  "
         f"predicted: {row['y_pred_label']}{confidence_text}",
-        fontsize=14, color="#b22222" if not row["correct"] else "#2e7d32")
+        fontsize=14, color=ERROR_COLOR if not row["correct"] else CORRECT_COLOR)
     fig.tight_layout()
 
     out_dir = Path(out_dir or config.ERROR_FIGURE_DIR)
@@ -393,7 +394,7 @@ def plot_error_feature_distributions(preds: pd.DataFrame, comparison: pd.DataFra
 
     for ax, feature in zip(axes, features):
         sns.boxplot(x="Outcome", y=feature, data=df, hue="Outcome",
-                    order=["Correct", "Misclassified"], palette=["#55a868", "#c44e52"],
+                    order=["Correct", "Misclassified"], palette=[CORRECT_COLOR, ERROR_COLOR],
                     legend=False, ax=ax)
         delta = comparison.loc[comparison["feature"] == feature, "cliffs_delta"].iloc[0]
         ax.set_title(f"{feature}  (delta={delta:+.2f})", fontsize=11)

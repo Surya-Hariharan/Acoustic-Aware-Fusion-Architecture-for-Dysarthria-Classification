@@ -62,7 +62,14 @@ class TrainingConfig:
 
     amp: Optional[bool] = None                       # None = on iff device is CUDA
     device: Optional[str] = None                     # None = auto (cuda if available)
-    num_workers: int = 0
+    # 4, not 0: UASpeechDataset.__getitem__ does real CPU work per utterance
+    # (audio load, resample, VAD trim, MFCC) - at 0 workers that runs
+    # synchronously in the main process and starves the GPU between batches,
+    # which is the usual reason training looks like it isn't using the GPU
+    # at all even though the model is correctly placed on cuda. Set to 0 to
+    # fall back to the old synchronous behaviour (e.g. for step-by-step
+    # debugging where worker processes make tracebacks harder to read).
+    num_workers: int = 4
 
     max_folds: Optional[int] = None                  # only run the first N folds
     folds: Optional[List[str]] = None                # only run these fold IDs
