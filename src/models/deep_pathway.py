@@ -38,9 +38,25 @@ class DeepPathway(nn.Module):
 
     def __init__(self, use_lora: bool = True):
         super().__init__()
-        backbone = Wav2Vec2Model.from_pretrained(config.WAV2VEC_MODEL_NAME)
+        self.use_lora = use_lora
+        backbone = Wav2Vec2Model.from_pretrained(
+            config.WAV2VEC_MODEL_NAME, token=config.HF_TOKEN)
 
         if use_lora:
+            # use_reentrant=False (not the older reentrant checkpoint) recomputes
+            # activations during backward instead of storing them for every
+            # transformer layer - the standard ~20% compute / ~40% activation-memory
+            # trade-off, which is what makes batch=32 safe on an 8 GB card. Only
+            # meaningful here (use_lora=True): the frozen backbone below never
+            # builds a backward graph at all (none of its params require grad),
+            # so checkpointing it would trade compute for memory it never spends.
+            # Must happen before get_peft_model - the reentrant-free checkpoint
+            # only needs *some* trainable param inside the wrapped segment (the
+            # LoRA adapters, injected next), not a grad-requiring input, so no
+            # enable_input_require_grads() workaround is needed (and Wav2Vec2Model
+            # has no input embeddings to hook into anyway - it takes raw audio).
+            backbone.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
             lora_config = LoraConfig(
                 r=config.LORA_RANK,
                 lora_alpha=config.LORA_ALPHA,
@@ -52,7 +68,22 @@ class DeepPathway(nn.Module):
         else:
             for param in backbone.parameters():
                 param.requires_grad = False
+            backbone.eval()
             self.wav2vec = backbone
+
+    def train(self, mode: bool = True):
+        """
+        Keep the frozen backbone (use_lora=False) in eval mode even when the
+        engine calls model.train() for a training epoch — engine.run_epoch
+        toggles the whole model with one model.train(mode=train) call, which
+        would otherwise re-enable the backbone's internal dropout layers
+        despite every backbone param having requires_grad=False. Frozen
+        should mean deterministic, not "no weight updates but still noisy."
+        """
+        super().train(mode)
+        if not self.use_lora:
+            self.wav2vec.eval()
+        return self
 
     def forward_sequence(self, waveform: torch.Tensor) -> torch.Tensor:
         """

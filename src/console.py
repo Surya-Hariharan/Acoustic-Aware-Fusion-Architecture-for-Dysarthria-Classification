@@ -19,6 +19,16 @@ from typing import Dict, Iterable, Optional
 
 import pandas as pd
 
+# huggingface_hub/transformers report download and checkpoint-loading progress
+# via `tqdm.auto`, which resolves to the ipywidgets notebook bar in a Jupyter
+# kernel. That bar only animates in a *connected* kernel — the same
+# static-render problem documented on progress() below — so it forces the
+# same import here to make every library's bars (ours and HF's) plain ANSI
+# text that replays correctly from a saved/reopened notebook.
+import tqdm.std
+import tqdm.auto
+tqdm.auto.tqdm = tqdm.std.tqdm
+
 LINE_WIDTH = 78
 KEY_WIDTH = 40
 

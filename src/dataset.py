@@ -14,7 +14,8 @@ from torch.utils.data import Dataset
 
 from src import config
 from src.praat import praat_vector
-from src.preprocessing import build_mfcc_transform, extract_mfcc_features, load_and_preprocess
+from src.preprocessing import (extract_mfcc_features_cached,
+                               load_and_preprocess_cached)
 
 
 class UASpeechDataset(Dataset):
@@ -31,7 +32,6 @@ class UASpeechDataset(Dataset):
                  praat_table: Optional[pd.DataFrame] = None,
                  praat_stats: Optional[Tuple] = None):
         self.df = dataframe.reset_index(drop=True)
-        self.mfcc_transform = build_mfcc_transform()
 
         if (praat_table is None) != (praat_stats is None):
             raise ValueError(
@@ -48,8 +48,8 @@ class UASpeechDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         row = self.df.iloc[idx]
-        waveform = load_and_preprocess(row["Filepath"])
-        mfcc = extract_mfcc_features(waveform, self.mfcc_transform)
+        waveform = load_and_preprocess_cached(row["Filepath"])
+        mfcc = extract_mfcc_features_cached(row["Filepath"])
 
         item = {
             "waveform": waveform,                                   # (1, 64000)

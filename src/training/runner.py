@@ -28,7 +28,8 @@ from src.console import (V, print_architecture, print_banner, print_fold_progres
                         print_signal_chain, print_status, print_subheader, print_table)
 from src.praat import FEATURE_COLUMNS as PRAAT_FEATURE_COLUMNS
 from src.praat import load_praat_table
-from src.splits import build_severity_folds, get_severity_split, iter_loso_folds
+from src.splits import (build_severity_folds, get_severity_split, iter_loso_folds,
+                        iter_screening_folds, sample_severity_folds)
 from src.training.checkpoint import load_checkpoint, save_checkpoint
 from src.training.data import (TASK_LABEL_COLUMN, build_loaders,
                                compute_class_weights, stratified_train_val_split)
@@ -75,13 +76,41 @@ class TrainingConfig:
     folds: Optional[List[str]] = None                # only run these fold IDs
     limit_samples: Optional[int] = None               # cap rows per split — smoke testing only
 
+    # Detection: "loso" is the base-paper's full 28-fold protocol (expensive
+    # x 6 ablation variants); "screening" is a cheap speaker-grouped,
+    # class-stratified k-fold used to rank variants before spending full-LOSO
+    # GPU time on the winner(s). See src.splits.iter_screening_folds.
+    cv_protocol: str = "loso"
+    screening_folds: int = 8
 
-def build_folds(df: pd.DataFrame, task: str):
+    # Severity: None runs all 81 leave-one-per-class-out combinations (the
+    # base-paper protocol); an int randomly subsamples that many combos
+    # (src.splits.sample_severity_folds) — 81 folds x every ablation variant
+    # is the single largest GPU-time item in the training notebook.
+    severity_fold_sample: Optional[int] = None
+
+    # 1 = every batch steps the optimizer (unchanged default behaviour). >1
+    # accumulates that many batches' gradients before stepping, simulating a
+    # larger effective batch size (batch_size x grad_accum_steps) at
+    # batch_size's actual memory footprint — raise this instead of
+    # batch_size itself if a fold OOMs on a smaller GPU than the one
+    # DEFAULT_BATCH_SIZE was tuned for.
+    grad_accum_steps: int = 1
+
+
+def build_folds(df: pd.DataFrame, task: str, cfg: Optional["TrainingConfig"] = None):
     """Yield (fold_id, train_df, test_df) for the requested task's protocol."""
+    cfg = cfg or TrainingConfig()
     if task == "detection":
-        yield from iter_loso_folds(df)
+        if cfg.cv_protocol == "screening":
+            yield from iter_screening_folds(df, cfg.screening_folds, cfg.seed)
+        else:
+            yield from iter_loso_folds(df)
     else:
-        for combo in build_severity_folds(df):
+        combos = build_severity_folds(df)
+        if cfg.severity_fold_sample is not None:
+            combos = sample_severity_folds(combos, cfg.severity_fold_sample, cfg.seed)
+        for combo in combos:
             train_df, test_df = get_severity_split(df, combo)
             yield "-".join(combo), train_df, test_df
 
@@ -159,7 +188,16 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     use_amp = cfg.amp if cfg.amp is not None else (device.type == "cuda")
-    scaler = torch.amp.GradScaler(device=device.type, enabled=use_amp)
+    # bf16 over fp16 whenever the GPU supports it (Ampere/Ada and later,
+    # including the RTX 4060): bf16 keeps fp32's exponent range, so it can't
+    # underflow the way fp16 can mid LoRA fine-tuning, and needs no loss
+    # scaling — GradScaler is a no-op for gradient values in that range, so
+    # it's only left enabled for the fp16 fallback path where scaling is
+    # actually load-bearing.
+    amp_dtype = (torch.bfloat16 if use_amp and device.type == "cuda"
+                and torch.cuda.is_bf16_supported() else torch.float16)
+    scaler = torch.amp.GradScaler(device=device.type,
+                                  enabled=use_amp and amp_dtype == torch.float16)
     early_stopping = EarlyStopping(patience=cfg.patience, mode="min")
 
     log_dir = config.LOG_DIR / run_name / fold_id
@@ -175,10 +213,13 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     for epoch in range(cfg.epochs):
         train_result = run_epoch(model, train_loader, criterion, optimizer, device,
                                  scaler, cfg.grad_clip, cfg.task, train=True,
-                                 description=f"epoch {epoch + 1}/{cfg.epochs} train")
+                                 description=f"epoch {epoch + 1}/{cfg.epochs} train",
+                                 amp_dtype=amp_dtype, amp_enabled=use_amp,
+                                 grad_accum_steps=cfg.grad_accum_steps)
         val_result = run_epoch(model, val_loader, criterion, None, device,
                                scaler, cfg.grad_clip, cfg.task, train=False,
-                               description=f"epoch {epoch + 1}/{cfg.epochs} val")
+                               description=f"epoch {epoch + 1}/{cfg.epochs} val",
+                               amp_dtype=amp_dtype, amp_enabled=use_amp)
         scheduler.step(val_result.loss)
 
         writer.add_scalar("Loss/train", train_result.loss, epoch)
@@ -209,7 +250,8 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
 
     test_result = run_epoch(model, test_loader, criterion, None, device, scaler,
                             cfg.grad_clip, cfg.task, train=False, collect_embeddings=True,
-                            description=f"held-out test ({fold_id})")
+                            description=f"held-out test ({fold_id})",
+                            amp_dtype=amp_dtype, amp_enabled=use_amp)
 
     save_predictions(config.PREDICTIONS_DIR / run_name / f"{fold_id}.csv",
                      test_result.filenames, test_result.speaker_ids, test_result.y_true,
@@ -266,8 +308,13 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     if cfg.model in MODELS_REQUIRING_PRAAT:
         praat_table = load_praat_table()
 
-    protocol = ("Leave-One-Speaker-Out" if cfg.task == "detection"
-                else "balanced leave-one-speaker-per-class-out")
+    if cfg.task == "detection":
+        protocol = ("Leave-One-Speaker-Out" if cfg.cv_protocol != "screening"
+                    else f"screening ({cfg.screening_folds}-fold, speaker-grouped)")
+    else:
+        protocol = "balanced leave-one-speaker-per-class-out"
+        if cfg.severity_fold_sample is not None:
+            protocol += f" (subsampled to {cfg.severity_fold_sample} of 81)"
 
     print_banner("UA-Speech Dysarthria Classification",
                  f"{MODEL_DESCRIPTIONS.get(cfg.model, cfg.model)}")
@@ -286,7 +333,7 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
 
     print_signal_chain()
 
-    fold_iter = build_folds(df, cfg.task)
+    fold_iter = build_folds(df, cfg.task, cfg)
     if cfg.folds:
         wanted = set(cfg.folds)
         fold_iter = (f for f in fold_iter if f[0] in wanted)
@@ -295,10 +342,17 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         fold_iter = fold_iter[:cfg.max_folds]
 
     n_folds = len(fold_iter)
-    if cfg.limit_samples is not None or (cfg.max_folds is not None and cfg.max_folds < 28):
+    is_reduced_scale = (cfg.limit_samples is not None
+                        or (cfg.max_folds is not None and cfg.max_folds < 28)
+                        or cfg.cv_protocol == "screening")
+    if is_reduced_scale:
         print()
-        print_note("REDUCED SCALE — this is a pipeline check, not a reportable result "
-                   "(max_folds / limit_samples are set).")
+        if cfg.cv_protocol == "screening":
+            print_note("SCREENING PROTOCOL — cheap speaker-grouped k-fold for ranking "
+                       "ablation variants, not the base-paper's full LOSO result.")
+        else:
+            print_note("REDUCED SCALE — this is a pipeline check, not a reportable result "
+                       "(max_folds / limit_samples are set).")
 
     fold_metrics = []
     pooled_true, pooled_pred, pooled_prob, pooled_speakers = [], [], [], []
@@ -332,6 +386,15 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
                 continue
             y_true, y_pred, y_prob = test_result.y_true, test_result.y_pred, test_result.y_prob
             speakers = test_result.speaker_ids
+            # Each fold builds a fresh model/optimizer/scaler (run_fold) that goes
+            # out of scope here; without an explicit empty_cache(), the CUDA
+            # allocator's cached-but-unused blocks can fragment across 28-81
+            # sequential folds and quietly shrink the effective free memory a
+            # later fold sees, risking a late-run OOM (or reduced_precision
+            # allocator lock-in) hours into an unattended session. Skipped for
+            # cache-hit folds above since they never allocated anything.
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         fold_metrics.append(metrics_dict)
         pooled_true.append(y_true)

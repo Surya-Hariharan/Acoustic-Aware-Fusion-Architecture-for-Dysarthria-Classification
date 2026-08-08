@@ -34,7 +34,9 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
               optimizer: Optional[torch.optim.Optimizer], device: torch.device,
               scaler: torch.amp.GradScaler, grad_clip_norm: float, task: str,
               train: bool, collect_embeddings: bool = False,
-              description: str = "") -> EpochResult:
+              description: str = "", amp_dtype: torch.dtype = torch.float16,
+              amp_enabled: Optional[bool] = None,
+              grad_accum_steps: int = 1) -> EpochResult:
     """
     Run one full pass over `loader`.
 
@@ -43,11 +45,24 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
     always collected — the extra bookkeeping is negligible next to a
     wav2vec 2.0 forward pass. Set collect_embeddings=True only for the
     final per-fold test pass that populates outputs/embeddings/.
+
+    grad_accum_steps=1 (default) steps the optimizer every batch — identical
+    to the old unconditional per-batch step. >1 accumulates that many
+    batches' gradients (loss divided accordingly) before one optimizer step,
+    simulating a larger effective batch size at the true batch size's memory
+    footprint — a fallback for when raising cfg.batch_size directly risks
+    OOM. Inert when train=False (validation/test never touch this branch).
     """
     model.train(mode=train)
     label_key = "group_label" if task == "detection" else "severity_label"
     device_type = device.type
-    amp_enabled = scaler.is_enabled()
+    # Not derived from scaler.is_enabled(): the scaler is only ever enabled
+    # for the fp16 path (bf16 needs no loss scaling — see runner.py), so
+    # using it here would silently disable autocast itself whenever bf16 is
+    # selected. Falls back to the scaler's flag only for callers that don't
+    # pass amp_enabled explicitly, preserving the old behaviour for them.
+    if amp_enabled is None:
+        amp_enabled = scaler.is_enabled()
 
     running_loss, num_samples = 0.0, 0
     all_true, all_pred, all_prob, all_embeddings = [], [], [], []
@@ -56,9 +71,12 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
     grad_context = torch.enable_grad() if train else torch.no_grad()
     batches = (progress(loader, description, total=len(loader), leave=False, unit="batch")
                if description else loader)
+    num_batches = len(loader)
 
     with grad_context:
-        for batch in batches:
+        if train:
+            optimizer.zero_grad(set_to_none=True)
+        for step, batch in enumerate(batches):
             waveform = batch["waveform"].squeeze(1).to(device, non_blocking=True)
             mfcc = batch["mfcc"].to(device, non_blocking=True)
             labels = batch[label_key].to(device, non_blocking=True)
@@ -68,10 +86,7 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
             # src/training/models.py), so the engine needs no per-model branching.
             praat = batch["praat"].to(device, non_blocking=True) if "praat" in batch else None
 
-            if train:
-                optimizer.zero_grad(set_to_none=True)
-
-            with torch.autocast(device_type=device_type, enabled=amp_enabled):
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 if collect_embeddings:
                     features = model.forward_features(waveform, mfcc, praat)
                     logits = model.classifier(features)
@@ -80,11 +95,14 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
                 loss = criterion(logits, labels)
 
             if train:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss / grad_accum_steps).backward()
+                is_last_batch = (step + 1) == num_batches
+                if (step + 1) % grad_accum_steps == 0 or is_last_batch:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
 
             batch_size = labels.size(0)
             running_loss += loss.item() * batch_size

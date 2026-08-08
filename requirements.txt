@@ -16,5 +16,6 @@ tensorboard==2.21.0
 praat-parselmouth==0.4.7
 tqdm==4.67.3
 ipywidgets==8.1.8
+python-dotenv==1.1.1
 umap-learn==0.5.7
 shap==0.48.0

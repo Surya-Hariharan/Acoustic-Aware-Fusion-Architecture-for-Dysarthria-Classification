@@ -6,7 +6,12 @@ every module (scanning, preprocessing, dataset, splits, models) reads from a
 single source of truth.
 """
 
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -90,6 +95,17 @@ MAX_SAMPLES  = int(TARGET_SR * CLIP_SECONDS)
 N_MFCC       = 13
 MEL_KWARGS   = {"n_fft": 400, "hop_length": 160, "n_mels": 40}
 
+# Per-(process, filepath) memoization cap for src.preprocessing's cached
+# loaders — see load_and_preprocess_cached / extract_mfcc_features_cached.
+# Every DataLoader worker process holds its own cache up to this many
+# utterances; ~256 KB/waveform + ~62 KB/MFCC at CLIP_SECONDS=4.0, so 4000
+# is roughly 1.3 GB per worker (x num_workers processes — see
+# TrainingConfig.num_workers). Lower this (or set to 0 to disable caching
+# entirely) if a Colab session is RAM-constrained; raise it only up to the
+# fold's utterance count (more than that is wasted headroom, since nothing
+# beyond it will ever be re-requested within one fold).
+PREPROCESS_CACHE_SIZE = 4000
+
 # ---------------------------------------------------------------------------
 # Label mappings
 # ---------------------------------------------------------------------------
@@ -111,6 +127,13 @@ SEVERITY_LABEL_MAP = {
 # ---------------------------------------------------------------------------
 WAV2VEC_MODEL_NAME = "facebook/wav2vec2-base-960h"
 WAV2VEC_EMBED_DIM  = 768                        # latent embedding size
+
+# Read from the environment (`setx HF_TOKEN ...` / `$env:HF_TOKEN = ...`) rather
+# than hard-coded, so the token never lands in source control. Public models like
+# WAV2VEC_MODEL_NAME load fine without it; passing it when present just lifts the
+# unauthenticated-request rate limit and lets the same code load gated/private
+# checkpoints without a separate code path.
+HF_TOKEN = os.environ.get("HF_TOKEN")
 ACOUSTIC_EMBED_DIM = 128                        # 1D-CNN output embedding size
 
 LORA_RANK          = 8
@@ -137,12 +160,14 @@ DETECTION_CLASS_NAMES = ["Healthy Control", "Dysarthric Patient"]
 SEVERITY_CLASS_NAMES  = ["Very Low", "Low", "Mid", "High"]
 
 DEFAULT_EPOCHS        = 20
-# 16, not 8: AMP is already on for every CUDA run (src/training/runner.py),
+# 32, not 16: AMP is already on for every CUDA run (src/training/runner.py),
 # and LoRA fine-tuning only backpropagates through a few hundred-K adapter
-# params, not the frozen backbone — 8 was leaving GPU throughput unused
-# without buying any regularization benefit worth the slower 28/81-fold
-# sweep. Drop back to 8 (or lower) only if a fold OOMs on your GPU.
-DEFAULT_BATCH_SIZE    = 16
+# params, not the frozen backbone — a smaller batch was leaving GPU
+# throughput unused without buying any regularization benefit worth the
+# slower 28/81-fold sweep. wav2vec2-base at CLIP_SECONDS=4.0 with AMP fits
+# batch 32 comfortably on an 8 GB card (RTX 4060 and similar); drop to 16,
+# then 8, if a fold OOMs on a smaller GPU.
+DEFAULT_BATCH_SIZE    = 32
 DEFAULT_LR_HEAD       = 1e-3     # classifier head / acoustic pathway / LoRA adapters
 DEFAULT_LR_BACKBONE   = 1e-4     # wav2vec 2.0 backbone (only when fine-tuned)
 DEFAULT_WEIGHT_DECAY  = 1e-2
