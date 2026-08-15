@@ -10,6 +10,7 @@ Requires: transformers, peft
 """
 
 import warnings
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,13 @@ class DeepPathway(nn.Module):
         self.use_lora = use_lora
         backbone = Wav2Vec2Model.from_pretrained(
             config.WAV2VEC_MODEL_NAME, token=config.HF_TOKEN)
+        # Kept as a direct reference to the (unwrapped) backbone so the
+        # sample-length -> feature-length conversion below still works after
+        # get_peft_model wraps it — get_peft_model wraps this same nn.Module
+        # in place rather than copying it, so the bound method stays valid
+        # and correct (it's a pure function of conv strides, unaffected by
+        # LoRA adapters) even when self.wav2vec becomes a PeftModel.
+        self._feat_extract_output_lengths = backbone._get_feat_extract_output_lengths
 
         if use_lora:
             # use_reentrant=False (not the older reentrant checkpoint) recomputes
@@ -85,7 +93,8 @@ class DeepPathway(nn.Module):
             self.wav2vec.eval()
         return self
 
-    def forward_sequence(self, waveform: torch.Tensor) -> torch.Tensor:
+    def forward_sequence(self, waveform: torch.Tensor,
+                        attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         The per-frame hidden states, *before* the mean-pool that forward() applies.
 
@@ -94,20 +103,59 @@ class DeepPathway(nn.Module):
         attending to wav2vec's evidence requires the frames it is pooled from.
 
         Args:
-            waveform: (batch, samples) raw 16 kHz audio.
+            waveform: (batch, samples) raw 16 kHz audio, right-padded with
+                zeros past each row's true length.
+            attention_mask: (batch, samples) bool/long, True/1 for real audio,
+                False/0 for padding — passed straight to Wav2Vec2Model, which
+                natively converts a sample-level mask to its internal
+                feature-level one. None (default) attends over every sample,
+                including padding — only safe when the caller already knows
+                there is no padding (e.g. a single un-batched utterance).
         Returns:
             (batch, frames, 768) — ~199 frames for a 4-second clip.
         """
-        return self.wav2vec(waveform).last_hidden_state
+        return self.wav2vec(waveform, attention_mask=attention_mask).last_hidden_state
 
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+    def sequence_key_padding_mask(self, waveform: torch.Tensor,
+                                  attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        The frame-level padding mask matching forward_sequence's output, in
+        nn.MultiheadAttention's key_padding_mask convention (True = ignore
+        this position). Derived from the same sample lengths so the frame
+        count lines up exactly with what forward_sequence actually returns
+        for this waveform's shape.
+        """
+        num_frames = self._num_frames(waveform)
+        lengths = attention_mask.sum(dim=1)
+        feat_lengths = self._feat_extract_output_lengths(lengths)
+        frame_idx = torch.arange(num_frames, device=waveform.device)[None, :]
+        return frame_idx >= feat_lengths[:, None]           # True where padded
+
+    def _num_frames(self, waveform: torch.Tensor) -> int:
+        result = self._feat_extract_output_lengths(waveform.shape[1])
+        return int(result.item()) if torch.is_tensor(result) else int(result)
+
+    def forward(self, waveform: torch.Tensor,
+               attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             waveform: (batch, samples) raw 16 kHz audio.
+            attention_mask: see forward_sequence. When given, the mean-pool
+                below also excludes padded frames — otherwise every padded
+                utterance's embedding is diluted by however much silence was
+                appended to reach the fixed MAX_SAMPLES window.
         Returns:
-            (batch, 768) latent embedding, mean-pooled over time.
+            (batch, 768) latent embedding, mean-pooled over real frames only.
         """
-        return self.forward_sequence(waveform).mean(dim=1)
+        hidden = self.forward_sequence(waveform, attention_mask)
+        if attention_mask is None:
+            return hidden.mean(dim=1)
+
+        key_padding_mask = self.sequence_key_padding_mask(waveform, attention_mask)
+        frame_mask = (~key_padding_mask).unsqueeze(-1).to(hidden.dtype)  # (B, T, 1)
+        summed = (hidden * frame_mask).sum(dim=1)
+        counts = frame_mask.sum(dim=1).clamp(min=1.0)
+        return summed / counts
 
     def forward_all_layers(self, waveform: torch.Tensor) -> torch.Tensor:
         """

@@ -36,8 +36,9 @@ from src.training.data import (TASK_LABEL_COLUMN, build_loaders,
 from src.training.early_stopping import EarlyStopping
 from src.training.engine import EpochResult, build_optimizer, run_epoch
 from src.training.metrics import compute_confusion_matrix, compute_metrics
-from src.training.models import (MODEL_DESCRIPTIONS, MODELS_REQUIRING_PRAAT,
-                                 build_model)
+from src.training.models import (MODEL_DESCRIPTIONS,
+                                 MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING,
+                                 MODELS_REQUIRING_PRAAT, build_model)
 from src.training.reporting import (aggregate_fold_metrics, save_confusion_matrix,
                                     save_embeddings, save_metrics, save_predictions,
                                     save_roc_curve)
@@ -151,7 +152,12 @@ def _load_completed_fold(run_name: str, fold_id: str, task: str
             prob_cols = [f"prob_{name.replace(' ', '_')}" for name in class_names]
             y_prob = preds[prob_cols].to_numpy()
         speakers = preds["speaker_id"].tolist()
-    except Exception:
+    except Exception as exc:
+        # Deliberately swallowed, not re-raised: a corrupted/truncated resume
+        # file must not abort an unattended multi-hour run — falling back to
+        # retraining this one fold is the safe behaviour (see docstring). The
+        # note is printed so the corruption itself doesn't go unnoticed.
+        print_note(f"Could not load a prior result for fold {fold_id} ({exc}) — retraining it.")
         return None
 
     return metrics_dict, y_true, y_pred, y_prob, speakers
@@ -160,11 +166,13 @@ def _load_completed_fold(run_name: str, fold_id: str, task: str
 def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
             cfg: TrainingConfig, device: torch.device, run_name: str,
             praat_table: Optional[pd.DataFrame] = None,
+            frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None,
             fold_index: int = 1, n_folds: int = 1
             ) -> Tuple[Dict, EpochResult]:
     """Train, validate, checkpoint, and test-evaluate one fold. Returns
     (metrics_dict, test_result) — the caller pools test_result across
     folds for the cross-fold metrics."""
+    fold_start = time.monotonic()
     label_column = TASK_LABEL_COLUMN[cfg.task]
     num_classes = config.NUM_CLASSES[cfg.task]
 
@@ -178,7 +186,8 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
 
     train_loader, val_loader, test_loader = build_loaders(
         train_df, val_df, test_df, cfg.batch_size, cfg.num_workers,
-        pin_memory=(device.type == "cuda"), praat_table=praat_table)
+        pin_memory=(device.type == "cuda"), praat_table=praat_table,
+        frozen_embedding_table=frozen_embedding_table)
 
     model = build_model(cfg.model, num_classes).to(device)
     optimizer = build_optimizer(model, cfg.lr_head, cfg.lr_backbone, cfg.weight_decay)
@@ -248,16 +257,22 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     if best_ckpt_path.exists():
         load_checkpoint(best_ckpt_path, model, map_location=str(device))
 
+    train_time_s = time.monotonic() - fold_start
+    inference_start = time.monotonic()
     test_result = run_epoch(model, test_loader, criterion, None, device, scaler,
                             cfg.grad_clip, cfg.task, train=False, collect_embeddings=True,
                             description=f"held-out test ({fold_id})",
                             amp_dtype=amp_dtype, amp_enabled=use_amp)
+    inference_time_s = time.monotonic() - inference_start
+    fold_time_s = time.monotonic() - fold_start
 
     save_predictions(config.PREDICTIONS_DIR / run_name / f"{fold_id}.csv",
                      test_result.filenames, test_result.speaker_ids, test_result.y_true,
                      test_result.y_pred, test_result.y_prob, cfg.task)
     save_metrics(config.METRICS_DIR / run_name / f"{fold_id}.json",
-                {"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics})
+                {"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
+                 "fold_time_s": fold_time_s, "train_time_s": train_time_s,
+                 "inference_time_s": inference_time_s})
     save_confusion_matrix(
         config.CONFUSION_MATRIX_DIR / run_name / f"{fold_id}.png",
         compute_confusion_matrix(test_result.y_true, test_result.y_pred, cfg.task),
@@ -273,7 +288,9 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     print_kv(f"Fold {fold_id} held-out test", ", ".join(
         f"{k}={v:.3f}" for k, v in test_result.metrics.items()))
 
-    return {"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics}, test_result
+    return ({"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
+             "fold_time_s": fold_time_s, "train_time_s": train_time_s,
+             "inference_time_s": inference_time_s}, test_result)
 
 
 def run_training(df: pd.DataFrame, cfg: TrainingConfig,
@@ -307,6 +324,17 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     praat_table = None
     if cfg.model in MODELS_REQUIRING_PRAAT:
         praat_table = load_praat_table()
+
+    # deep_frozen/fusion_frozen only. The frozen wav2vec2 embedding is the
+    # same vector for a given file in every fold and every epoch (the
+    # backbone never updates), so it is extracted once for the whole dataset
+    # here — a cached, batched pass — rather than recomputed on every
+    # training-loop forward pass (see MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING).
+    frozen_embedding_table = None
+    if cfg.model in MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING:
+        from src.training.baseline import extract_frozen_embeddings_masked
+        embeddings = extract_frozen_embeddings_masked(df, device=device)
+        frozen_embedding_table = dict(zip(df["Filepath"], embeddings))
 
     if cfg.task == "detection":
         protocol = ("Leave-One-Speaker-Out" if cfg.cv_protocol != "screening"
@@ -372,7 +400,7 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         else:
             try:
                 metrics_dict, test_result = run_fold(fold_id, train_df, test_df, cfg, device,
-                                                     run_name, praat_table,
+                                                     run_name, praat_table, frozen_embedding_table,
                                                      fold_index=i, n_folds=n_folds)
             except Exception:
                 # One fold's OOM/transient failure should not abort a run that

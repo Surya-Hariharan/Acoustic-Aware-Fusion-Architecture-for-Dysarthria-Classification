@@ -46,6 +46,17 @@ from src.models.deep_pathway import DeepPathway
 from src.praat import FEATURE_COLUMNS
 
 
+def _masked_mean(sequence: torch.Tensor,
+                 key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """Mean-pool over time, excluding positions key_padding_mask marks as
+    padding (True). None (no mask given) falls back to a plain mean. Shared
+    by AttentionFusionModel and AttentionFusionPraatModel."""
+    if key_padding_mask is None:
+        return sequence.mean(dim=1)
+    valid = (~key_padding_mask).unsqueeze(-1).to(sequence.dtype)  # (B, T, 1)
+    return (sequence * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+
+
 class CrossAttentionBlock(nn.Module):
     """
     One stream attends to another: pre-norm multi-head cross-attention with a
@@ -77,17 +88,25 @@ class CrossAttentionBlock(nn.Module):
         )
 
     def forward(self, query: torch.Tensor, context: torch.Tensor,
-                need_weights: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                need_weights: bool = False,
+                context_key_padding_mask: Optional[torch.Tensor] = None
+                ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             query:   (B, Tq, dim) the stream doing the attending.
             context: (B, Tc, dim) the stream being attended to.
+            context_key_padding_mask: (B, Tc) bool, True where `context` is
+                padding (past its source pathway's real-audio length) — see
+                DeepPathway/AcousticPathway.sequence_key_padding_mask. Without
+                this, a query attends into the padded-silence tail of the
+                fixed analysis window just like the plain pooled paths did.
         Returns:
             ((B, Tq, dim) attended query, (B, Tq, Tc) attention weights or None)
         """
         attended, weights = self.attention(
             self.norm_query(query), self.norm_context(context), self.norm_context(context),
-            need_weights=need_weights, average_attn_weights=True)
+            need_weights=need_weights, average_attn_weights=True,
+            key_padding_mask=context_key_padding_mask)
         x = query + attended                       # residual 1
         x = x + self.ffn(self.norm_ffn(x))         # residual 2
         return x, weights
@@ -133,33 +152,55 @@ class AttentionFusionModel(nn.Module):
             nn.Linear(256, num_classes),
         )
 
-    def _project(self, waveform: torch.Tensor, mfcc: torch.Tensor
-                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        deep = self.deep_proj(self.deep_pathway.forward_sequence(waveform))
+    def _project(self, waveform: torch.Tensor, mfcc: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None
+                ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        deep = self.deep_proj(self.deep_pathway.forward_sequence(waveform, attention_mask))
         acoustic = self.acoustic_proj(self.acoustic_pathway.forward_sequence(mfcc))
-        return deep, acoustic
+        deep_mask = acoustic_mask = None
+        if attention_mask is not None:
+            deep_mask = self.deep_pathway.sequence_key_padding_mask(waveform, attention_mask)
+            acoustic_mask = self.acoustic_pathway.sequence_key_padding_mask(mfcc, attention_mask)
+        return deep, acoustic, deep_mask, acoustic_mask
 
     def forward_features(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                         praat: torch.Tensor = None) -> torch.Tensor:
+                         praat: torch.Tensor = None,
+                         attention_mask: Optional[torch.Tensor] = None,
+                         deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             waveform: (batch, samples) raw audio.
             mfcc:     (batch, 39, frames) acoustic features.
             praat:    ignored — accepted so every model shares one call signature.
+            attention_mask: (batch, samples) real-audio mask (see DeepPathway).
+                Masks both the cross-attention (neither stream can attend into
+                the other's padded tail) and the post-attention mean-pool.
+            deep_embedding: ignored — this model always needs wav2vec's per-
+                frame sequence (forward_sequence), not the pooled vector the
+                frozen-embedding cache stores, and always runs with
+                use_lora=True (see MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING),
+                so the cache is never populated for it. Accepted only so every
+                model shares one call signature.
         Returns:
             (batch, 512) attention-fused embedding, pre-classification-head.
         """
-        deep, acoustic = self._project(waveform, mfcc)
-        deep_attended, _ = self.deep_from_acoustic(deep, acoustic)
-        acoustic_attended, _ = self.acoustic_from_deep(acoustic, deep)
-        return torch.cat([deep_attended.mean(dim=1), acoustic_attended.mean(dim=1)], dim=1)
+        deep, acoustic, deep_mask, acoustic_mask = self._project(waveform, mfcc, attention_mask)
+        deep_attended, _ = self.deep_from_acoustic(deep, acoustic,
+                                                   context_key_padding_mask=acoustic_mask)
+        acoustic_attended, _ = self.acoustic_from_deep(acoustic, deep,
+                                                       context_key_padding_mask=deep_mask)
+        return torch.cat([_masked_mean(deep_attended, deep_mask),
+                          _masked_mean(acoustic_attended, acoustic_mask)], dim=1)
 
     def forward(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                praat: torch.Tensor = None) -> torch.Tensor:
-        return self.classifier(self.forward_features(waveform, mfcc, praat))
+                praat: torch.Tensor = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.classifier(self.forward_features(waveform, mfcc, praat, attention_mask))
 
     @torch.no_grad()
-    def attention_weights(self, waveform: torch.Tensor, mfcc: torch.Tensor
+    def attention_weights(self, waveform: torch.Tensor, mfcc: torch.Tensor,
+                          attention_mask: Optional[torch.Tensor] = None
                           ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         The two attention maps, for interpretability.
@@ -170,9 +211,11 @@ class AttentionFusionModel(nn.Module):
         rather than merely better - and it is the groundwork for ROADMAP Phase 6's
         deferred explainability item.
         """
-        deep, acoustic = self._project(waveform, mfcc)
-        _, deep_over_acoustic = self.deep_from_acoustic(deep, acoustic, need_weights=True)
-        _, acoustic_over_deep = self.acoustic_from_deep(acoustic, deep, need_weights=True)
+        deep, acoustic, deep_mask, acoustic_mask = self._project(waveform, mfcc, attention_mask)
+        _, deep_over_acoustic = self.deep_from_acoustic(
+            deep, acoustic, need_weights=True, context_key_padding_mask=acoustic_mask)
+        _, acoustic_over_deep = self.acoustic_from_deep(
+            acoustic, deep, need_weights=True, context_key_padding_mask=deep_mask)
         return deep_over_acoustic, acoustic_over_deep
 
 
@@ -238,12 +281,18 @@ class AttentionFusionPraatModel(nn.Module):
         )
 
     def forward_features(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                         praat: torch.Tensor = None) -> torch.Tensor:
+                         praat: torch.Tensor = None,
+                         attention_mask: Optional[torch.Tensor] = None,
+                         deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             waveform: (batch, samples) raw audio.
             mfcc:     (batch, 39, frames) acoustic features.
             praat:    (batch, num_praat_features) standardized Praat features.
+            attention_mask: (batch, samples) real-audio mask (see DeepPathway).
+                The Praat token is never padding, so its own mask entry is
+                always False (never ignored).
+            deep_embedding: ignored — see AttentionFusionModel.forward_features.
         Returns:
             (batch, 768) tri-modal attention-fused embedding.
         """
@@ -255,23 +304,38 @@ class AttentionFusionPraatModel(nn.Module):
                 "does this automatically for model='attention_fusion_praat'."
             )
 
-        deep = self.deep_proj(self.deep_pathway.forward_sequence(waveform))
+        deep = self.deep_proj(self.deep_pathway.forward_sequence(waveform, attention_mask))
         acoustic = self.acoustic_proj(self.acoustic_pathway.forward_sequence(mfcc))
         praat_token = self.praat_encoder(praat).unsqueeze(1)            # (B, 1, 256)
+
+        deep_mask = acoustic_mask = praat_mask = None
+        if attention_mask is not None:
+            deep_mask = self.deep_pathway.sequence_key_padding_mask(waveform, attention_mask)
+            acoustic_mask = self.acoustic_pathway.sequence_key_padding_mask(mfcc, attention_mask)
+            praat_mask = torch.zeros(praat_token.shape[0], 1, dtype=torch.bool,
+                                     device=praat_token.device)
 
         # Each learned stream attends over the other stream *plus* the Praat token.
         deep_context = torch.cat([acoustic, praat_token], dim=1)
         acoustic_context = torch.cat([deep, praat_token], dim=1)
+        deep_context_mask = (torch.cat([acoustic_mask, praat_mask], dim=1)
+                             if attention_mask is not None else None)
+        acoustic_context_mask = (torch.cat([deep_mask, praat_mask], dim=1)
+                                 if attention_mask is not None else None)
 
-        deep_attended, _ = self.deep_from_context(deep, deep_context)
-        acoustic_attended, _ = self.acoustic_from_context(acoustic, acoustic_context)
+        deep_attended, _ = self.deep_from_context(
+            deep, deep_context, context_key_padding_mask=deep_context_mask)
+        acoustic_attended, _ = self.acoustic_from_context(
+            acoustic, acoustic_context, context_key_padding_mask=acoustic_context_mask)
 
         return torch.cat([
-            deep_attended.mean(dim=1),
-            acoustic_attended.mean(dim=1),
+            _masked_mean(deep_attended, deep_mask),
+            _masked_mean(acoustic_attended, acoustic_mask),
             praat_token.squeeze(1),
         ], dim=1)
 
     def forward(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                praat: torch.Tensor = None) -> torch.Tensor:
-        return self.classifier(self.forward_features(waveform, mfcc, praat))
+                praat: torch.Tensor = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.classifier(self.forward_features(waveform, mfcc, praat, attention_mask))

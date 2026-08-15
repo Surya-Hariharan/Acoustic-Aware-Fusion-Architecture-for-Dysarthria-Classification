@@ -81,17 +81,34 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
             mfcc = batch["mfcc"].to(device, non_blocking=True)
             labels = batch[label_key].to(device, non_blocking=True)
 
+            # Sample-level boolean mask (True = real audio, False = the
+            # zero-padding _pad_or_truncate appended past waveform_length) —
+            # every model threads this to DeepPathway so wav2vec2's
+            # self-attention and pooling never draw on padded silence
+            # (see src/preprocessing.py's load_and_preprocess docstring).
+            waveform_length = batch["waveform_length"].to(device, non_blocking=True)
+            attention_mask = (torch.arange(waveform.shape[1], device=device)[None, :]
+                              < waveform_length[:, None])
+
             # Present only when the Dataset was built with a Praat table, i.e.
             # for Phase 6's Model F. Every other model ignores it (see
             # src/training/models.py), so the engine needs no per-model branching.
             praat = batch["praat"].to(device, non_blocking=True) if "praat" in batch else None
+            # Present only for deep_frozen/fusion_frozen (see
+            # MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING) — the precomputed frozen
+            # wav2vec2 vector, used instead of a live backbone forward pass.
+            deep_embedding = (batch["deep_embedding"].to(device, non_blocking=True)
+                              if "deep_embedding" in batch else None)
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 if collect_embeddings:
-                    features = model.forward_features(waveform, mfcc, praat)
+                    features = model.forward_features(waveform, mfcc, praat,
+                                                       attention_mask=attention_mask,
+                                                       deep_embedding=deep_embedding)
                     logits = model.classifier(features)
                 else:
-                    logits = model(waveform, mfcc, praat)
+                    logits = model(waveform, mfcc, praat, attention_mask=attention_mask,
+                                   deep_embedding=deep_embedding)
                 loss = criterion(logits, labels)
 
             if train:

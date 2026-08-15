@@ -35,6 +35,13 @@ from src.training.utils import resolve_device
 
 EMBEDDING_CACHE_PATH = config.EMBEDDINGS_DIR / "frozen_wav2vec_base.npz"
 ALL_LAYERS_CACHE_PATH = config.EMBEDDINGS_DIR / "frozen_wav2vec_all_layers.npz"
+# Separate from EMBEDDING_CACHE_PATH deliberately: that cache mean-pools over
+# every frame including the zero-padded tail (kept as-is for the Phase 2 SVM
+# baseline, so its numbers stay comparable across reruns) — this one excludes
+# padding via the attention-mask fix (see src.models.deep_pathway), which is
+# what deep_frozen/fusion_frozen training must actually consume. Conflating
+# the two under one cache file would silently mix two different embeddings.
+MASKED_EMBEDDING_CACHE_PATH = config.EMBEDDINGS_DIR / "frozen_wav2vec_base_masked.npz"
 
 
 @torch.no_grad()
@@ -120,6 +127,55 @@ def extract_frozen_embeddings_all_layers(df: pd.DataFrame, device: Optional[torc
     np.savez(ALL_LAYERS_CACHE_PATH, embeddings=embeddings,
             filepaths=df["Filepath"].to_numpy())
     print_kv("Frozen per-layer embeddings", f"extracted and cached to {ALL_LAYERS_CACHE_PATH}")
+    return embeddings
+
+
+@torch.no_grad()
+def extract_frozen_embeddings_masked(df: pd.DataFrame, device: Optional[torch.device] = None,
+                                     batch_size: int = 16, num_workers: int = 4,
+                                     use_cache: bool = True) -> np.ndarray:
+    """
+    768-dim frozen wav2vec 2.0 embedding per row of df, pooled with the
+    attention-mask fix (padded-tail frames excluded) — what deep_frozen and
+    fusion_frozen training actually need (see src.training.data.build_loaders'
+    frozen_embedding_table wiring). Same one-extraction-per-file rationale and
+    cache pattern as extract_frozen_embeddings, kept as a separate function/
+    cache file (MASKED_EMBEDDING_CACHE_PATH) rather than a flag on that one,
+    since the two are genuinely different numbers and a flag makes it too easy
+    to load the wrong cache for a given caller.
+    """
+    config.ensure_directories()
+    if use_cache and MASKED_EMBEDDING_CACHE_PATH.exists():
+        cached = np.load(MASKED_EMBEDDING_CACHE_PATH, allow_pickle=True)
+        cached_paths = cached["filepaths"]
+        if set(df["Filepath"]).issubset(set(cached_paths)):
+            index = {path: i for i, path in enumerate(cached_paths)}
+            order = [index[p] for p in df["Filepath"]]
+            print_kv("Frozen embeddings (masked)", f"loaded from cache ({MASKED_EMBEDDING_CACHE_PATH})")
+            return cached["embeddings"][order]
+
+    device = device or resolve_device()
+    model = DeepPathway(use_lora=False).to(device).eval()
+    loader = DataLoader(UASpeechDataset(df), batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=(device.type == "cuda"))
+
+    print_header("Extracting Frozen wav2vec 2.0 Embeddings (attention-masked)")
+    print_kv("Utterances", len(df))
+    print_kv("Device", device)
+
+    embeddings = []
+    for batch in progress(loader, "Frozen wav2vec 2.0 forward (masked)", total=len(loader),
+                          unit="batch"):
+        waveform = batch["waveform"].squeeze(1).to(device, non_blocking=True)
+        waveform_length = batch["waveform_length"].to(device, non_blocking=True)
+        attention_mask = (torch.arange(waveform.shape[1], device=device)[None, :]
+                          < waveform_length[:, None])
+        embeddings.append(model(waveform, attention_mask=attention_mask).cpu().numpy())
+    embeddings = np.concatenate(embeddings)
+
+    np.savez(MASKED_EMBEDDING_CACHE_PATH, embeddings=embeddings,
+            filepaths=df["Filepath"].to_numpy())
+    print_kv("Frozen embeddings (masked)", f"extracted and cached to {MASKED_EMBEDDING_CACHE_PATH}")
     return embeddings
 
 

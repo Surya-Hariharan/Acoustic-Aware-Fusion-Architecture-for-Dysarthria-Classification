@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
-from scipy.stats import wilcoxon
+from scipy.stats import binomtest, wilcoxon
 from sklearn.metrics import (auc, average_precision_score, precision_recall_curve,
                              roc_curve)
 
@@ -134,6 +135,152 @@ def compare_models_statistically(run_a: str, run_b: str, metric: str = "f1") -> 
         "statistic": float(statistic), "p_value": float(p_value),
         "significant": bool(p_value < 0.05),
     }
+
+
+def mcnemar_test(run_a: str, run_b: str) -> Dict:
+    """
+    Exact McNemar test on paired per-utterance correctness between two runs —
+    answers "of the utterances the two models disagree on, is one model right
+    more often than the other?", which a difference in pooled accuracy alone
+    cannot answer (a tie in overall accuracy can still hide one model being
+    systematically better on a specific subset the other gets wrong).
+
+    Loads outputs/predictions/<run>/*.csv via src.error_analysis.load_run_predictions
+    for both runs (already written by every run — no training-pipeline change
+    needed) and inner-joins on `filename`, so only utterances both runs were
+    actually evaluated on are compared. Both runs must share the same held-out
+    utterances for the pairing to be meaningful (true for any two of the primary
+    detection sweep's variants, since all six use the same LOSO folds).
+
+    Uses the exact binomial form on the discordant pairs (scipy.stats.binomtest)
+    rather than the chi-square approximation — correct at any discordant-pair
+    count, including the small ones typical of a single LOSO fold's test split,
+    where the chi-square approximation is unreliable. No new dependency:
+    statsmodels' contingency-table implementation is not used since scipy
+    (already a project dependency) covers the same exact test directly.
+    """
+    from src.error_analysis import load_run_predictions
+
+    preds_a = load_run_predictions(run_a)[["filename", "correct"]].rename(
+        columns={"correct": "correct_a"})
+    preds_b = load_run_predictions(run_b)[["filename", "correct"]].rename(
+        columns={"correct": "correct_b"})
+    merged = preds_a.merge(preds_b, on="filename", how="inner")
+    if len(merged) == 0:
+        raise ValueError(
+            f"No overlapping utterances between '{run_a}' and '{run_b}' — "
+            "they must be trained on the same fold protocol/dataset."
+        )
+
+    # Discordant pairs: utterances exactly one of the two models got right.
+    a_only = int(((merged["correct_a"]) & (~merged["correct_b"])).sum())
+    b_only = int(((~merged["correct_a"]) & (merged["correct_b"])).sum())
+    n_discordant = a_only + b_only
+
+    if n_discordant == 0:
+        p_value = 1.0
+    else:
+        # Under H0 (the two models are equally likely to be the one that's
+        # right on a discordant pair), a_only ~ Binomial(n_discordant, 0.5).
+        p_value = float(binomtest(a_only, n_discordant, 0.5, alternative="two-sided").pvalue)
+
+    return {
+        "run_a": run_a, "run_b": run_b, "n_utterances": len(merged),
+        "a_correct_b_wrong": a_only, "b_correct_a_wrong": b_only,
+        "n_discordant": n_discordant, "p_value": p_value,
+        "significant": bool(p_value < 0.05),
+    }
+
+
+def bootstrap_ci(run_name: str, metric: str = "f1", n_boot: int = 2000,
+                 ci: float = 0.95, seed: int = 42) -> Dict:
+    """
+    Percentile bootstrap confidence interval for one run's pooled metric,
+    resampled at the FOLD level (not raw utterance level) from
+    outputs/metrics/<run>.per_fold.csv.
+
+    Folds, not utterances, are this project's unit of statistical independence
+    — src.results.compare_models_statistically already relies on this for the
+    paired Wilcoxon test, for the same reason: utterances from the same LOSO
+    fold (and often the same speaker) are not independent draws, so resampling
+    individual utterances would understate the true uncertainty. Resampling
+    whole folds with replacement and recomputing the mean each time gives a CI
+    that respects that structure.
+    """
+    path = config.METRICS_DIR / f"{run_name}.per_fold.csv"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing per-fold metrics for '{run_name}' — train it first "
+            "(src.training.runner.run_training)."
+        )
+    values = pd.read_csv(path)[metric].dropna().to_numpy()
+    if len(values) < 2:
+        raise ValueError(f"Only {len(values)} fold(s) with a valid '{metric}' — "
+                         "need at least 2 to bootstrap.")
+
+    rng = np.random.default_rng(seed)
+    boot_means = np.empty(n_boot)
+    for i in range(n_boot):
+        sample = rng.choice(values, size=len(values), replace=True)
+        boot_means[i] = sample.mean()
+
+    alpha = 1 - ci
+    lower, upper = np.percentile(boot_means, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return {
+        "run_name": run_name, "metric": metric, "n_folds": len(values),
+        "n_boot": n_boot, "ci": ci,
+        "mean": float(values.mean()),
+        "ci_lower": float(lower), "ci_upper": float(upper),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ablation gain table
+# ---------------------------------------------------------------------------
+def compute_ablation_gains(comparison_df: pd.DataFrame,
+                           metrics: List[str] = ("accuracy", "f1", "auroc")) -> pd.DataFrame:
+    """
+    The five deltas the primary ablation matrix exists to answer, computed
+    from the six-variant comparison table (index = model name: acoustic,
+    deep_frozen, deep_lora, fusion_frozen, fusion, attention_fusion — see
+    notebooks/03_training.ipynb Stage 8e):
+
+        fusion_over_mfcc            fusion         - acoustic        (RQ3)
+        fusion_over_wav2vec         fusion         - deep_lora       (RQ3)
+        lora_over_frozen            deep_lora      - deep_frozen     (RQ4, standalone)
+        lora_over_frozen_in_fusion  fusion         - fusion_frozen   (RQ4, inside fusion)
+        proposed_over_fusion        attention_fusion - fusion        (proposed-model gain)
+
+    Reports both the absolute gain in percentage points and the relative gain
+    as a percentage of the baseline, for each requested metric (values are
+    assumed to be fractions in [0, 1], matching src.training.metrics.compute_metrics'
+    output). A comparison whose model or baseline row is missing from
+    comparison_df is skipped (not raised) — useful while the primary sweep is
+    still partially trained.
+    """
+    comparisons = {
+        "fusion_over_mfcc": ("fusion", "acoustic"),
+        "fusion_over_wav2vec": ("fusion", "deep_lora"),
+        "lora_over_frozen": ("deep_lora", "deep_frozen"),
+        "lora_over_frozen_in_fusion": ("fusion", "fusion_frozen"),
+        "proposed_over_fusion": ("attention_fusion", "fusion"),
+    }
+    rows = []
+    for label, (better, worse) in comparisons.items():
+        if better not in comparison_df.index or worse not in comparison_df.index:
+            print_kv("Ablation gain skipped", f"{label} — '{better}' or '{worse}' not yet in the table")
+            continue
+        row = {"comparison": label, "model": better, "baseline": worse}
+        for metric in metrics:
+            if metric not in comparison_df.columns:
+                continue
+            better_val, worse_val = comparison_df.loc[better, metric], comparison_df.loc[worse, metric]
+            row[f"{metric}_abs_gain_pp"] = 100 * (better_val - worse_val)
+            row[f"{metric}_rel_gain_pct"] = (
+                100 * (better_val - worse_val) / worse_val if worse_val else float("nan"))
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ train portion (carving out a validation slice) and turning DataFrames into
 PyTorch DataLoaders.
 """
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -89,7 +89,8 @@ def compute_class_weights(train_df: pd.DataFrame, task: str) -> torch.Tensor:
 
 def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame,
                   batch_size: int, num_workers: int, pin_memory: bool,
-                  praat_table: Optional[pd.DataFrame] = None
+                  praat_table: Optional[pd.DataFrame] = None,
+                  frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None
                   ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Wrap the three fold DataFrames into DataLoaders.
@@ -100,13 +101,21 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     the normalization of the very fold that is meant to be measuring generalization
     to that speaker — a subtle leak, but a real one in a LOSO protocol, and exactly
     the kind a reviewer will ask about.
+
+    frozen_embedding_table (Filepath -> 768-dim np.ndarray) is given only for
+    the deep_frozen/fusion_frozen variants (see src.training.runner.run_fold) —
+    the frozen wav2vec2 embedding is identical across every fold/epoch (the
+    backbone never updates), so it is computed once for the whole dataset via
+    src.training.baseline.extract_frozen_embeddings_masked and handed to every
+    fold's Dataset here rather than recomputed on every forward pass.
     """
     praat_stats = None
     if praat_table is not None:
         praat_stats = praat_standardizer(praat_table, train_df["Filename"])
 
     def dataset(df: pd.DataFrame) -> UASpeechDataset:
-        return UASpeechDataset(df, praat_table=praat_table, praat_stats=praat_stats)
+        return UASpeechDataset(df, praat_table=praat_table, praat_stats=praat_stats,
+                               frozen_embedding_table=frozen_embedding_table)
 
     # __getitem__ does real CPU work per utterance (torchaudio.load, resample,
     # VAD trim, MFCC + deltas) - with num_workers=0 that runs synchronously in

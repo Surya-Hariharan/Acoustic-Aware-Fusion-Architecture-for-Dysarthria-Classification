@@ -12,7 +12,7 @@ The base paper uses a **frozen** wav2vec 2.0 as a feature extractor feeding an S
 
 ## Architecture
 
-Three pathways feed a classification head; how they combine is itself the ablation ladder this project runs (see [ROADMAP.md](ROADMAP.md) Phase 3 and 6).
+Three pathways feed a classification head; how they combine is itself the ablation ladder this project runs (Phase 3 and 6 — see the status table below).
 
 | Pathway | Input | Model | Output |
 |---|---|---|---|
@@ -64,7 +64,7 @@ The corrected scan also skips macOS resource-fork duplicates (`._` prefix), whic
 
 ## Preprocessing
 
-Audio is resampled to 16 kHz mono, silence-trimmed by voice activity detection, and padded or truncated to a fixed four-second window. MFCCs are 13 coefficients plus delta and delta-delta (39-dim per frame), matching the base paper's baseline features. A single dataset class returns the waveform, the MFCC tensor, both labels, and the speaker ID, so the two pathways always see identical audio and identical splits.
+Audio is resampled to 16 kHz mono, silence-trimmed by Silero VAD (`src/vad.py` — leading/trailing non-speech removed, internal pauses preserved, deterministic, with a safe fallback to the original waveform if VAD fails), and padded or truncated to a fixed four-second window. MFCCs are 13 coefficients plus delta and delta-delta (39-dim per frame), matching the base paper's baseline features. A single dataset class returns the waveform, the MFCC tensor, both labels, and the speaker ID, so the two pathways always see identical VAD-processed audio and identical splits.
 
 ## Repository layout
 
@@ -72,15 +72,14 @@ All logic lives in `src/`; only functions and architecture belong there. Noteboo
 
 ```text
 requirements.txt                Python dependencies
-ROADMAP.md                      Phases 2-6: baseline reproduction, ablation, Praat
-                                 analysis, error analysis, novel contribution
 notebooks/
   01_data_pipeline.ipynb        Interactive data-pipeline driver; imports src/
-  02_feature_analysis.ipynb     MFCC + Phase 4 Praat feature extraction, EDA, feature
-                                 correlation, severity-group significance
+  02_feature_analysis.ipynb     MFCC + VAD validation, Phase 4 Praat feature extraction,
+                                 EDA, feature correlation, severity-group significance
   03_training.ipynb             Interactive training driver: pipeline sanity check,
                                  Phase 2 baseline reproduction, MFCC-only/Wav2Vec2-only/
-                                 Fusion training, automatic experiment comparison
+                                 Fusion training, automatic experiment comparison,
+                                 budget-managed primary-detection sweep (VAD + LoRA)
   04_model_analysis.ipynb       Phase 6 interpretability: ablation chart, embedding
                                  space (t-SNE/PCA/UMAP), attention maps, SHAP
   05_error_analysis.ipynb       Phase 5: misclassifications correlated against Praat features
@@ -93,12 +92,18 @@ data/
                                  base-paper PDF), readme_UASpeech.txt, UASPEECH_LICENSE.txt
 outputs/                        Generated figures, manifest, and training artifacts (gitignored)
   checkpoints/ logs/ predictions/ metrics/ confusion_matrix/ roc/ embeddings/
+  experiments/<name>/           Per-experiment bundle (config.json, metrics.json,
+                                 predictions.csv, timing.json, checkpoint/) for the
+                                 budget-managed primary-detection sweep — additive to
+                                 the flat dirs above, not a replacement for them
 src/
   config.py                     Paths, speaker ground truth, label maps, hyperparameters
   console.py                    Aligned console output helpers
   extraction.py                 Archive extraction
   scanning.py                   Filename parsing, verification, mic filter, severity labels
-  preprocessing.py              Resampling, VAD trimming, padding, MFCC extraction
+  preprocessing.py              Resampling, Silero VAD trimming, padding, MFCC extraction
+  vad.py                        Silero VAD wrapper (leading/trailing trim, fallback,
+                                 per-utterance stats)
   praat.py                      Phase 4: 31 Praat features (F0, jitter, shimmer, HNR, CPPS,
                                  formants, intensity, rhythm) + severity-group significance test
   error_analysis.py             Phase 5: per-error diagnostics, Praat-correlation explainability
@@ -126,9 +131,8 @@ src/
     early_stopping.py           Early stopping on validation loss
     checkpoint.py                Checkpoint save/load
     reporting.py                Predictions/metrics/confusion-matrix/ROC/embeddings I/O
-scripts/
-  check_data_integrity.py       Standalone data-integrity verification (see ROADMAP.md)
-  run_full_training.py          Unattended full-scale driver for all six ablation variants
+    budget.py                   ExperimentBudgetManager: measures real per-variant cost and
+                                 allocates a wall-clock budget across the primary sweep
 ```
 
 ## Usage
@@ -143,7 +147,7 @@ Copy `UASpeech_normalized_C.tgz` and `UASpeech_normalized_FM.tgz` into `data/arc
 # 1. Data pipeline
 jupyter notebook notebooks/01_data_pipeline.ipynb
 
-# 2. Feature analysis (MFCC + Praat)
+# 2. Feature analysis (MFCC + VAD validation + Praat)
 jupyter notebook notebooks/02_feature_analysis.ipynb
 
 # 3. Training
@@ -173,7 +177,7 @@ cfg = TrainingConfig(task="detection", model="fusion")   # LOSO, 28 folds
 summary, pooled = run_training(df_m6, cfg)
 ```
 
-`model` is one of `acoustic`, `deep_frozen`, `deep_lora`, `fusion`, `attention_fusion`, `attention_fusion_praat` (see [ROADMAP.md](ROADMAP.md) for what each maps to in the ablation study — the last two are `notebooks/02_feature_analysis.ipynb`'s Praat features and Phase 6's cross-attention contribution). Every fold writes a checkpoint, TensorBoard log (`tensorboard --logdir outputs/logs`), predictions CSV, metrics JSON, confusion matrix, ROC curve, and fused embedding under `outputs/`; run-level metrics are reported both as a per-fold mean ± std and pooled across all folds. `TrainingConfig(..., max_folds=1, epochs=1, limit_samples=24)` gives a fast pipeline sanity check before a real run — notebook 3's Stage 1 does exactly this. Phase 2's baseline reproduction (frozen wav2vec 2.0 + linear SVM, via `src/training/baseline.py`) lives in the same notebook, which groups every ablation variant into three families (MFCC-only, Wav2Vec2-only, Fusion) so each can be run, resumed, or extended independently.
+`model` is one of `acoustic`, `deep_frozen`, `deep_lora`, `fusion_frozen`, `fusion`, `attention_fusion`, `attention_fusion_praat` (see `src/training/models.py::MODEL_DESCRIPTIONS` for what each maps to in the ablation study — the last one is `notebooks/02_feature_analysis.ipynb`'s Praat features on top of Phase 6's cross-attention contribution). Every fold writes a checkpoint, TensorBoard log (`tensorboard --logdir outputs/logs`), predictions CSV, metrics JSON, confusion matrix, ROC curve, and fused embedding under `outputs/`; run-level metrics are reported both as a per-fold mean ± std and pooled across all folds. `TrainingConfig(..., max_folds=1, epochs=1, limit_samples=24)` gives a fast pipeline sanity check before a real run — notebook 3's Stage 1 does exactly this. Phase 2's baseline reproduction (frozen wav2vec 2.0 + linear SVM, via `src/training/baseline.py`) lives in the same notebook, which groups every ablation variant into three families (MFCC-only, Wav2Vec2-only, Fusion) so each can be run, resumed, or extended independently.
 
 ## Status
 

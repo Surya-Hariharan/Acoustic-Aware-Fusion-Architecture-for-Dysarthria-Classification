@@ -6,8 +6,9 @@ Deep Pathway (wav2vec 2.0 + LoRA) and the MFCC tensor for the Acoustic
 Pathway (1D-CNN) — so both are trained on identical audio and splits.
 """
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -30,7 +31,8 @@ class UASpeechDataset(Dataset):
 
     def __init__(self, dataframe: pd.DataFrame,
                  praat_table: Optional[pd.DataFrame] = None,
-                 praat_stats: Optional[Tuple] = None):
+                 praat_stats: Optional[Tuple] = None,
+                 frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None):
         self.df = dataframe.reset_index(drop=True)
 
         if (praat_table is None) != (praat_stats is None):
@@ -42,17 +44,24 @@ class UASpeechDataset(Dataset):
             )
         self.praat_table = praat_table
         self.praat_stats = praat_stats
+        # Filepath -> precomputed 768-dim frozen wav2vec2 embedding (see
+        # src.training.baseline.extract_frozen_embeddings_masked). Only ever
+        # populated for the deep_frozen/fusion_frozen variants (see
+        # src.training.data.build_loaders) — every other model never sees a
+        # "deep_embedding" key and is unaffected.
+        self.frozen_embedding_table = frozen_embedding_table
 
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, idx: int) -> dict:
         row = self.df.iloc[idx]
-        waveform = load_and_preprocess_cached(row["Filepath"])
+        waveform, waveform_length = load_and_preprocess_cached(row["Filepath"])
         mfcc = extract_mfcc_features_cached(row["Filepath"])
 
         item = {
             "waveform": waveform,                                   # (1, 64000)
+            "waveform_length": torch.tensor(waveform_length, dtype=torch.long),
             "mfcc": mfcc,                                           # (1, 39, frames)
             "group_label": torch.tensor(
                 config.GROUP_LABEL_MAP[row["Group"]], dtype=torch.long),
@@ -70,5 +79,9 @@ class UASpeechDataset(Dataset):
         if self.praat_table is not None:
             item["praat"] = torch.from_numpy(
                 praat_vector(self.praat_table, row["Filename"], self.praat_stats))
+
+        if self.frozen_embedding_table is not None:
+            item["deep_embedding"] = torch.from_numpy(
+                self.frozen_embedding_table[row["Filepath"]]).float()
 
         return item

@@ -36,6 +36,13 @@ CONFUSION_MATRIX_DIR = OUTPUT_DIR / "confusion_matrix"
 ROC_DIR              = OUTPUT_DIR / "roc"
 EMBEDDINGS_DIR       = OUTPUT_DIR / "embeddings"
 
+# Per-experiment output bundles (config/metrics/predictions/timing/checkpoint in one
+# folder) for the budget-managed primary-detection sweep — see src/training/reporting.py
+# ::save_experiment_bundle. Additive to the flat dirs above, which every run (old and
+# new) continues to use; nothing reads EXPERIMENTS_DIR except the new sweep's own
+# consumers (notebooks/03_training.ipynb, requirement-7 comparison table).
+EXPERIMENTS_DIR      = OUTPUT_DIR / "experiments"
+
 ARCHIVE_FILES = [
     "UASpeech_normalized_C.tgz",                # healthy controls
     "UASpeech_normalized_FM.tgz",               # dysarthric speakers
@@ -94,6 +101,25 @@ MAX_SAMPLES  = int(TARGET_SR * CLIP_SECONDS)
 # MFCC settings: 13 coefficients (+ delta + delta-delta = 39-dim per frame)
 N_MFCC       = 13
 MEL_KWARGS   = {"n_fft": 400, "hop_length": 160, "n_mels": 40}
+
+# ---------------------------------------------------------------------------
+# Voice activity detection (Silero VAD, replacing torchaudio.functional.vad —
+# see src/vad.py). torchaudio's vad() only trims LEADING silence; trailing
+# silence and the fixed 4s pad/truncate window in load_and_preprocess() were
+# together the source of the large near-constant tail visible in MFCC plots.
+# ---------------------------------------------------------------------------
+VAD_ENABLED         = True    # False -> load_and_preprocess() skips VAD entirely
+                               # (only pad/truncate), for A/B comparison or if
+                               # torch.hub is unreachable in an offline session.
+VAD_THRESHOLD       = 0.5     # Silero speech-probability threshold (its own default)
+VAD_MIN_SPEECH_MS   = 100     # shorter detected segments are not "speech" — UA-Speech
+                               # utterances are short isolated words, so this is kept
+                               # low relative to Silero's usual 250ms conversational default
+VAD_MIN_SILENCE_MS  = 100     # internal gaps shorter than this stay merged into the
+                               # surrounding speech segment, preserving natural pauses
+VAD_SPEECH_PAD_MS   = 30      # padding added around the kept [first..last] speech span
+VAD_SAMPLE_RATE     = 16_000  # must match TARGET_SR — Silero only accepts 8k/16k
+VAD_STATS_PATH      = OUTPUT_DIR / "vad_stats.csv"   # per-utterance VAD stats (Stage 9)
 
 # Per-(process, filepath) memoization cap for src.preprocessing's cached
 # loaders — see load_and_preprocess_cached / extract_mfcc_features_cached.
@@ -181,5 +207,6 @@ def ensure_directories() -> None:
     """Create every project directory that the pipeline writes to or reads from."""
     for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, OUTPUT_DIR, FIGURE_DIR,
                        ERROR_FIGURE_DIR, CHECKPOINT_DIR, LOG_DIR, PREDICTIONS_DIR,
-                       METRICS_DIR, CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR):
+                       METRICS_DIR, CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR,
+                       EXPERIMENTS_DIR):
         directory.mkdir(parents=True, exist_ok=True)

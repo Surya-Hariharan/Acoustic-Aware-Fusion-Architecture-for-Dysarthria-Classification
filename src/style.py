@@ -25,6 +25,7 @@ MODEL_COLORS = {
     "acoustic": "#4c72b0",                 # Model A — MFCC 1D-CNN
     "deep_frozen": "#dd8452",              # Model B — frozen wav2vec2
     "deep_lora": "#55a868",                # Model C — wav2vec2 + LoRA
+    "fusion_frozen": "#64b5cd",            # LoRA-off Model D (frozen-fusion ablation)
     "fusion": "#c44e52",                   # Model D — concatenation
     "attention_fusion": "#8172b3",         # Model E — cross-attention
     "attention_fusion_praat": "#937860",   # Model F — cross-attention + Praat
@@ -76,8 +77,3 @@ def color_for_run(run_name: str) -> str:
         if name in run_name:
             return MODEL_COLORS[name]
     return "#4c72b0"
-
-
-def model_palette(model_names) -> list:
-    """A color list in the given order, for use as a seaborn `palette=`."""
-    return [model_color(m) for m in model_names]

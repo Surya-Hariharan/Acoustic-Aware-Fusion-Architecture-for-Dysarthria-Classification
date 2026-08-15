@@ -9,6 +9,10 @@ ablation variants as a single --model switch instead of six bespoke scripts:
     acoustic                A  MFCC 1D-CNN only
     deep_frozen             B  frozen wav2vec 2.0 + MLP head
     deep_lora               C  wav2vec 2.0 + LoRA + MLP head
+    fusion_frozen            frozen wav2vec + MFCC CNN, concatenated (LoRA-off
+                             counterpart of Model D, for the LoRA-vs-frozen
+                             fusion ablation — see src/training/budget.py's
+                             primary-detection sweep)
     fusion                  D  LoRA wav2vec + MFCC CNN, concatenated
     attention_fusion        E  LoRA wav2vec + MFCC CNN, cross-attended (Phase 6)
     attention_fusion_praat  F  Model E + Praat features as a third pathway
@@ -18,6 +22,8 @@ supplied by the DataLoader only for Model F, so it arrives as None everywhere
 else. Widening the signature (rather than special-casing Model F in the engine)
 is what keeps run_epoch free of any per-model branching.
 """
+
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -29,7 +35,7 @@ from src.models.attention_fusion import (AttentionFusionModel,
 from src.models.deep_pathway import DeepPathway
 from src.models.concat_fusion import FusionModel
 
-MODEL_NAMES = ("acoustic", "deep_frozen", "deep_lora", "fusion",
+MODEL_NAMES = ("acoustic", "deep_frozen", "deep_lora", "fusion_frozen", "fusion",
                "attention_fusion", "attention_fusion_praat")
 
 # One-line description per variant, used in the run banner and the ablation
@@ -38,6 +44,7 @@ MODEL_DESCRIPTIONS = {
     "acoustic": "Model A — MFCC 1D-CNN (cepstral features only)",
     "deep_frozen": "Model B — frozen wav2vec 2.0 + MLP head",
     "deep_lora": "Model C — wav2vec 2.0 + LoRA adapters + MLP head",
+    "fusion_frozen": "frozen wav2vec + MFCC CNN, concatenated (LoRA-off Model D)",
     "fusion": "Model D — LoRA wav2vec + MFCC CNN, concatenated",
     "attention_fusion": "Model E — LoRA wav2vec + MFCC CNN, cross-attended",
     "attention_fusion_praat": "Model F — Model E + Praat features (third pathway)",
@@ -46,6 +53,17 @@ MODEL_DESCRIPTIONS = {
 # Models whose DataLoader must also carry Phase 4's Praat feature vector.
 # src.training.runner reads this to decide whether to load praat_features.csv.
 MODELS_REQUIRING_PRAAT = frozenset({"attention_fusion_praat"})
+
+# Models whose Deep Pathway is frozen (use_lora=False) and only ever consumed
+# through DeepPathway.forward()'s pooled 768-dim vector (never
+# forward_sequence — attention_fusion/attention_fusion_praat always run with
+# use_lora=True). That embedding is identical across every fold/epoch since
+# the frozen backbone never updates, so src.training.runner precomputes it
+# once via src.training.baseline.extract_frozen_embeddings_masked instead of
+# recomputing the same forward pass on every batch of every epoch of every
+# fold — the single most expensive step these two variants would otherwise
+# repeat for no reason.
+MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING = frozenset({"deep_frozen", "fusion_frozen"})
 
 
 class AcousticClassifier(nn.Module):
@@ -62,12 +80,16 @@ class AcousticClassifier(nn.Module):
         )
 
     def forward_features(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                         praat: torch.Tensor = None) -> torch.Tensor:
-        return self.acoustic_pathway(mfcc)
+                         praat: torch.Tensor = None,
+                         attention_mask: Optional[torch.Tensor] = None,
+                         deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.acoustic_pathway(mfcc, attention_mask=attention_mask)
 
     def forward(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                praat: torch.Tensor = None) -> torch.Tensor:
-        return self.classifier(self.forward_features(waveform, mfcc, praat))
+                praat: torch.Tensor = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.classifier(self.forward_features(waveform, mfcc, praat, attention_mask))
 
 
 class DeepClassifier(nn.Module):
@@ -91,12 +113,25 @@ class DeepClassifier(nn.Module):
         )
 
     def forward_features(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                         praat: torch.Tensor = None) -> torch.Tensor:
-        return self.deep_pathway(waveform)
+                         praat: torch.Tensor = None,
+                         attention_mask: Optional[torch.Tensor] = None,
+                         deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # deep_embedding, when given, is the precomputed frozen wav2vec2
+        # vector for this batch (see MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING) —
+        # use it directly instead of running the backbone again. Only ever
+        # populated for use_lora=False, where the backbone has no gradients
+        # to contribute anyway, so skipping its forward pass changes no
+        # result, only how many times an identical computation repeats.
+        if deep_embedding is not None:
+            return deep_embedding
+        return self.deep_pathway(waveform, attention_mask=attention_mask)
 
     def forward(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                praat: torch.Tensor = None) -> torch.Tensor:
-        return self.classifier(self.forward_features(waveform, mfcc, praat))
+                praat: torch.Tensor = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.classifier(self.forward_features(
+            waveform, mfcc, praat, attention_mask, deep_embedding))
 
 
 def build_model(model_name: str, num_classes: int) -> nn.Module:
@@ -107,10 +142,31 @@ def build_model(model_name: str, num_classes: int) -> nn.Module:
         return DeepClassifier(num_classes=num_classes, use_lora=False)
     if model_name == "deep_lora":
         return DeepClassifier(num_classes=num_classes, use_lora=True)
+    if model_name == "fusion_frozen":
+        return FusionModel(num_classes=num_classes, use_lora=False)
     if model_name == "fusion":
-        return FusionModel(num_classes=num_classes)
+        return FusionModel(num_classes=num_classes, use_lora=True)
     if model_name == "attention_fusion":
         return AttentionFusionModel(num_classes=num_classes)
     if model_name == "attention_fusion_praat":
         return AttentionFusionPraatModel(num_classes=num_classes)
     raise ValueError(f"Unknown model '{model_name}'. Choose from {MODEL_NAMES}.")
+
+
+def parameter_counts(model: nn.Module) -> Dict[str, float]:
+    """Trainable / total parameter counts and trainable percentage for any of
+    the six ablation variants — generalizes DeepPathway.trainable_parameter_summary()
+    (which only counts the wav2vec submodule) to the whole model, so a model with
+    an always-trainable MFCC CNN or classifier head (e.g. "acoustic", "deep_frozen")
+    reports its true trainable/total split, not just its backbone's.
+
+    Used by the requirement-7 comparison table (trainable param count / % columns)
+    and by src/training/reporting.py::save_experiment_bundle's config.json.
+    """
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return {
+        "trainable_params": trainable,
+        "total_params": total,
+        "trainable_pct": 100 * trainable / total if total else 0.0,
+    }

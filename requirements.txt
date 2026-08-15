@@ -1,6 +1,11 @@
 # GPU training: install torch/torchaudio from the CUDA-enabled index first, e.g.
 #   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 # then this file (plain PyPI has CPU-only wheels under these bare version numbers).
+#
+# Silero VAD (src/vad.py) loads via torch.hub.load("snakers4/silero-vad", ...) — no
+# extra pinned package needed beyond torch itself, but the FIRST run on a machine
+# needs internet access to download and cache the JIT model (~2MB, cached under
+# torch.hub's default cache dir afterward; every later run is fully offline).
 torch==2.5.1
 torchaudio==2.5.1
 soundfile==0.14.0
@@ -15,7 +20,6 @@ scikit-learn==1.7.2
 tensorboard==2.21.0
 praat-parselmouth==0.4.7
 tqdm==4.67.3
-ipywidgets==8.1.8
 python-dotenv==1.1.1
 umap-learn==0.5.7
 shap==0.48.0

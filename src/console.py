@@ -164,7 +164,8 @@ def print_signal_chain() -> None:
 
     print_subheader("Front end — short-time analysis")
     print_kv("Sampling rate", f"{config.TARGET_SR} Hz, mono")
-    print_kv("Voice activity detection", "silence trimmed (torchaudio VAD)")
+    print_kv("Voice activity detection", "Silero VAD (neural) — leading/trailing "
+             "silence trimmed, internal pauses preserved")
     print_kv("Analysis window", f"{config.CLIP_SECONDS:.0f} s "
                                 f"({config.MAX_SAMPLES} samples, pad/truncate)")
     print_kv("Frame length", f"{config.MEL_KWARGS['n_fft']} samples ({frame_ms:.0f} ms)")
@@ -174,7 +175,7 @@ def print_signal_chain() -> None:
     print_kv("Dynamic features", f"{DELTA} + {DELTA}{DELTA} {ARROW} {3 * config.N_MFCC}-dim per frame")
     print_kv("Frames per utterance", f"~{n_frames}")
     print()
-    print(f"  waveform {ARROW} VAD {ARROW} STFT ({frame_ms:.0f} ms / {hop_ms:.0f} ms) "
+    print(f"  waveform {ARROW} Silero VAD {ARROW} STFT ({frame_ms:.0f} ms / {hop_ms:.0f} ms) "
           f"{ARROW} Mel filterbank {ARROW} log {ARROW} DCT")
     print(f"           {ARROW} {config.N_MFCC} MFCC + {DELTA} + {DELTA}{DELTA} "
           f"{ARROW} {3 * config.N_MFCC}-dim  [Acoustic Pathway]")
