@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 from src import config
 from src.praat import praat_vector
 from src.preprocessing import (extract_mfcc_features_cached,
-                               load_and_preprocess_cached)
+                               load_and_preprocess_cached, mfcc_frame_count)
 
 
 class UASpeechDataset(Dataset):
@@ -32,8 +32,22 @@ class UASpeechDataset(Dataset):
     def __init__(self, dataframe: pd.DataFrame,
                  praat_table: Optional[pd.DataFrame] = None,
                  praat_stats: Optional[Tuple] = None,
-                 frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None):
+                 frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None,
+                 include_mfcc: bool = True):
         self.df = dataframe.reset_index(drop=True)
+
+        # MFCC extraction (STFT + mel filterbank + DCT + two delta passes) runs
+        # per utterance on the DataLoader worker and is pure waste for the
+        # wav2vec2-only variants, which never read the tensor — deep_frozen and
+        # deep_lora discard it after it has been computed, collated, pinned and
+        # copied to the GPU. deep_frozen consumes a PRECOMPUTED embedding and
+        # runs no backbone forward pass at all, yet still benchmarked at ~194s
+        # per fold-epoch; that cost is almost entirely this.
+        #
+        # False emits a zero-size placeholder so the batch dict keeps its shape
+        # and src.training.engine.run_epoch needs no per-model branching.
+        # src.training.data.build_loaders sets it from the model name.
+        self.include_mfcc = include_mfcc
 
         if (praat_table is None) != (praat_stats is None):
             raise ValueError(
@@ -57,12 +71,25 @@ class UASpeechDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         row = self.df.iloc[idx]
         waveform, waveform_length = load_and_preprocess_cached(row["Filepath"])
-        mfcc = extract_mfcc_features_cached(row["Filepath"])
+
+        if self.include_mfcc:
+            mfcc = extract_mfcc_features_cached(row["Filepath"])
+            # Raw (pre-pool) MFCC frame count derived from the audio itself, not
+            # from MFCC values — frames >= this index are the fixed-window's
+            # zero-padded tail, not real speech. AcousticPathway derives the same
+            # quantity internally from waveform_length (see valid_frame_count),
+            # so this is metadata for validation/visualization, not a second
+            # source of truth the model reads from.
+            mfcc_valid_frames = min(mfcc_frame_count(waveform_length), mfcc.shape[-1])
+        else:
+            mfcc = torch.empty(1, 3 * config.N_MFCC, 0)
+            mfcc_valid_frames = 0
 
         item = {
             "waveform": waveform,                                   # (1, 64000)
             "waveform_length": torch.tensor(waveform_length, dtype=torch.long),
             "mfcc": mfcc,                                           # (1, 39, frames)
+            "mfcc_valid_frames": torch.tensor(mfcc_valid_frames, dtype=torch.long),
             "group_label": torch.tensor(
                 config.GROUP_LABEL_MAP[row["Group"]], dtype=torch.long),
             "severity_label": torch.tensor(

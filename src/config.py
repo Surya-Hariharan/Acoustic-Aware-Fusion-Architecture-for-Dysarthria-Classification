@@ -7,6 +7,7 @@ single source of truth.
 """
 
 import os
+from itertools import zip_longest
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -43,6 +44,13 @@ EMBEDDINGS_DIR       = OUTPUT_DIR / "embeddings"
 # consumers (notebooks/03_training.ipynb, requirement-7 comparison table).
 EXPERIMENTS_DIR      = OUTPUT_DIR / "experiments"
 
+# Final reporting gate output (notebooks/06_results.ipynb). Holds only what
+# survived the eligibility filter in src/results.py, plus the excluded/
+# preliminary registers and the reproducibility manifest — the folder to hand
+# off when writing the paper. Distinct from OUTPUT_DIR/paper_exports, which is
+# a copy-and-format step; this is the gated source of truth.
+RESULTS_DIR          = OUTPUT_DIR / "results"
+
 ARCHIVE_FILES = [
     "UASpeech_normalized_C.tgz",                # healthy controls
     "UASpeech_normalized_FM.tgz",               # dysarthric speakers
@@ -63,7 +71,34 @@ DYSARTHRIC_IDS = [
     "M09", "M10", "M11", "M12", "M14", "M16",
 ]
 
-ALL_SPEAKERS = CONTROL_IDS + DYSARTHRIC_IDS
+def _interleave_by_class(controls, dysarthric):
+    """Alternate control and dysarthric speakers so that EVERY PREFIX of the
+    result contains both classes (from length 2 onward), with the longer list's
+    leftovers appended at the end.
+
+    This is the order src.splits.iter_loso_folds walks, and therefore the order
+    a detection LOSO run evaluates speakers in. The previous plain
+    `CONTROL_IDS + DYSARTHRIC_IDS` put all 13 controls first, which meant any
+    run that stopped early — a time budget, a crash, an interrupted session —
+    had evaluated ONLY healthy controls. Since UA-Speech detection labels are
+    speaker-level, each of those folds was single-class, so precision, recall,
+    F1 and AUROC were all undefined for the entire partial run (see
+    src.training.metrics' module docstring). That is exactly what happened to
+    every truncated detection run in the pre-repair audit.
+
+    A COMPLETE LOSO sweep is order-independent: it visits all 28 speakers and
+    pools their predictions regardless of sequence, so no finished result
+    changes and this is a bug fix rather than a protocol change. What it buys
+    is that a PARTIAL run is now class-balanced, and therefore honestly
+    reportable as a partial result instead of a degenerate one.
+    """
+    interleaved = []
+    for pair in zip_longest(controls, dysarthric):
+        interleaved.extend(speaker for speaker in pair if speaker is not None)
+    return interleaved
+
+
+ALL_SPEAKERS = _interleave_by_class(CONTROL_IDS, DYSARTHRIC_IDS)
 
 # Severity mapping for the 15 dysarthric speakers (base-paper protocol)
 SEVERITY_MAP = {
@@ -208,5 +243,5 @@ def ensure_directories() -> None:
     for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, OUTPUT_DIR, FIGURE_DIR,
                        ERROR_FIGURE_DIR, CHECKPOINT_DIR, LOG_DIR, PREDICTIONS_DIR,
                        METRICS_DIR, CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR,
-                       EXPERIMENTS_DIR):
+                       EXPERIMENTS_DIR, RESULTS_DIR):
         directory.mkdir(parents=True, exist_ok=True)

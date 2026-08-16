@@ -157,7 +157,8 @@ class DeepPathway(nn.Module):
         counts = frame_mask.sum(dim=1).clamp(min=1.0)
         return summed / counts
 
-    def forward_all_layers(self, waveform: torch.Tensor) -> torch.Tensor:
+    def forward_all_layers(self, waveform: torch.Tensor,
+                           attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Every hidden-state layer (CNN feature-extractor output + all 12
         transformer layers), each mean-pooled over time — the base paper
@@ -169,12 +170,40 @@ class DeepPathway(nn.Module):
 
         Args:
             waveform: (batch, samples) raw 16 kHz audio.
+            attention_mask: (batch, samples) bool/long, True/1 for real audio.
+                When given, the per-layer mean-pool excludes padded frames,
+                exactly as forward() does.
+
+                This matters more here than anywhere else in the project.
+                Utterances are pad/truncated to a fixed 4-second window and the
+                median padding fraction of that window is ~86% (measured in
+                notebooks/01_data_pipeline.ipynb Stage 9), so an UNMASKED mean
+                is dominated by silence — roughly six parts padding to one part
+                speech. Leaving the mask off was how the Phase 2 SVM layer sweep
+                was originally computed, and it is the leading candidate
+                explanation for that reproduction landing at 82.25% against the
+                paper's 93.95%. Both variants are kept available so the
+                difference can be REPORTED as a diagnostic rather than silently
+                corrected — see src.training.baseline.
+
+                None (the default) preserves the original unmasked behaviour so
+                previously cached sweeps stay reproducible.
         Returns:
             (batch, 13, 768) mean-pooled embedding per layer.
         """
-        outputs = self.wav2vec(waveform, output_hidden_states=True)
+        outputs = self.wav2vec(waveform, attention_mask=attention_mask,
+                               output_hidden_states=True)
         hidden_states = torch.stack(outputs.hidden_states, dim=1)  # (B, 13, T, 768)
-        return hidden_states.mean(dim=2)
+        if attention_mask is None:
+            return hidden_states.mean(dim=2)
+
+        # One frame mask, broadcast across all 13 layers — every layer shares
+        # the same time axis, so the padded positions are identical throughout.
+        key_padding_mask = self.sequence_key_padding_mask(waveform, attention_mask)
+        frame_mask = (~key_padding_mask)[:, None, :, None].to(hidden_states.dtype)
+        summed = (hidden_states * frame_mask).sum(dim=2)           # (B, 13, 768)
+        counts = frame_mask.sum(dim=2).clamp(min=1.0)              # (B, 1, 1)
+        return summed / counts
 
     def trainable_parameter_summary(self) -> str:
         """Human-readable count of trainable (LoRA) vs frozen parameters."""

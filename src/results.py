@@ -35,17 +35,53 @@ from src.style import apply_style, color_for_run
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
-def load_all_experiment_summaries() -> pd.DataFrame:
+# Run-name prefixes that are diagnostics, not experiments. Their outputs are
+# structurally identical to a real run's — same summary/per-fold/prediction
+# files — so nothing downstream can tell them apart by inspection. They must be
+# excluded by name.
+#   _smoke_test               pipeline sanity check (1 fold, 1 epoch, 24 samples)
+#   _budget_bench_            ExperimentBudgetManager.benchmark (1 fold, 1 epoch)
+#   _batch_bench_             benchmark_batch_sizes (1 fold, 1 epoch per size)
+# Before this filter existed, the seven _budget_bench_* runs appeared in the
+# results table beside real experiments with nothing marking them.
+NON_EXPERIMENT_PREFIXES = ("_smoke_test", "_budget_bench_", "_batch_bench_")
+
+
+def is_non_experiment(run_name: str) -> bool:
+    """True for diagnostic/benchmark runs that must never reach a results table."""
+    return (run_name.startswith(NON_EXPERIMENT_PREFIXES)
+            or run_name.endswith("smoke_test"))
+
+
+def load_all_experiment_summaries(include_diagnostics: bool = False,
+                                  with_status: bool = True) -> pd.DataFrame:
     """
-    Every trained run's pooled mean metrics in one table, keyed by run_name —
+    Every trained run's per-fold mean metrics in one table, keyed by run_name —
     reads the *.summary.csv files aggregate_fold_metrics() already writes per
-    run rather than recomputing anything. Skips the pipeline sanity-check run
-    ("_smoke_test"), which is not a real result.
+    run rather than recomputing anything.
+
+    Diagnostic runs (see NON_EXPERIMENT_PREFIXES) are excluded unless
+    include_diagnostics=True. When the experiment registry is populated
+    (src.training.reporting), each row is additionally annotated with
+    completed/expected folds, coverage and status — so a reader can see at a
+    glance that a run is PARTIAL rather than inferring completeness from the
+    mere presence of a number.
+
+    Note these are PER-FOLD MEANS, not pooled metrics. For detection LOSO the
+    pooled numbers (outputs/metrics/<run>/ALL_FOLDS_pooled.json) are the
+    reportable ones; per-fold class-sensitive metrics are NaN on single-class
+    folds by design and are skipped by the mean.
     """
+    from src.training.reporting import summarize_registry
+
     rows = []
     for path in sorted(config.METRICS_DIR.glob("*.summary.csv")):
-        run_name = path.stem
-        if run_name.endswith("smoke_test"):
+        # Path("detection_fusion.summary.csv").stem is "detection_fusion.summary"
+        # — the double extension leaves ".summary" attached. Left unstripped, the
+        # run_name never matches the registry's, so every row silently joined to
+        # NaN and reported as UNREGISTERED regardless of its real status.
+        run_name = path.name[:-len(".summary.csv")]
+        if not include_diagnostics and is_non_experiment(run_name):
             continue
         summary = pd.read_csv(path, index_col=0)
         if "mean" not in summary.columns:
@@ -60,7 +96,198 @@ def load_all_experiment_summaries() -> pd.DataFrame:
             "train at least one model first (src.training.runner.run_training, "
             "see notebooks/03_training.ipynb)."
         )
-    return pd.DataFrame(rows).set_index("run_name").sort_index()
+    table = pd.DataFrame(rows).set_index("run_name").sort_index()
+
+    if with_status:
+        registry = summarize_registry()
+        if not registry.empty:
+            status_cols = ["completed_folds", "expected_folds", "coverage",
+                           "pooled_has_both_classes", "status"]
+            table = table.join(registry.set_index("run_name")[status_cols], how="left")
+            # Runs that predate the registry (every run in the pre-repair
+            # session) legitimately have no status — say "UNREGISTERED" rather
+            # than leaving a bare NaN that reads as a missing measurement.
+            table["status"] = table["status"].fillna("UNREGISTERED")
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Final-result eligibility gate
+#
+# "The notebook finished" and "the experiment is valid" are different states.
+# Everything below exists to keep them apart. A run reaches the FINAL table
+# only by passing every check; anything else is routed to PRELIMINARY (real but
+# incomplete) or EXCLUDED (cannot support a claim), always with a stated reason.
+# Nothing is deleted and nothing is hidden — the brief requires incomplete work
+# to remain visible, just not to masquerade as a result.
+# ---------------------------------------------------------------------------
+TIER_FINAL = "FINAL"
+TIER_PRELIMINARY = "PRELIMINARY"
+TIER_EXCLUDED = "EXCLUDED"
+
+
+def classify_result(run_row: pd.Series, min_coverage: float = 1.0,
+                    min_valid_folds: int = 1) -> Dict:
+    """
+    Sort one registry rollup row into FINAL / PRELIMINARY / EXCLUDED, with the
+    reason that decided it.
+
+    The checks, in the order they disqualify:
+      1. diagnostic run                    -> EXCLUDED (benchmark, not an experiment)
+      2. no completed folds                -> EXCLUDED (never ran)
+      3. pooled set is single-class        -> EXCLUDED for detection; the pooled
+                                              metrics are undefined, so the run
+                                              carries no evidence whatever its
+                                              accuracy reads
+      4. coverage below min_coverage       -> PRELIMINARY (real, but incomplete)
+      5. no fold with >1 held-out class    -> PRELIMINARY, WITH ONE EXCEPTION
+                                              (see below)
+
+    THE LOSO EXCEPTION (check 5)
+    A detection LOSO fold holds out exactly one speaker, so it is single-class
+    BY DESIGN — that is the base paper's own protocol, not a defect. Every
+    complete 28-fold LOSO run would therefore have valid_folds == 0 and, absent
+    this exception, would be stuck at PRELIMINARY forever regardless of
+    coverage. Check 5 is skipped for task == "detection" and
+    cv_protocol == "loso"; check 3 (pooled_has_both_classes) already covers the
+    thing that actually matters for that protocol — whether the fold-by-fold
+    single-class results pool into a real evaluation. For every other protocol
+    (screening, severity's leave-one-per-class-out) multi-class folds are the
+    normal, expected outcome, so an all-single-class result there is still
+    treated as a sign something is wrong with the fold construction.
+
+    min_coverage defaults to 1.0: a FINAL result must have reached every fold
+    of its intended protocol. Lower it only deliberately, and say so in the
+    write-up.
+    """
+    run_name = run_row["run_name"]
+    task = run_row.get("task", "detection")
+    cv_protocol = run_row.get("cv_protocol", "")
+    completed = int(run_row.get("completed_folds", 0) or 0)
+    expected = int(run_row.get("expected_folds", 0) or 0)
+    coverage = float(run_row.get("coverage", 0.0) or 0.0)
+    valid_folds = int(run_row.get("valid_folds", 0) or 0)
+    both_classes = bool(run_row.get("pooled_has_both_classes", False))
+    is_loso_detection = (task == "detection" and cv_protocol == "loso")
+
+    def verdict(tier, reason):
+        return {"run_name": run_name, "task": task, "tier": tier, "reason": reason,
+                "completed_folds": completed, "expected_folds": expected,
+                "coverage": coverage, "valid_folds": valid_folds,
+                "pooled_has_both_classes": both_classes,
+                "status": run_row.get("status", "UNKNOWN")}
+
+    if is_non_experiment(run_name):
+        return verdict(TIER_EXCLUDED, "Diagnostic/benchmark run, not an experiment")
+    if completed == 0:
+        return verdict(TIER_EXCLUDED, "Never executed — no completed folds")
+    if task == "detection" and not both_classes:
+        return verdict(
+            TIER_EXCLUDED,
+            f"Pooled held-out set is single-class across all {completed} completed "
+            "fold(s) — precision/recall/F1/AUROC are undefined, so this run carries "
+            "no evidence about detection")
+    if coverage < min_coverage:
+        return verdict(
+            TIER_PRELIMINARY,
+            f"Incomplete coverage: {completed}/{expected} folds ({coverage:.0%})")
+    if not is_loso_detection and valid_folds < min_valid_folds:
+        return verdict(
+            TIER_PRELIMINARY,
+            "Complete coverage but no individual fold held out more than one class — "
+            "only pooled metrics are interpretable")
+    return verdict(TIER_FINAL,
+                   f"Complete: {completed}/{expected} folds, both classes represented"
+                   + (" (LOSO: single-class per fold by design, pooled set validated)"
+                      if is_loso_detection else ""))
+
+
+def build_result_tiers(min_coverage: float = 1.0) -> Dict[str, pd.DataFrame]:
+    """
+    Every registered run sorted into the three reporting tiers.
+
+    Returns {"final": df, "preliminary": df, "excluded": df}. Notebook 6 renders
+    these as its three tables; the FINAL one is the only one a claim may rest on.
+    """
+    from src.training.reporting import summarize_registry
+
+    registry = summarize_registry()
+    if registry.empty:
+        empty = pd.DataFrame(columns=["run_name", "task", "tier", "reason",
+                                      "completed_folds", "expected_folds", "coverage",
+                                      "valid_folds", "pooled_has_both_classes", "status"])
+        return {"final": empty.copy(), "preliminary": empty.copy(), "excluded": empty.copy()}
+
+    verdicts = pd.DataFrame([classify_result(row, min_coverage)
+                             for _, row in registry.iterrows()])
+    return {
+        "final": verdicts[verdicts["tier"] == TIER_FINAL].reset_index(drop=True),
+        "preliminary": verdicts[verdicts["tier"] == TIER_PRELIMINARY].reset_index(drop=True),
+        "excluded": verdicts[verdicts["tier"] == TIER_EXCLUDED].reset_index(drop=True),
+    }
+
+
+def select_analysis_run(task: str = "detection", metric: str = "f1",
+                        preferred: Optional[str] = None,
+                        allow_preliminary: bool = True) -> Optional[str]:
+    """
+    Pick which run notebooks 4 and 5 should analyse, from the registry rather
+    than from a hardcoded name.
+
+    Both notebooks previously opened with `RUN_NAME = "detection_fusion"` — a
+    run that has never existed in this project — so both raised on their first
+    cell. Worse, hardcoding invites analysing whichever run the string happens
+    to name regardless of whether it is valid.
+
+    Preference order: `preferred` if it is registered and eligible → the best
+    FINAL run by `metric` → the best PRELIMINARY run (only when
+    allow_preliminary, since error analysis on an incomplete run is still
+    informative, unlike *reporting* it) → None.
+
+    Returns None rather than raising when nothing qualifies: an analysis
+    notebook should say "nothing valid to analyse yet" and continue, not die.
+    """
+    tiers = build_result_tiers()
+    eligible = tiers["final"]
+    if allow_preliminary and not tiers["preliminary"].empty:
+        eligible = pd.concat([eligible, tiers["preliminary"]], ignore_index=True)
+    eligible = eligible[eligible["task"] == task]
+    if eligible.empty:
+        return None
+
+    if preferred and preferred in set(eligible["run_name"]):
+        return preferred
+
+    scored = []
+    for run_name in eligible["run_name"]:
+        try:
+            scored.append((load_pooled_metrics(run_name).get(metric), run_name))
+        except FileNotFoundError:
+            continue
+    scored = [(value, name) for value, name in scored
+              if value is not None and not pd.isna(value)]
+    if not scored:
+        # Nothing has a usable pooled metric — fall back to the most complete
+        # run so the notebook still has something to introspect.
+        return eligible.sort_values("coverage", ascending=False).iloc[0]["run_name"]
+    return max(scored)[1]
+
+
+def load_pooled_metrics(run_name: str) -> Dict:
+    """One run's pooled-across-folds metrics, as written by run_training.
+
+    These — not the per-fold means in load_all_experiment_summaries() — are the
+    base-paper-comparable detection numbers, because pooling is what restores a
+    positive class to a set of single-class LOSO folds.
+    """
+    path = config.METRICS_DIR / run_name / "ALL_FOLDS_pooled.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No pooled metrics for '{run_name}' at {path} — the run either never "
+            "completed a fold or predates the pooled writer.")
+    import json
+    with open(path) as f:
+        return json.load(f)
 
 
 def style_comparison_table(df: pd.DataFrame, higher_is_better: bool = True,
@@ -340,6 +567,324 @@ def plot_roc_pr_comparison(run_names: List[str], task: str = "detection",
         plt.close(fig_roc)
         plt.close(fig_pr)
     return {"roc": str(roc_path), "pr": str(pr_path)}
+
+
+# ---------------------------------------------------------------------------
+# Final reporting gate — tables, manifest, figures, summary
+# ---------------------------------------------------------------------------
+def build_final_results_table(min_coverage: float = 1.0) -> pd.DataFrame:
+    """
+    The FINAL results table: one row per eligible run, pooled metrics joined to
+    its coverage.
+
+    Pooled metrics, not per-fold means — pooling across folds is what restores a
+    positive class to a set of single-class LOSO folds, so it is the only
+    base-paper-comparable number for detection. Undefined metrics stay NaN and
+    are rendered "N/A" on export; they are never coerced to zero.
+    """
+    tiers = build_result_tiers(min_coverage)
+    rows = []
+    for _, verdict in tiers["final"].iterrows():
+        run_name = verdict["run_name"]
+        try:
+            pooled = load_pooled_metrics(run_name)
+        except FileNotFoundError:
+            continue
+        rows.append({
+            "run_name": run_name, "task": verdict["task"],
+            "expected_folds": verdict["expected_folds"],
+            "completed_folds": verdict["completed_folds"],
+            "valid_folds": verdict["valid_folds"],
+            "coverage": verdict["coverage"],
+            "accuracy": pooled.get("accuracy"), "precision": pooled.get("precision"),
+            "recall": pooled.get("recall"), "specificity": pooled.get("specificity"),
+            "f1": pooled.get("f1"), "auroc": pooled.get("auroc"),
+            "status": verdict["status"],
+        })
+    if not rows:
+        return pd.DataFrame(columns=[
+            "run_name", "task", "expected_folds", "completed_folds", "valid_folds",
+            "coverage", "accuracy", "precision", "recall", "specificity", "f1",
+            "auroc", "status"])
+    return pd.DataFrame(rows).sort_values(["task", "f1"], ascending=[True, False])
+
+
+def build_preliminary_results_table(min_coverage: float = 1.0) -> pd.DataFrame:
+    """Real but incomplete runs, each carrying its coverage and the reason it
+    is not FINAL. Kept visible — the brief requires incomplete work to be shown,
+    just never presented as a finished result."""
+    tiers = build_result_tiers(min_coverage)
+    rows = []
+    for _, verdict in tiers["preliminary"].iterrows():
+        run_name = verdict["run_name"]
+        try:
+            pooled = load_pooled_metrics(run_name)
+        except FileNotFoundError:
+            pooled = {}
+        rows.append({
+            "run_name": run_name, "task": verdict["task"],
+            "completed_folds": verdict["completed_folds"],
+            "expected_folds": verdict["expected_folds"],
+            "coverage": verdict["coverage"],
+            "accuracy": pooled.get("accuracy"), "f1": pooled.get("f1"),
+            "auroc": pooled.get("auroc"),
+            "caveat": "PRELIMINARY — NOT FOR FINAL CLAIMS",
+            "reason": verdict["reason"],
+        })
+    return pd.DataFrame(rows)
+
+
+def build_experiment_manifest() -> pd.DataFrame:
+    """
+    Reproducibility manifest: everything needed to regenerate a reported result.
+
+    Per registered run — model, task, protocol, seed, epochs, LR, batch size,
+    coverage — joined with the dataset/preprocessing/feature configuration that
+    lives as module constants in src/config.py rather than per-run fields. Run
+    config comes from the experiment bundle's config.json where
+    save_experiment_bundle wrote one; the rest falls back to the registry.
+    """
+    import json
+    from src.training.reporting import summarize_registry
+
+    registry = summarize_registry()
+    if registry.empty:
+        return pd.DataFrame()
+
+    shared = {
+        "dataset": "UA-Speech (M6 channel)",
+        "target_sr": config.TARGET_SR,
+        "clip_seconds": config.CLIP_SECONDS,
+        "vad_enabled": config.VAD_ENABLED,
+        "vad_threshold": config.VAD_THRESHOLD,
+        "n_mfcc": config.N_MFCC,
+        "mfcc_n_fft": config.MEL_KWARGS["n_fft"],
+        "mfcc_hop_length": config.MEL_KWARGS["hop_length"],
+        "mfcc_n_mels": config.MEL_KWARGS["n_mels"],
+        "wav2vec2_model": config.WAV2VEC_MODEL_NAME,
+        "lora_rank": config.LORA_RANK,
+        "lora_alpha": config.LORA_ALPHA,
+    }
+
+    rows = []
+    for _, run in registry.iterrows():
+        run_config = {}
+        for bundle in config.EXPERIMENTS_DIR.glob("*/config.json"):
+            try:
+                with open(bundle) as f:
+                    candidate = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if candidate.get("run_name") == run["run_name"]:
+                run_config = candidate
+                break
+        rows.append({
+            "experiment_id": run["run_name"],
+            "model": run["model"], "task": run["task"],
+            "fold_protocol": run["cv_protocol"],
+            "expected_folds": run["expected_folds"],
+            "completed_folds": run["completed_folds"],
+            "coverage": run["coverage"],
+            "status": run["status"],
+            "seed": run_config.get("seed", config.DEFAULT_SEED),
+            "epochs": run_config.get("epochs"),
+            "batch_size": run_config.get("batch_size"),
+            "lr_head": run_config.get("lr_head"),
+            "lr_backbone": run_config.get("lr_backbone"),
+            "checkpoint_dir": str(config.CHECKPOINT_DIR / run["run_name"]),
+            **shared,
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_fold_coverage(show: bool = False) -> Optional[str]:
+    """
+    Stacked bar of completed / failed / skipped folds per run.
+
+    The point of this figure is that incomplete experiments become impossible to
+    overlook. A leaderboard row and a coverage bar sit in the same report, so a
+    reader cannot see "99.7% accuracy" without also seeing "1 of 28 folds".
+    """
+    from src.training.reporting import summarize_registry
+
+    registry = summarize_registry()
+    if registry.empty:
+        return None
+
+    registry = registry.sort_values(["task", "run_name"])
+    labels = registry["run_name"].tolist()
+    completed = registry["completed_folds"].to_numpy()
+    failed = registry["failed_folds"].to_numpy()
+    expected = registry["expected_folds"].to_numpy()
+    remaining = np.maximum(expected - completed - failed, 0)
+
+    fig, ax = plt.subplots(figsize=(9, max(3, 0.45 * len(labels) + 1.5)))
+    y = np.arange(len(labels))
+    ax.barh(y, completed, color="#2C6249", label="completed")
+    ax.barh(y, failed, left=completed, color="#A62B22", label="failed")
+    ax.barh(y, remaining, left=completed + failed, color="#D8DCE3",
+            label="not run")
+
+    for i, (done, total) in enumerate(zip(completed, expected)):
+        ax.text(total + max(expected) * 0.01, i, f"{int(done)}/{int(total)}",
+                va="center", fontsize=9)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlabel("Folds")
+    ax.set_title("Evaluation coverage per experiment")
+    ax.legend(loc="lower right", fontsize=9)
+    fig.tight_layout()
+
+    out_path = config.RESULTS_DIR / "fold_coverage.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return str(out_path)
+
+
+def plot_baseline_comparison(reproduction_accuracy: Optional[float] = None,
+                             proposed: Optional[Dict[str, float]] = None,
+                             paper_accuracy: float = 0.9395,
+                             task: str = "detection",
+                             show: bool = False) -> Optional[str]:
+    """
+    Paper-reported vs. our reproduction vs. proposed models, on one axis with
+    the three provenances kept visually distinct.
+
+    The paper's number is a CITATION, not something measured here, and must
+    never be shaded as though it came out of this pipeline — mixing them is how
+    a reproduction gap turns into an accidental claim. Bars are labelled and
+    coloured by provenance for exactly that reason.
+    """
+    entries, colors = [], []
+    entries.append(("Paper (reported)", paper_accuracy))
+    colors.append("#9AA3B0")
+    if reproduction_accuracy is not None:
+        entries.append(("Our reproduction", reproduction_accuracy))
+        colors.append("#37516B")
+    for name, value in (proposed or {}).items():
+        if value is not None and not pd.isna(value):
+            entries.append((name, value))
+            colors.append("#0E7C86")
+
+    if len(entries) < 2:
+        return None
+
+    labels = [e[0] for e in entries]
+    values = [e[1] for e in entries]
+
+    fig, ax = plt.subplots(figsize=(max(6, 1.4 * len(entries)), 4.5))
+    bars = ax.bar(labels, values, color=colors)
+    for bar, value in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, value + 0.012,
+                f"{value:.3f}", ha="center", fontsize=9)
+
+    ax.axhline(paper_accuracy, linestyle="--", linewidth=1, color="#9AA3B0")
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Accuracy")
+    ax.set_title(f"Baseline comparison — {task}\n"
+                 "grey = paper-reported · navy = reproduced here · teal = proposed",
+                 fontsize=11)
+    ax.tick_params(axis="x", rotation=20)
+    fig.tight_layout()
+
+    out_path = config.RESULTS_DIR / "baseline_comparison.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return str(out_path)
+
+
+def export_gated_results(min_coverage: float = 1.0) -> Dict[str, Path]:
+    """
+    Write the three gated tables plus the reproducibility manifest into
+    outputs/results/. Undefined metrics are exported as the string "N/A", never
+    as 0 — a downstream reader of the CSV must not be able to mistake
+    "not measurable" for "measured as zero".
+    """
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    tiers = build_result_tiers(min_coverage)
+
+    tables = {
+        "final_results.csv": build_final_results_table(min_coverage),
+        "preliminary_results.csv": build_preliminary_results_table(min_coverage),
+        "excluded_results.csv": tiers["excluded"],
+        "experiment_manifest.csv": build_experiment_manifest(),
+    }
+
+    written = {}
+    for filename, table in tables.items():
+        path = config.RESULTS_DIR / filename
+        table.to_csv(path, index=False, na_rep="N/A")
+        written[filename] = path
+        print_kv(filename, f"{len(table)} row(s) -> {path}")
+    return written
+
+
+def print_experiment_summary(min_coverage: float = 1.0) -> None:
+    """
+    The end-of-notebook research summary: coverage per task, which models are
+    eligible, which are not, and the explicit status of the two variants the
+    project's central claim depends on.
+
+    Every value is read from artifacts. A model that was never trained is
+    reported as "not executed" rather than omitted, because an absent row is
+    what let the attention-fusion variants disappear from the pre-repair report
+    without anyone noticing.
+    """
+    from src.console import print_header, print_subheader
+    from src.training.reporting import summarize_registry
+
+    registry = summarize_registry()
+    tiers = build_result_tiers(min_coverage)
+
+    print_header("EXPERIMENT SUMMARY")
+
+    if registry.empty:
+        print_kv("Registry", "empty — no run has been executed since the registry "
+                             "was added (pre-repair runs are unregistered)")
+        return
+
+    for task in sorted(registry["task"].unique()):
+        subset = registry[registry["task"] == task]
+        print_subheader(task.capitalize())
+        print_kv("Expected folds (max across runs)", int(subset["expected_folds"].max()))
+        print_kv("Completed folds (total)", int(subset["completed_folds"].sum()))
+        print_kv("Runs with full coverage",
+                 f"{int((subset['coverage'] >= min_coverage).sum())} / {len(subset)}")
+
+    print_subheader("Eligibility")
+    print_kv("FINAL", ", ".join(tiers["final"]["run_name"]) or "none")
+    print_kv("PRELIMINARY", ", ".join(tiers["preliminary"]["run_name"]) or "none")
+    print_kv("EXCLUDED", ", ".join(tiers["excluded"]["run_name"]) or "none")
+
+    final_table = build_final_results_table(min_coverage)
+    for task in ("detection", "severity"):
+        subset = final_table[final_table["task"] == task]
+        subset = subset[subset["f1"].notna()]
+        print_kv(f"Best valid {task} model",
+                 f"{subset.iloc[0]['run_name']} (F1={subset.iloc[0]['f1']:.4f})"
+                 if len(subset) else "none — no run passed the eligibility gate")
+
+    # The project's central contribution, called out by name. If these are not
+    # in the registry at all, say so explicitly — silence reads as success.
+    print_subheader("Central contribution")
+    for model in ("attention_fusion", "attention_fusion_praat"):
+        matches = registry[registry["model"] == model]
+        if matches.empty:
+            print_kv(model, "NOT EXECUTED — no registered run")
+            continue
+        row = matches.sort_values("coverage", ascending=False).iloc[0]
+        print_kv(model, f"{row['status']} — {int(row['completed_folds'])}/"
+                        f"{int(row['expected_folds'])} folds ({row['coverage']:.0%})")
 
 
 # ---------------------------------------------------------------------------

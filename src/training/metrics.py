@@ -6,6 +6,25 @@ Detection is binary (positive class = Dysarthric Patient); severity is
 how many utterances it contributed. Both report accuracy, precision,
 recall (= sensitivity), specificity, F1, and ROC-AUC, matching the metric
 set Phase 3's ablation table needs.
+
+UNDEFINED IS NOT ZERO
+Every LOSO detection fold holds out ONE speaker, and UA-Speech detection
+labels are speaker-level — so that speaker is entirely Healthy or entirely
+Dysarthric and the fold's y_true is single-valued. Class-sensitive metrics
+(precision, recall, F1, specificity, AUROC) are then *undefined*, not zero:
+there is no positive class to have found or missed. Reporting 0.0 for them
+produced the pipeline's most misleading artifact — a held-out control
+speaker scoring "99.7% accuracy, F1 = 0.0", which reads as a catastrophic
+model but actually means "this fold carries no evidence about detection at
+all". compute_metrics() therefore returns float("nan") for each metric that
+is undefined on the given labels, and reports n_classes_present so callers
+can tell the two situations apart without re-deriving it. Aggregation with
+pandas (.mean(), .agg) skips NaN by default, so a partially-valid set of
+folds averages only over the folds where the metric existed.
+
+Pooling across folds is what makes detection metrics meaningful again — see
+src.training.runner.run_training, which concatenates every fold's predictions
+before scoring. A pooled set covering both classes has all metrics defined.
 """
 
 from typing import Dict
@@ -18,12 +37,18 @@ from src import config
 
 
 def _binary_specificity(cm: np.ndarray) -> float:
+    """TN / (TN + FP). NaN when this fold held out no negative-class sample —
+    there were no true negatives to correctly reject, so specificity has no
+    value (as opposed to a value of zero). See the module docstring."""
     tn, fp, _fn, _tp = cm.ravel()
-    return float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+    return float(tn / (tn + fp)) if (tn + fp) > 0 else float("nan")
 
 
 def _macro_specificity(cm: np.ndarray) -> float:
-    """Mean one-vs-rest specificity across classes, for multiclass confusion matrices."""
+    """Mean one-vs-rest specificity across classes, for multiclass confusion
+    matrices. Classes with no negative samples contribute NaN and are skipped
+    by the nanmean rather than dragging the macro average toward zero; if no
+    class is defined at all, the result is NaN."""
     total = cm.sum()
     specificities = []
     for i in range(cm.shape[0]):
@@ -31,8 +56,10 @@ def _macro_specificity(cm: np.ndarray) -> float:
         fn = cm[i, :].sum() - tp
         fp = cm[:, i].sum() - tp
         tn = total - tp - fn - fp
-        specificities.append(tn / (tn + fp) if (tn + fp) > 0 else 0.0)
-    return float(np.mean(specificities))
+        specificities.append(tn / (tn + fp) if (tn + fp) > 0 else float("nan"))
+    if np.all(np.isnan(specificities)):
+        return float("nan")
+    return float(np.nanmean(specificities))
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
@@ -45,26 +72,34 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
                 (N, num_classes) softmax probabilities for severity.
         task: "detection" or "severity".
     Returns:
-        Dict of scalar metrics: accuracy, precision, recall, specificity, f1, auroc, loss placeholder omitted.
+        Dict of scalar metrics: accuracy, precision, recall, specificity, f1,
+        auroc — each NaN where undefined on these labels (see the module
+        docstring) — plus n_classes_present and n_samples, so a caller can
+        distinguish "not measurable on this fold" from "measured as zero"
+        without re-deriving it from the labels.
     """
     num_classes = config.NUM_CLASSES[task]
     labels = list(range(num_classes))
     average = "binary" if task == "detection" else "macro"
 
-    accuracy = accuracy_score(y_true, y_pred)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=labels, average=average, zero_division=0)
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-    specificity = _binary_specificity(cm) if task == "detection" else _macro_specificity(cm)
+    classes_present = np.unique(y_true)
+    n_classes_present = int(len(classes_present))
 
-    # Every LOSO detection fold's held-out speaker is entirely one class (see
-    # src.training.runner), so y_true is single-valued on most folds — checking
-    # this up front avoids sklearn's UndefinedMetricWarning firing on every one
-    # of those (otherwise expected, not a bug) instead of only computing AUROC
-    # when it is actually defined.
-    if len(np.unique(y_true)) < 2:
-        auroc = float("nan")
+    accuracy = accuracy_score(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+
+    # Accuracy is always defined (it needs no positive class); everything below
+    # it is class-sensitive and undefined on a single-class fold. zero_division
+    # is left at 0 only because the branch below never reads those values when
+    # they would be undefined — see the module docstring on why 0.0 is the
+    # wrong answer here.
+    if n_classes_present < 2:
+        precision = recall = f1 = specificity = auroc = float("nan")
     else:
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, labels=labels, average=average, zero_division=0)
+        specificity = (_binary_specificity(cm) if task == "detection"
+                       else _macro_specificity(cm))
         try:
             if task == "detection":
                 auroc = roc_auc_score(y_true, y_prob)
@@ -83,6 +118,8 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
         "specificity": float(specificity),
         "f1": float(f1),
         "auroc": float(auroc),
+        "n_classes_present": n_classes_present,
+        "n_samples": int(len(y_true)),
     }
 
 

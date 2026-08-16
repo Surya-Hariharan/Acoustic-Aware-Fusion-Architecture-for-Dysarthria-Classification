@@ -124,13 +124,105 @@ def build_mfcc_transform() -> torchaudio.transforms.MFCC:
     )
 
 
+def mfcc_frame_count(num_samples):
+    """Number of frames torchaudio.transforms.MFCC (center=True, its default)
+    produces for a waveform of `num_samples` samples, given
+    config.MEL_KWARGS["hop_length"]. Works on a plain int or a LongTensor
+    alike (only // and + are used), so it is the single source of truth for
+    both a fixed total frame count (config.MAX_SAMPLES) and a per-sample
+    valid-frame count derived from real audio length — see
+    src.models.acoustic_pathway.AcousticPathway.valid_frame_count, which
+    calls this instead of re-deriving the formula."""
+    return num_samples // config.MEL_KWARGS["hop_length"] + 1
+
+
+def mfcc_valid_frame_mask(total_frames: int, valid_length: int) -> torch.Tensor:
+    """Frame-level boolean mask over an MFCC/delta/delta-delta tensor with
+    `total_frames` frames: True = real audio-derived frame, False = frame
+    generated only from the fixed-window's zero-padded tail. Derived purely
+    from the post-VAD waveform's valid sample count (`valid_length`, see
+    load_and_preprocess) — never from MFCC values themselves, since a
+    genuinely low-energy voiced frame must not be mistaken for padding."""
+    valid_frames = min(mfcc_frame_count(valid_length), total_frames)
+    return torch.arange(total_frames) < valid_frames
+
+
 def extract_mfcc_features(waveform: torch.Tensor,
-                          mfcc_transform: torchaudio.transforms.MFCC) -> torch.Tensor:
-    """MFCC + delta + delta-delta, concatenated to 39 dims per frame."""
-    mfcc = mfcc_transform(waveform)
+                          mfcc_transform: torchaudio.transforms.MFCC,
+                          valid_length: Optional[int] = None) -> torch.Tensor:
+    """MFCC + delta + delta-delta, concatenated to 39 dims per frame.
+
+    `waveform` is normally the fixed-window (config.MAX_SAMPLES), zero-padded
+    tensor load_and_preprocess returns. Without `valid_length`, MFCC/delta/
+    delta-delta are computed straight over that padded waveform — the default,
+    for callers that only ever see the full window (e.g. the "before VAD, raw
+    padded" comparison panel in notebooks/02_feature_analysis.ipynb).
+
+    When `valid_length` is given, the transform instead runs only over the
+    real-audio prefix `waveform[:, :valid_length]`, and the result is
+    zero-padded back out to the same frame count the full waveform would have
+    produced. This matters for compute_deltas: its filter looks a few frames
+    ahead/behind, so computing it on the full padded waveform smears the real/
+    padding boundary into the last few *valid* frames as a spurious edge
+    artifact. Slicing to valid_length first keeps every delta true to only
+    real audio; only the explicit pad step afterward introduces zeros.
+    """
+    total_frames = mfcc_frame_count(waveform.shape[-1])
+    source = waveform
+    if valid_length is not None and 0 < valid_length < waveform.shape[-1]:
+        source = waveform[:, :valid_length]
+
+    mfcc = mfcc_transform(source)
     delta = torchaudio.functional.compute_deltas(mfcc)
     delta2 = torchaudio.functional.compute_deltas(delta)
-    return torch.cat([mfcc, delta, delta2], dim=1)           # (1, 39, frames)
+    features = torch.cat([mfcc, delta, delta2], dim=1)       # (1, 39, frames)
+
+    if features.shape[-1] < total_frames:
+        features = torch.nn.functional.pad(features, (0, total_frames - features.shape[-1]))
+    elif features.shape[-1] > total_frames:
+        features = features[..., :total_frames]
+    return features
+
+
+def validate_mfcc_output(features: torch.Tensor, valid_length: int,
+                         mask: Optional[torch.Tensor] = None) -> None:
+    """Sanity-check one extract_mfcc_features() output. Raises ValueError with
+    a specific message on the first violation found; returns None (silently)
+    when everything checks out. Not called on the training hot path — this is
+    for notebook/debugging use, where a caught bug is worth the extra pass
+    over the tensor.
+    """
+    expected_dim = 3 * config.N_MFCC
+    if features.dim() not in (2, 3):
+        raise ValueError(f"expected a (C, T) or (1, C, T) MFCC tensor, got shape {tuple(features.shape)}")
+    channel_dim = -2
+    if features.shape[channel_dim] != expected_dim:
+        raise ValueError(
+            f"MFCC channel dim is {features.shape[channel_dim]}, expected "
+            f"3 * N_MFCC = {expected_dim} (mfcc + delta + delta-delta)")
+
+    total_frames = features.shape[-1]
+    if torch.isnan(features).any():
+        raise ValueError("MFCC features contain NaN")
+    if torch.isinf(features).any():
+        raise ValueError("MFCC features contain Inf")
+
+    valid_frames = mfcc_frame_count(valid_length)
+    if valid_frames <= 0:
+        raise ValueError(f"valid_length={valid_length} produced zero valid frames")
+    if valid_frames > total_frames:
+        raise ValueError(
+            f"valid frame count ({valid_frames}) exceeds padded frame count "
+            f"({total_frames}) — valid_length is longer than the fixed window")
+
+    if mask is not None:
+        if mask.shape[-1] != total_frames:
+            raise ValueError(
+                f"mask length ({mask.shape[-1]}) does not match feature frame "
+                f"count ({total_frames})")
+        expected_mask = mfcc_valid_frame_mask(total_frames, valid_length)
+        if not torch.equal(mask.bool(), expected_mask):
+            raise ValueError("mask does not match the frame count implied by valid_length")
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +264,9 @@ def load_and_preprocess_cached(filepath: str) -> Tuple[torch.Tensor, int]:
 
 @lru_cache(maxsize=config.PREPROCESS_CACHE_SIZE)
 def extract_mfcc_features_cached(filepath: str) -> torch.Tensor:
-    """Same contract as extract_mfcc_features, memoized per (process, filepath)."""
-    waveform, _ = load_and_preprocess_cached(filepath)
-    return extract_mfcc_features(waveform, _shared_mfcc_transform())
+    """Same contract as extract_mfcc_features, memoized per (process, filepath).
+    Passes the VAD-trimmed waveform's valid_length through so delta/delta-delta
+    are computed only over real audio, not smeared across the padded tail —
+    see extract_mfcc_features's docstring."""
+    waveform, valid_length = load_and_preprocess_cached(filepath)
+    return extract_mfcc_features(waveform, _shared_mfcc_transform(), valid_length=valid_length)

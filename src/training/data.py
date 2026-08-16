@@ -87,10 +87,17 @@ def compute_class_weights(train_df: pd.DataFrame, task: str) -> torch.Tensor:
     return torch.tensor(weights.to_numpy(), dtype=torch.float32)
 
 
+# Variants with no acoustic (MFCC) pathway. Their Dataset skips MFCC
+# extraction entirely — see UASpeechDataset(include_mfcc=...). Every other
+# variant either is the MFCC CNN or fuses with it, so it needs the tensor.
+MODELS_WITHOUT_MFCC = frozenset({"deep_frozen", "deep_lora"})
+
+
 def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame,
                   batch_size: int, num_workers: int, pin_memory: bool,
                   praat_table: Optional[pd.DataFrame] = None,
-                  frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None
+                  frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None,
+                  model_name: Optional[str] = None
                   ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Wrap the three fold DataFrames into DataLoaders.
@@ -113,9 +120,15 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     if praat_table is not None:
         praat_stats = praat_standardizer(praat_table, train_df["Filename"])
 
+    # Unknown/None model_name keeps MFCC on — the safe default, since a model
+    # that needs it and doesn't get it fails loudly, whereas one that skips it
+    # unnecessarily only costs time.
+    include_mfcc = model_name not in MODELS_WITHOUT_MFCC
+
     def dataset(df: pd.DataFrame) -> UASpeechDataset:
         return UASpeechDataset(df, praat_table=praat_table, praat_stats=praat_stats,
-                               frozen_embedding_table=frozen_embedding_table)
+                               frozen_embedding_table=frozen_embedding_table,
+                               include_mfcc=include_mfcc)
 
     # __getitem__ does real CPU work per utterance (torchaudio.load, resample,
     # VAD trim, MFCC + deltas) - with num_workers=0 that runs synchronously in

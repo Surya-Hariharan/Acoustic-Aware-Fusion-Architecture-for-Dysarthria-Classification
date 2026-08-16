@@ -51,7 +51,14 @@ class ExperimentBudgetManager:
     hard_cap_hours: float = 6.0
     n_folds: int = 28                          # full LOSO fold count
     epochs_per_fold_estimate: Optional[int] = None   # None -> derive from patience
-    log_path: Optional[str] = None             # defaults to outputs/metrics/budget_manager_log.json
+    # Distinguishes this manager's log from any other manager alive in the same
+    # notebook. notebooks/03_training.ipynb builds two — a screening manager
+    # (Stage 5) and the primary-sweep manager (Stage 8d) — and with a single
+    # shared default path the second silently overwrote the first's benchmarks,
+    # destroying the screening measurements. Any distinct string works; the
+    # name only has to differ between concurrent managers.
+    name: str = "default"
+    log_path: Optional[str] = None             # defaults to outputs/metrics/budget_manager_<name>_log.json
 
     benchmarks: Dict[str, float] = field(default_factory=dict)     # variant -> seconds/(fold*epoch)
     estimates: Dict[str, float] = field(default_factory=dict)      # variant -> projected total seconds
@@ -61,7 +68,7 @@ class ExperimentBudgetManager:
 
     def __post_init__(self):
         if self.log_path is None:
-            self.log_path = config.METRICS_DIR / "budget_manager_log.json"
+            self.log_path = config.METRICS_DIR / f"budget_manager_{self.name}_log.json"
         if self.epochs_per_fold_estimate is None:
             # Early stopping usually fires a few epochs past its best, not at
             # DEFAULT_EPOCHS — patience+2 is a documented, adjustable guess, not a
@@ -153,23 +160,139 @@ class ExperimentBudgetManager:
                       "variant's full allocation; this is a ceiling, not a target.")
 
     # -----------------------------------------------------------------
-    def deadline_for(self, model_name: str) -> Optional[float]:
-        """A time.monotonic() deadline for `model_name`, sized from its allocation,
-        anchored to the remaining session time. Returns None if the hard cap has
-        already been reached by variants that ran before this one this session —
-        callers should skip the variant and print a clear note (matches the existing
-        'session budget used up' pattern from the pre-budget-manager notebook cells)."""
+    def projection_for(self, model_name: str, remaining_folds: Optional[int] = None) -> Dict:
+        """
+        What finishing `model_name` would actually cost, from its measured
+        benchmark — reported BEFORE committing, which the previous
+        implementation never did.
+
+        `remaining_folds` defaults to the full fold count; pass the number still
+        outstanding (total minus whatever the on-disk resume cache already
+        holds) to project only the work left to do.
+        """
+        remaining_folds = self.n_folds if remaining_folds is None else remaining_folds
+        per_fold_epoch = self.benchmarks.get(model_name)
+        if per_fold_epoch is None:
+            return {"model": model_name, "projected_s": None,
+                    "remaining_folds": remaining_folds}
+        projected = per_fold_epoch * self.epochs_per_fold_estimate * remaining_folds
+        session_remaining = max(
+            0.0, self._session_start + self.hard_cap_hours * 3600 - time.monotonic())
+        return {
+            "model": model_name,
+            "remaining_folds": remaining_folds,
+            "s_per_fold_epoch": per_fold_epoch,
+            "projected_s": projected,
+            "projected_h": projected / 3600,
+            "session_remaining_h": session_remaining / 3600,
+            "fits_in_session": projected <= session_remaining,
+            # One fold is the true granularity: the deadline is only checked
+            # BETWEEN folds (src.training.runner.run_training), so a fold that
+            # starts always runs to completion. An allocation smaller than this
+            # cannot be honoured and will overrun the cap.
+            "min_useful_s": per_fold_epoch * self.epochs_per_fold_estimate,
+        }
+
+    def deadline_for(self, model_name: str, remaining_folds: Optional[int] = None,
+                     allow_partial: bool = True) -> Optional[float]:
+        """
+        A time.monotonic() deadline for `model_name`, sized from its allocation
+        and anchored to the remaining session time.
+
+        Returns None — and says why — when the variant cannot usefully run.
+        Three distinct refusals, where the previous version had one silent skip:
+
+          1. budget_exhausted        the session cap is already spent.
+          2. insufficient_for_one_fold
+             There is not even time for a single fold. Because run_training
+             only checks the deadline between folds, handing back a deadline
+             shorter than one fold's measured cost does not yield a smaller
+             result — it yields a full-length fold that overruns the cap. That
+             is exactly how the pre-repair primary sweep spent 2.58h against a
+             2.5h cap and then dropped its last three variants, including the
+             proposed architecture.
+          3. cannot_complete         (only when allow_partial=False)
+             It cannot finish all remaining folds, so a FINAL run refuses to
+             start it rather than manufacture a partial leaderboard.
+
+        Leave allow_partial=True for screening/development, where a partial
+        ranking is still useful — it is now labelled PARTIAL in the registry
+        rather than passing as a finished result.
+        """
         if model_name not in self.allocations:
             raise KeyError(f"No allocation for '{model_name}' — call allocate() first.")
+
+        projection = self.projection_for(model_name, remaining_folds)
         session_deadline = self._session_start + self.hard_cap_hours * 3600
         remaining = session_deadline - time.monotonic()
+
         if remaining <= 0:
-            print_note(f"Session budget ({self.hard_cap_hours}h) already used up — "
-                      f"skipping '{model_name}'. Re-run this cell later to resume "
-                      "(completed folds are loaded from disk, not retrained).")
+            print_note(f"Skipping '{model_name}' [PARTIAL: budget_exhausted] — the "
+                      f"{self.hard_cap_hours}h session budget is spent. Re-run later "
+                      "to resume; completed folds load from disk, not retrained.")
             return None
+
+        min_useful = projection.get("min_useful_s")
+        if min_useful is not None and remaining < min_useful:
+            print_note(
+                f"Skipping '{model_name}' [PARTIAL: insufficient_for_one_fold] — "
+                f"{remaining / 60:.0f} min left but one fold measures "
+                f"~{min_useful / 60:.0f} min. Starting it would overrun the cap, "
+                "since the deadline is only enforced between folds.")
+            return None
+
+        if not allow_partial and not projection.get("fits_in_session", False):
+            print_note(
+                f"Skipping '{model_name}' [PARTIAL: cannot_complete] — needs "
+                f"~{projection['projected_h']:.1f}h for "
+                f"{projection['remaining_folds']} fold(s) but only "
+                f"{projection['session_remaining_h']:.1f}h remain. allow_partial=False, "
+                "so it is not started rather than producing an incomplete result.")
+            return None
+
+        print_kv(f"{model_name} projection",
+                f"~{projection['projected_h']:.1f}h for {projection['remaining_folds']} "
+                f"fold(s); {projection['session_remaining_h']:.1f}h left in session"
+                + ("" if projection["fits_in_session"] else "   [will be PARTIAL]"))
+
         slice_s = min(self.allocations[model_name], remaining)
         return time.monotonic() + slice_s
+
+    def preflight(self, remaining_folds: Optional[Dict[str, int]] = None) -> pd.DataFrame:
+        """
+        The "before you press go" table: projected cost per variant against the
+        session budget, as one view rather than something discovered variant by
+        variant as the budget drains.
+
+        Call this before a FINAL run. If the total exceeds the cap, the run WILL
+        be partial — decide that deliberately here instead of learning it from a
+        truncated leaderboard afterwards.
+        """
+        remaining_folds = remaining_folds or {}
+        rows = [self.projection_for(m, remaining_folds.get(m)) for m in self.models]
+        table = pd.DataFrame([r for r in rows if r.get("projected_s") is not None])
+
+        print_header("Pre-flight — projected cost")
+        if table.empty:
+            print_note("No benchmarks yet — call benchmark() first.")
+            return table
+
+        print_table(table[["model", "remaining_folds", "s_per_fold_epoch",
+                           "projected_h", "fits_in_session"]])
+        total_h = table["projected_s"].sum() / 3600
+        print_kv("Total projected", f"{total_h:.1f}h")
+        print_kv("Hard cap", f"{self.hard_cap_hours:.1f}h")
+        print_kv("Epochs per fold (estimate)", self.epochs_per_fold_estimate)
+        print_kv("Folds per variant", self.n_folds)
+        if total_h > self.hard_cap_hours:
+            print_note(f"Projected {total_h:.1f}h exceeds the {self.hard_cap_hours}h cap "
+                      f"by {total_h - self.hard_cap_hours:.1f}h — this run will be PARTIAL. "
+                      "Raise the cap, cut folds/variants, or plan to resume across "
+                      "sessions (completed folds load from disk and are never retrained).")
+        else:
+            print_status(f"Fits: {total_h:.1f}h projected against a "
+                        f"{self.hard_cap_hours:.1f}h cap", ok=True)
+        return table
 
     def record_actual(self, model_name: str, elapsed_seconds: float) -> None:
         self.actuals[model_name] = elapsed_seconds
@@ -191,11 +314,13 @@ class ExperimentBudgetManager:
 
     @classmethod
     def load(cls, models: List[str], hard_cap_hours: float = 6.0,
+             name: str = "default",
              log_path: Optional[str] = None) -> "ExperimentBudgetManager":
-        """Resume a prior benchmark/allocation from outputs/metrics/budget_manager_log.json
-        instead of re-benchmarking — useful across notebook restarts within one session."""
-        log_path = log_path or (config.METRICS_DIR / "budget_manager_log.json")
-        manager = cls(models=models, hard_cap_hours=hard_cap_hours, log_path=log_path)
+        """Resume a prior benchmark/allocation from this manager's log instead of
+        re-benchmarking — useful across notebook restarts within one session."""
+        log_path = log_path or (config.METRICS_DIR / f"budget_manager_{name}_log.json")
+        manager = cls(models=models, hard_cap_hours=hard_cap_hours, name=name,
+                      log_path=log_path)
         if log_path.exists():
             with open(log_path) as f:
                 data = json.load(f)

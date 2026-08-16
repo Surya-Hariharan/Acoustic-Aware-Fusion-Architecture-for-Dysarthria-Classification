@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from src import config
+from src.preprocessing import mfcc_frame_count
 
 
 class AcousticPathway(nn.Module):
@@ -70,12 +71,14 @@ class AcousticPathway(nn.Module):
         Convert a sample-level waveform attention mask (see DeepPathway) into
         the number of *pooled* frames (this module's forward_sequence output)
         that fall before the padded tail — mirrors torchaudio.transforms.MFCC's
-        center=True STFT framing (frames = valid_samples // hop_length + 1),
-        then this module's pooling stages. Both pathways read the same padded
-        waveform (src/dataset.py), so this needs no separate length input.
+        center=True STFT framing via src.preprocessing.mfcc_frame_count (the
+        same formula src.dataset.UASpeechDataset uses for its
+        mfcc_valid_frames metadata), then this module's pooling stages. Both
+        pathways read the same padded waveform (src/dataset.py), so this
+        needs no separate length input.
         """
         valid_samples = waveform_attention_mask.sum(dim=1)
-        mfcc_frames = valid_samples // config.MEL_KWARGS["hop_length"] + 1
+        mfcc_frames = mfcc_frame_count(valid_samples)
         return self._pool_frames(mfcc_frames).clamp(min=1)
 
     def sequence_key_padding_mask(self, mfcc: torch.Tensor,

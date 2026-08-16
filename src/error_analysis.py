@@ -308,8 +308,9 @@ def plot_utterance_diagnostics(row, show: bool = False,
     sr = sound.sampling_frequency
     times = np.arange(len(original)) / sr
 
-    processed, _ = load_and_preprocess(filepath)
-    mfcc = extract_mfcc_features(processed, build_mfcc_transform())[0].numpy()
+    processed, valid_length = load_and_preprocess(filepath)
+    mfcc = extract_mfcc_features(processed, build_mfcc_transform(),
+                                 valid_length=valid_length)[0].numpy()
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 

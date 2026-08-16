@@ -3,13 +3,17 @@ Per-fold and cross-fold output writers: predictions, metrics, confusion
 matrices, ROC curves, and embeddings — everything train.py drops into
 outputs/ for downstream phases (ablation tables, error analysis, Praat
 correlation, embedding visualization).
+
+Also home to the EXPERIMENT REGISTRY (see below), the single record of what
+was actually evaluated — as opposed to what merely left a file behind.
 """
 
 import json
 import shutil
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -133,6 +137,187 @@ def aggregate_fold_metrics(metrics_dir: Path, run_name: str,
     with open(metrics_dir / f"{run_name}.summary.json", "w") as f:
         json.dump(summary.to_dict(orient="index"), f, indent=2)
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Experiment registry
+#
+# THE PROBLEM IT SOLVES
+# Before this existed, every consumer inferred "this experiment finished" from
+# "a CSV exists". That is how a single held-out control speaker — one fold of
+# an intended 28, carrying no positive class at all — became a headline
+# "99.7% accuracy" row in the final comparison table. A run that stops at the
+# time budget writes exactly the same files as one that completes; nothing on
+# disk distinguished them.
+#
+# The registry records what was actually evaluated: which folds ran, which
+# speakers they held out, which classes those speakers covered, and whether the
+# run reached its intended fold count. Downstream reporting reads STATUS from
+# here rather than guessing from filenames.
+#
+# It deliberately lives beside save_experiment_bundle (which already owns
+# outputs/experiments/) and is written from the same run_fold/run_training path
+# that already computes every one of these values — it is an extension of the
+# existing bundle system, not a second bookkeeping mechanism.
+# ---------------------------------------------------------------------------
+REGISTRY_PATH = config.EXPERIMENTS_DIR / "registry.csv"
+
+# Per-fold outcomes.
+FOLD_COMPLETED = "COMPLETED"        # trained and evaluated in this session
+FOLD_CACHED = "CACHED"              # loaded from a previous session's output
+FOLD_FAILED = "FAILED"              # raised; excluded from pooling
+FOLD_SKIPPED_DEADLINE = "SKIPPED_DEADLINE"   # budget ran out before it started
+
+# Run-level rollups.
+RUN_COMPLETED = "COMPLETED"         # every expected fold has a result
+RUN_PARTIAL = "PARTIAL"             # some folds ran, some did not
+RUN_FAILED = "FAILED"               # folds ran but none produced a result
+RUN_NOT_STARTED = "NOT_STARTED"
+
+REGISTRY_COLUMNS = [
+    "run_name", "model", "task", "cv_protocol", "fold_id", "fold_index",
+    "expected_folds", "held_out_speakers", "speaker_labels", "num_samples",
+    "num_classes_present", "epochs_completed", "runtime_s", "status", "recorded_at",
+]
+
+
+def describe_fold(test_df: pd.DataFrame) -> Dict:
+    """Held-out composition of one fold, straight from its test split.
+
+    `speaker_labels` is what makes a single-class fold self-evident in the
+    registry without re-reading predictions: for a detection LOSO fold it reads
+    e.g. "CF02=Healthy Control", and num_classes_present is 1.
+    """
+    speakers = sorted(test_df["Speaker_ID"].unique().tolist())
+    label_column = "Severity" if "Severity" in test_df.columns else "Group"
+    pairs = (test_df[["Speaker_ID", label_column]].drop_duplicates()
+             .sort_values("Speaker_ID"))
+    return {
+        "held_out_speakers": ";".join(speakers),
+        "speaker_labels": ";".join(f"{r.Speaker_ID}={getattr(r, label_column)}"
+                                   for r in pairs.itertuples(index=False)),
+        "num_samples": int(len(test_df)),
+    }
+
+
+def record_fold(run_name: str, model: str, task: str, cv_protocol: str,
+                fold_id: str, fold_index: int, expected_folds: int,
+                status: str, fold_description: Optional[Dict] = None,
+                num_classes_present: Optional[int] = None,
+                epochs_completed: Optional[int] = None,
+                runtime_s: Optional[float] = None,
+                registry_path: Optional[Path] = None) -> None:
+    """Upsert one (run_name, fold_id) row into the registry.
+
+    Upsert, not append: re-running a fold (after a crash, or a resumed session
+    re-reading it from cache) must update its row rather than accumulate
+    duplicates that would inflate the completed-fold count and hand the
+    eligibility gate a false 100% coverage.
+    """
+    registry_path = Path(registry_path or REGISTRY_PATH)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    row = {
+        "run_name": run_name, "model": model, "task": task,
+        "cv_protocol": cv_protocol, "fold_id": fold_id, "fold_index": fold_index,
+        "expected_folds": expected_folds,
+        "held_out_speakers": "", "speaker_labels": "", "num_samples": np.nan,
+        "num_classes_present": num_classes_present,
+        "epochs_completed": epochs_completed,
+        "runtime_s": runtime_s, "status": status,
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **(fold_description or {}),
+    }
+
+    existing = load_registry(registry_path)
+    new_row = pd.DataFrame([row])
+    if existing.empty:
+        # Concatenating onto an all-NA placeholder frame lets pandas infer
+        # column dtypes from the empty side and warns about it; the first row
+        # should simply define the schema.
+        updated = new_row
+    else:
+        keep = ~((existing["run_name"] == run_name) & (existing["fold_id"] == fold_id))
+        updated = pd.concat([existing[keep], new_row], ignore_index=True)
+    updated.reindex(columns=REGISTRY_COLUMNS).to_csv(registry_path, index=False)
+
+
+def load_registry(registry_path: Optional[Path] = None) -> pd.DataFrame:
+    """The raw per-fold registry, or an empty frame with the right columns."""
+    registry_path = Path(registry_path or REGISTRY_PATH)
+    if not registry_path.exists():
+        return pd.DataFrame(columns=REGISTRY_COLUMNS)
+    return pd.read_csv(registry_path)
+
+
+def summarize_registry(registry_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Per-run rollup: how much of each experiment actually happened.
+
+    Columns:
+      expected_folds / completed_folds  intended vs. produced a result
+      valid_folds                       folds whose held-out set had >1 class,
+                                        i.e. folds on which class-sensitive
+                                        metrics are defined at all
+      failed_folds / skipped_folds      excluded, with the reason distinguished
+      coverage                          completed / expected
+      pooled_has_both_classes           whether the union of completed folds
+                                        covers more than one class — the thing
+                                        that decides if a POOLED detection
+                                        metric means anything
+      status                            COMPLETED / PARTIAL / FAILED
+
+    A run can have completed_folds > 0 and pooled_has_both_classes == False —
+    that is precisely the pre-repair failure mode (two held-out controls), and
+    it is why coverage alone is not a sufficient gate.
+    """
+    registry = load_registry(registry_path)
+    if registry.empty:
+        return pd.DataFrame(columns=[
+            "run_name", "model", "task", "cv_protocol", "expected_folds",
+            "completed_folds", "valid_folds", "failed_folds", "skipped_folds",
+            "coverage", "pooled_has_both_classes", "total_runtime_s", "status"])
+
+    rows = []
+    for run_name, group in registry.groupby("run_name", sort=True):
+        done = group[group["status"].isin([FOLD_COMPLETED, FOLD_CACHED])]
+        expected = int(group["expected_folds"].max())
+        completed = int(len(done))
+        classes = pd.to_numeric(done["num_classes_present"], errors="coerce")
+        rows.append({
+            "run_name": run_name,
+            "model": group["model"].iloc[0],
+            "task": group["task"].iloc[0],
+            "cv_protocol": group["cv_protocol"].iloc[0],
+            "expected_folds": expected,
+            "completed_folds": completed,
+            "valid_folds": int((classes > 1).sum()),
+            "failed_folds": int((group["status"] == FOLD_FAILED).sum()),
+            "skipped_folds": int((group["status"] == FOLD_SKIPPED_DEADLINE).sum()),
+            "coverage": completed / expected if expected else 0.0,
+            # Distinct held-out labels across every completed fold. One fold of
+            # Healthy plus one of Dysarthric pools to both classes even though
+            # neither fold alone is valid — which is exactly why this is
+            # computed over the union rather than per fold.
+            "pooled_has_both_classes": _pooled_class_count(done) > 1,
+            "total_runtime_s": float(pd.to_numeric(
+                done["runtime_s"], errors="coerce").sum()),
+            "status": (RUN_COMPLETED if completed and completed >= expected
+                       else RUN_PARTIAL if completed
+                       else RUN_FAILED),
+        })
+    return pd.DataFrame(rows).sort_values(["task", "run_name"]).reset_index(drop=True)
+
+
+def _pooled_class_count(completed_folds: pd.DataFrame) -> int:
+    """Distinct held-out class labels across every completed fold of one run,
+    parsed from the `speaker_labels` column ("CF02=Healthy Control;...")."""
+    labels = set()
+    for entry in completed_folds["speaker_labels"].dropna():
+        for pair in str(entry).split(";"):
+            if "=" in pair:
+                labels.add(pair.split("=", 1)[1])
+    return len(labels)
 
 
 def save_experiment_bundle(experiment_name: str, model_name: str, task: str,

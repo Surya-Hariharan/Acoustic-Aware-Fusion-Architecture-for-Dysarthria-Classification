@@ -39,9 +39,11 @@ from src.training.metrics import compute_confusion_matrix, compute_metrics
 from src.training.models import (MODEL_DESCRIPTIONS,
                                  MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING,
                                  MODELS_REQUIRING_PRAAT, build_model)
-from src.training.reporting import (aggregate_fold_metrics, save_confusion_matrix,
+from src.training.reporting import (FOLD_CACHED, FOLD_COMPLETED, FOLD_FAILED,
+                                    FOLD_SKIPPED_DEADLINE, aggregate_fold_metrics,
+                                    describe_fold, record_fold, save_confusion_matrix,
                                     save_embeddings, save_metrics, save_predictions,
-                                    save_roc_curve)
+                                    save_roc_curve, summarize_registry)
 from src.training.utils import resolve_device, set_seed
 
 
@@ -187,7 +189,7 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     train_loader, val_loader, test_loader = build_loaders(
         train_df, val_df, test_df, cfg.batch_size, cfg.num_workers,
         pin_memory=(device.type == "cuda"), praat_table=praat_table,
-        frozen_embedding_table=frozen_embedding_table)
+        frozen_embedding_table=frozen_embedding_table, model_name=cfg.model)
 
     model = build_model(cfg.model, num_classes).to(device)
     optimizer = build_optimizer(model, cfg.lr_head, cfg.lr_backbone, cfg.weight_decay)
@@ -219,6 +221,7 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
         print_architecture(model, cfg.model)
         print()
 
+    epochs_completed = 0
     for epoch in range(cfg.epochs):
         train_result = run_epoch(model, train_loader, criterion, optimizer, device,
                                  scaler, cfg.grad_clip, cfg.task, train=True,
@@ -239,6 +242,7 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
             writer.add_scalar(f"Val/{name}", value, epoch)
         writer.add_scalar("LR", optimizer.param_groups[-1]["lr"], epoch)
 
+        epochs_completed = epoch + 1
         is_best = early_stopping.step(val_result.loss)
         if is_best:
             save_checkpoint(best_ckpt_path, model, optimizer, scheduler, scaler,
@@ -271,6 +275,7 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
                      test_result.y_pred, test_result.y_prob, cfg.task)
     save_metrics(config.METRICS_DIR / run_name / f"{fold_id}.json",
                 {"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
+                 "epochs_completed": epochs_completed,
                  "fold_time_s": fold_time_s, "train_time_s": train_time_s,
                  "inference_time_s": inference_time_s})
     save_confusion_matrix(
@@ -289,8 +294,17 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
         f"{k}={v:.3f}" for k, v in test_result.metrics.items()))
 
     return ({"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
+             "epochs_completed": epochs_completed,
              "fold_time_s": fold_time_s, "train_time_s": train_time_s,
              "inference_time_s": inference_time_s}, test_result)
+
+
+def _registry_kwargs(cfg: TrainingConfig, run_name: str, expected_folds: int) -> Dict:
+    """The run-identifying fields every record_fold() call in run_training shares."""
+    return {"run_name": run_name, "model": cfg.model, "task": cfg.task,
+            "cv_protocol": (cfg.cv_protocol if cfg.task == "detection"
+                            else "severity_lopco"),
+            "expected_folds": expected_folds}
 
 
 def run_training(df: pd.DataFrame, cfg: TrainingConfig,
@@ -382,10 +396,18 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
             print_note("REDUCED SCALE — this is a pipeline check, not a reportable result "
                        "(max_folds / limit_samples are set).")
 
+    registry_base = _registry_kwargs(cfg, run_name, n_folds)
     fold_metrics = []
     pooled_true, pooled_pred, pooled_prob, pooled_speakers = [], [], [], []
     failed_folds = []
     for i, (fold_id, train_df, test_df) in enumerate(fold_iter, start=1):
+        # Held-out composition is known before training and is recorded whatever
+        # the fold's outcome — so a fold that never ran still leaves a registry
+        # row saying which speakers it WOULD have covered. That is what lets
+        # summarize_registry() report honest coverage instead of silently
+        # shrinking the denominator to whatever happened to finish.
+        fold_description = describe_fold(test_df)
+
         # Resume support: a long unattended run (full 28-fold LOSO across six
         # model variants is realistically hours-to-days) can be interrupted
         # and restarted without redoing folds that already finished.
@@ -393,10 +415,23 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         if cached is None and deadline is not None and time.monotonic() >= deadline:
             print_note(f"Time budget reached after {i - 1}/{n_folds} folds — "
                       "stopping early. Re-run this cell to resume.")
+            # Record every remaining fold as skipped, not merely this one: the
+            # run is stopping here, so all of them are equally un-evaluated and
+            # the registry should say so rather than leave them absent (absent
+            # is indistinguishable from "never configured").
+            for j, (skipped_id, _, skipped_test_df) in enumerate(fold_iter[i - 1:], start=i):
+                record_fold(**registry_base, fold_id=skipped_id, fold_index=j,
+                            status=FOLD_SKIPPED_DEADLINE,
+                            fold_description=describe_fold(skipped_test_df))
             break
         if cached is not None:
             metrics_dict, y_true, y_pred, y_prob, speakers = cached
             print_kv(f"Fold {fold_id}", "already completed — loaded from disk, skipping retrain")
+            record_fold(**registry_base, fold_id=fold_id, fold_index=i,
+                        status=FOLD_CACHED, fold_description=fold_description,
+                        num_classes_present=int(len(np.unique(y_true))),
+                        epochs_completed=metrics_dict.get("epochs_completed"),
+                        runtime_s=metrics_dict.get("fold_time_s"))
         else:
             try:
                 metrics_dict, test_result = run_fold(fold_id, train_df, test_df, cfg, device,
@@ -409,9 +444,16 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
                 print_status(f"Fold {fold_id} failed — skipping (see traceback below)", ok=False)
                 print(traceback.format_exc())
                 failed_folds.append(fold_id)
+                record_fold(**registry_base, fold_id=fold_id, fold_index=i,
+                            status=FOLD_FAILED, fold_description=fold_description)
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 continue
+            record_fold(**registry_base, fold_id=fold_id, fold_index=i,
+                        status=FOLD_COMPLETED, fold_description=fold_description,
+                        num_classes_present=metrics_dict.get("n_classes_present"),
+                        epochs_completed=metrics_dict.get("epochs_completed"),
+                        runtime_s=metrics_dict.get("fold_time_s"))
             y_true, y_pred, y_prob = test_result.y_true, test_result.y_pred, test_result.y_prob
             speakers = test_result.speaker_ids
             # Each fold builds a fresh model/optimizer/scaler (run_fold) that goes
@@ -458,12 +500,34 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
 
     print_subheader("Per-fold mean +/- std")
     print_table(summary.reset_index().rename(columns={"index": "metric"}))
-    if cfg.task == "detection":
+    if cfg.task == "detection" and cfg.cv_protocol != "screening":
         print()
         print_note("Every LOSO fold holds out ONE speaker, who is entirely one class, so "
-                   "per-fold precision / recall / specificity / AUROC above are")
-        print_note("degenerate — only 'accuracy' is meaningful per fold. The pooled "
-                   "numbers below are the ones comparable to the base paper.")
+                   "per-fold precision / recall / specificity / AUROC are undefined")
+        print_note("(reported as NaN, not 0 — see src.training.metrics). Only 'accuracy' "
+                   "is meaningful per fold; the pooled numbers below are the reportable ones.")
+
+    # Coverage before metrics, deliberately: a pooled number from 2 of 28 folds
+    # looks identical to one from 28 of 28, and the reader needs to know which
+    # they are looking at BEFORE they read the number.
+    coverage = summarize_registry()
+    this_run = coverage[coverage["run_name"] == run_name]
+    if not this_run.empty:
+        row = this_run.iloc[0]
+        print_subheader("Evaluation coverage")
+        print_kv("Folds completed", f"{int(row['completed_folds'])} / "
+                 f"{int(row['expected_folds'])}  ({row['coverage']:.1%})")
+        print_kv("Folds with >1 held-out class", int(row["valid_folds"]))
+        print_kv("Pooled set covers both classes", bool(row["pooled_has_both_classes"]))
+        print_kv("Run status", row["status"])
+        if row["status"] != "COMPLETED":
+            print_note(f"This run is {row['status']} — it did not reach its intended "
+                       f"{int(row['expected_folds'])} folds. The pooled metrics below "
+                       "describe only the folds that ran and are NOT a final result.")
+        if not row["pooled_has_both_classes"] and cfg.task == "detection":
+            print_note("The pooled held-out set contains only ONE class, so pooled "
+                       "precision / recall / F1 / AUROC are undefined (NaN). This run "
+                       "carries no evidence about detection performance.")
 
     print_metrics(pooled_metrics,
                   title="Pooled across all folds (base-paper-style LOSO reporting)")
