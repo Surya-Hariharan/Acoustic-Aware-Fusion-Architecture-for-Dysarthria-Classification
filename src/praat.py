@@ -484,22 +484,6 @@ def praat_vector(table: pd.DataFrame, filename: str, stats: tuple) -> np.ndarray
 FRAME_HOP_SECONDS = 0.01     # matches config.MEL_KWARGS["hop_length"]=160 at 16 kHz
 
 
-def _interpolate_unvoiced(f0_hz: np.ndarray) -> np.ndarray:
-    """Linearly interpolate zero (unvoiced) frames between voiced neighbors;
-    an edge run is filled with its nearest voiced value (np.interp's default
-    edge behaviour). An all-unvoiced contour is returned unchanged — there is
-    nothing to interpolate from, and the accompanying voicing mask already
-    marks every frame invalid, so the caller cannot mistake this for a real
-    (silent) pitch of 0 Hz."""
-    voiced = f0_hz > 0
-    if not voiced.any():
-        return f0_hz.copy()
-    idx = np.arange(len(f0_hz))
-    interpolated = f0_hz.copy()
-    interpolated[~voiced] = np.interp(idx[~voiced], idx[voiced], f0_hz[voiced])
-    return interpolated
-
-
 def _hz_to_semitones(f0_hz: np.ndarray, reference_hz: float = 100.0) -> np.ndarray:
     """Semitones relative to 100 Hz — puts F0 on a scale where equal steps
     are equal perceptual pitch changes regardless of a speaker's register,
@@ -512,8 +496,8 @@ def _hz_to_semitones(f0_hz: np.ndarray, reference_hz: float = 100.0) -> np.ndarr
 def extract_suprasegmental_sequence(waveform: np.ndarray, sr: int, valid_length: int,
                                     total_frames: int) -> Dict[str, np.ndarray]:
     """
-    Frame-level F0 (semitones re 100 Hz, unvoiced-interpolated), a binary
-    voicing mask (1 = real pitch estimate, 0 = interpolated/unvoiced), and
+    Frame-level F0 (semitones re 100 Hz on voiced frames; zero otherwise), a
+    binary voicing mask (1 = real pitch estimate, 0 = unvoiced), and
     intensity (dB), sampled every FRAME_HOP_SECONDS over the real-audio
     prefix `waveform[:valid_length]`, then zero-padded to `total_frames`.
 
@@ -551,7 +535,11 @@ def extract_suprasegmental_sequence(waveform: np.ndarray, sr: int, valid_length:
 
         raw_f0 = pitch.selected_array["frequency"]
         raw_voiced = (raw_f0 > 0).astype(np.float32)
-        raw_semitones = _hz_to_semitones(_interpolate_unvoiced(raw_f0))
+        # Do not fabricate a contour through unvoiced frames. Zero is an
+        # explicit invalid-F0 sentinel, disambiguated by the voicing channel.
+        raw_semitones = np.zeros_like(raw_f0, dtype=np.float32)
+        voiced_idx = raw_voiced.astype(bool)
+        raw_semitones[voiced_idx] = _hz_to_semitones(raw_f0[voiced_idx])
 
         times = pitch.ts()
         raw_intensity = np.zeros(len(times), dtype=np.float32)

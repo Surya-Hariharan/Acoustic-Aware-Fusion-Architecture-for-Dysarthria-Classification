@@ -17,8 +17,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.suprasegmental_pathway import SuprasegmentalPathway
-from src.praat import (_hz_to_semitones, _interpolate_unvoiced,
-                       extract_segmental_extra_sequence, extract_suprasegmental_sequence)
+from src.praat import (_hz_to_semitones, extract_segmental_extra_sequence,
+                       extract_suprasegmental_sequence)
 
 RECEPTIVE_FIELD_MARGIN = 16   # SuprasegmentalPathway is one Conv1d(k=5,p=2)->MaxPool1d(2)
                               # -> Conv1d(k=5,p=2): a comfortably generous margin past the
@@ -91,29 +91,26 @@ def test_supra_masking_actually_changes_the_result():
     assert not torch.allclose(masked, unmasked, atol=1e-3)
 
 
-def test_interpolate_unvoiced_fills_only_the_gaps():
-    f0 = np.array([100.0, 0.0, 0.0, 200.0, 150.0], dtype=np.float32)
-    interpolated = _interpolate_unvoiced(f0)
-    assert interpolated[0] == 100.0
-    assert interpolated[3] == 200.0
-    assert interpolated[4] == 150.0
-    # Interior unvoiced frames are linearly interpolated between the
-    # surrounding voiced values, strictly between them.
-    assert 100.0 < interpolated[1] < 200.0
-    assert 100.0 < interpolated[2] < 200.0
-
-
-def test_interpolate_unvoiced_all_zero_stays_unchanged():
-    f0 = np.zeros(10, dtype=np.float32)
-    interpolated = _interpolate_unvoiced(f0)
-    assert np.array_equal(interpolated, f0)
-
-
 def test_hz_to_semitones_monotonic_and_zero_at_reference():
     hz = np.array([50.0, 100.0, 200.0], dtype=np.float32)
     semitones = _hz_to_semitones(hz, reference_hz=100.0)
     assert semitones[0] < semitones[1] < semitones[2]
     assert abs(semitones[1] - 0.0) < 1e-4          # 100 Hz re 100 Hz -> 0 semitones
+
+
+def test_suprasegmental_sequence_keeps_unvoiced_f0_at_zero():
+    """The voicing channel, not interpolation, must carry missing-F0 state."""
+    sr = 16_000
+    t = np.arange(sr, dtype=np.float32) / sr
+    voiced_then_silent = np.concatenate([
+        0.2 * np.sin(2 * np.pi * 150 * t),
+        np.zeros(sr, dtype=np.float32),
+    ])
+    result = extract_suprasegmental_sequence(
+        voiced_then_silent, sr=sr, valid_length=len(voiced_then_silent), total_frames=401)
+    f0, voicing = result["f0_semitones"], result["voicing"]
+    assert np.isfinite(f0[voicing == 1]).all()
+    assert np.all(f0[voicing == 0] == 0.0)
 
 
 def test_suprasegmental_sequence_short_circuits_for_near_zero_valid_length():
@@ -159,9 +156,8 @@ if __name__ == "__main__":
     test_supra_padding_beyond_receptive_field_cannot_affect_embedding()
     test_supra_masked_pool_equals_manual_mean_over_valid_frames()
     test_supra_masking_actually_changes_the_result()
-    test_interpolate_unvoiced_fills_only_the_gaps()
-    test_interpolate_unvoiced_all_zero_stays_unchanged()
     test_hz_to_semitones_monotonic_and_zero_at_reference()
+    test_suprasegmental_sequence_keeps_unvoiced_f0_at_zero()
     test_suprasegmental_sequence_short_circuits_for_near_zero_valid_length()
     test_segmental_extra_sequence_short_circuits_for_near_zero_valid_length()
     test_suprasegmental_sequence_never_raises_on_garbage_audio()

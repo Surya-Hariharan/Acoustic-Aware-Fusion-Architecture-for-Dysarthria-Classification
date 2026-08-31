@@ -2,7 +2,7 @@
 Data loading for train.py: manifest access, stratified train/val split,
 DataLoader construction, and class weighting.
 
-LOSO (detection) and the balanced 81-fold split (severity) already come
+LOSO (detection) and the primary full-population severity LOSO split already come
 from src.splits — this module only handles what happens inside a fold's
 train portion (carving out a validation slice) and turning DataFrames into
 PyTorch DataLoaders.

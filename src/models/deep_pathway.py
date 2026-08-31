@@ -15,7 +15,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from peft import LoraConfig, get_peft_model
-from transformers import Wav2Vec2Model
+from transformers import Wav2Vec2Config, Wav2Vec2Model
 
 from src import config
 
@@ -40,8 +40,19 @@ class DeepPathway(nn.Module):
     def __init__(self, use_lora: bool = True):
         super().__init__()
         self.use_lora = use_lora
-        backbone = Wav2Vec2Model.from_pretrained(
+        backbone_config = Wav2Vec2Config.from_pretrained(
             config.WAV2VEC_MODEL_NAME, token=config.HF_TOKEN)
+        if not config.WAV2VEC_APPLY_SPEC_AUGMENT:
+            # facebook/wav2vec2-base-960h is a CTC checkpoint whose weights
+            # omit masked_spec_embed. In Transformers 5.5.4, positive masking
+            # probabilities would instantiate that parameter randomly and use
+            # it during model.train(). Set both flags before construction so
+            # the learned branch contains no unpretrained masking component.
+            backbone_config.apply_spec_augment = False
+            backbone_config.mask_time_prob = 0.0
+            backbone_config.mask_feature_prob = 0.0
+        backbone = Wav2Vec2Model.from_pretrained(
+            config.WAV2VEC_MODEL_NAME, config=backbone_config, token=config.HF_TOKEN)
         # Kept as a direct reference to the (unwrapped) backbone so the
         # sample-length -> feature-length conversion below still works after
         # get_peft_model wraps it — get_peft_model wraps this same nn.Module

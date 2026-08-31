@@ -5,12 +5,9 @@ Detection : Leave-One-Speaker-Out (LOSO) across all 28 speakers — the
             base-paper protocol, and also a cheap "screening" k-fold used
             to rank the six ablation variants before spending full-LOSO
             GPU time on any of them.
-Severity  : balanced to 3 speakers per class (by excluding
-            DROPPED_FOR_BALANCE), then leave-one-speaker-per-class-out,
-            giving 3^4 = 81 iterations — the base-paper protocol. A random
-            subsample of those 81 combinations is available for the same
-            reason: 81 folds x every ablation variant is the single
-            largest GPU-time item in the training notebook.
+Severity  : PRIMARY full-population LOSO across all 15 dysarthric speakers.
+            The balanced 3-speakers-per-class, 81-iteration protocol is kept
+            only as a secondary/legacy sanity check.
 """
 
 import random

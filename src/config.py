@@ -250,14 +250,15 @@ ACOUSTIC_EMBED_DIM = 128                        # 1D-CNN output embedding size
 LORA_RANK          = 8
 LORA_ALPHA         = 16
 LORA_DROPOUT       = 0.1
-# q/k/v only for the seven legacy ablation variants (src/training/models.py),
-# kept unchanged so their already-defined behaviour doesn't shift. The new
-# GatedFusionModel (src/models/gated_fusion.py) uses LORA_TARGET_MODULES_WIDE
-# instead — adding the attention output projection gives this one-shot run's
-# only trainable model slightly deeper adaptation, at a small, budget-checked
-# parameter cost (see the plan's Part 2 Component 4).
+# q/k/v self-attention projections in every Wav2Vec2 encoder layer. This is
+# the implemented LoRA scope for both the legacy variants and GatedFusionModel.
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj"]   # self-attention layers
-LORA_TARGET_MODULES_WIDE = ["q_proj", "k_proj", "v_proj", "out_proj"]
+
+# The selected CTC checkpoint has no ``masked_spec_embed`` weight, while
+# Transformers 5.5.4 would otherwise create a random one for training-time
+# SpecAugment. Keep the pretrained encoder path deterministic and entirely
+# pretrained by disabling that incompatible augmentation before model loading.
+WAV2VEC_APPLY_SPEC_AUGMENT = False
 
 # Phase 6: attention-based fusion. The 768-dim deep and 128-dim acoustic frame
 # sequences are projected into a shared FUSION_ATTN_DIM space so cross-attention
@@ -285,8 +286,8 @@ FUSED_EMBED_DIM       = SEGMENTAL_EMBED_DIM + SUPRA_EMBED_DIM + LEARNED_EMBED_DI
 # plus 3 framewise formants (F1-F3) and framewise HNR — see src.praat's
 # extract_formant_sequence / extract_hnr_sequence.
 SEGMENTAL_CHANNELS = 3 * N_MFCC + 3 + 1          # 43
-# Framewise suprasegmental channels: F0 (semitones, interpolated), a binary
-# voicing mask (1 = real pitch estimate, 0 = interpolated/unvoiced), and
+# Framewise suprasegmental channels: F0 (semitones on voiced frames and zero
+# elsewhere), a binary voicing mask (1 = real pitch estimate, 0 = unvoiced),
 # intensity/energy (dB) — see src.praat's extract_f0_sequence /
 # extract_intensity_sequence.
 SUPRA_CHANNELS = 3

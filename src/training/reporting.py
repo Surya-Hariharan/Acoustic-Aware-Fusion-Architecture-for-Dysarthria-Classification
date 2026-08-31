@@ -511,7 +511,7 @@ def feature_audit(model=None, num_classes: int = 4) -> Dict:
             "projected_shape": list(z_learned.shape),
             "dimensions": z_learned.shape[-1],
             "wav2vec2_model": config.WAV2VEC_MODEL_NAME,
-            "lora_target_modules": config.LORA_TARGET_MODULES_WIDE,
+            "lora_target_modules": config.LORA_TARGET_MODULES,
             "lora_rank": config.LORA_RANK, "lora_alpha": config.LORA_ALPHA,
             "lora_dropout": config.LORA_DROPOUT,
         },
@@ -531,7 +531,7 @@ def feature_audit(model=None, num_classes: int = 4) -> Dict:
             "projected_shape": list(z_supra.shape),
             "dimensions": z_supra.shape[-1],
             "engineered_feature_families": [
-                "F0 (semitones, voicing-interpolated)", "voicing mask", "intensity (dB)"],
+                "F0 (semitones; zero when unvoiced)", "voicing mask", "intensity (dB)"],
             "shap_surrogate_feature_names": list(SUPRASEGMENTAL_FEATURE_COLUMNS),
         },
         "fusion": {

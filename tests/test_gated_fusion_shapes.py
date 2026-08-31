@@ -40,6 +40,10 @@ def _dummy_batch(batch_size=4, device="cpu"):
 
 def test_branch_bottleneck_dimensions_match_config():
     model = GatedFusionModel(num_classes=4, num_speakers=3, use_lora=True).eval()
+    backbone = model.deep_pathway.wav2vec.base_model.model
+    assert not backbone.config.apply_spec_augment
+    assert backbone.config.mask_time_prob == backbone.config.mask_feature_prob == 0.0
+    assert not hasattr(backbone, "masked_spec_embed")
     waveform, mfcc, supra, attention_mask, supra_valid_frames, _ = _dummy_batch()
     with torch.no_grad():
         z_l, z_s, z_p = model.encode_branches(waveform, mfcc, supra, attention_mask, supra_valid_frames)
