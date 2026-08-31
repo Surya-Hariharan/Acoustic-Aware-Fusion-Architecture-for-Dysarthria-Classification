@@ -52,6 +52,44 @@ FEATURE_COLUMNS = (
     *RHYTHM_KEYS,
 )
 
+# Split of the same utterance-level FEATURE_COLUMNS into the two branch
+# families the three-branch architecture (src/models/gated_fusion.py) keeps
+# separate, for the explainability layer (src.model_analysis's SHAP surrogate
+# and feature-group aggregation): segmental = local, short-time
+# spectral/articulatory/voice-quality behavior; suprasegmental = pitch,
+# energy, and temporal/voicing behavior. Global "speech_rate"/"pause_duration"
+# are suprasegmental (they characterize the WHOLE utterance's temporal
+# pattern), while "voice_breaks" is a voice-quality-adjacent periodicity
+# count and stays with the segmental/voice-quality group it was measured
+# alongside (jitter/shimmer). This grouping is for the SHAP/permutation-
+# importance feature TABLE only — the model's actual segmental/suprasegmental
+# BRANCHES consume framewise sequences (see extract_segmental_extra_sequence /
+# extract_suprasegmental_sequence below), not these utterance-level scalars.
+SEGMENTAL_FEATURE_COLUMNS = (
+    *JITTER_SHIMMER_KEYS,
+    *HNR_KEYS,
+    *CPPS_KEYS,
+    *FORMANT_KEYS,
+    "voice_breaks",
+)
+SUPRASEGMENTAL_FEATURE_COLUMNS = (
+    *PITCH_KEYS,
+    *INTENSITY_KEYS,
+    "speech_rate", "pause_duration",
+)
+
+# Feature-group labels for SHAP/permutation-importance aggregation (brief
+# Section 18) — every FEATURE_COLUMNS entry belongs to exactly one group.
+FEATURE_GROUPS = {
+    **{k: "Pitch" for k in PITCH_KEYS},
+    **{k: "Voice Quality" for k in ("jitter_local", "jitter_rap", "jitter_ppq5", "jitter_ddp",
+                                    "shimmer_local", "shimmer_apq3", "shimmer_apq11", "shimmer_dda",
+                                    *HNR_KEYS, *CPPS_KEYS)},
+    **{k: "Formants" for k in FORMANT_KEYS},
+    **{k: "Energy" for k in INTENSITY_KEYS},
+    "speech_rate": "Temporal", "pause_duration": "Temporal", "voice_breaks": "Voice Quality",
+}
+
 # Columns every features table carries alongside FEATURE_COLUMNS - the join key
 # back onto m6_manifest.csv plus the labels the group comparison splits on.
 ID_COLUMNS = ("Filename", "Speaker_ID", "Group", "Severity")
@@ -426,3 +464,165 @@ def praat_vector(table: pd.DataFrame, filename: str, stats: tuple) -> np.ndarray
     row = table.loc[filename, list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
     standardized = (row - mean) / std
     return np.nan_to_num(standardized, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Framewise sequence extraction for the three-branch gated-fusion severity
+# architecture (src/models/gated_fusion.py). Everything above this point
+# produces ONE scalar per utterance per feature (for the SHAP-surrogate
+# explainability table); the functions below instead produce a per-FRAME
+# sequence at the same ~10ms hop as the MFCC pipeline (src.preprocessing),
+# so a small temporal encoder — not a flat MLP over utterance-level means —
+# can consume them. See the architecture plan's Part 2, Components 5-6.
+#
+# Both functions never raise: on any Praat failure they fall back to an
+# all-zero sequence (with the accompanying valid-frame count still computed
+# from valid_length, matching src.preprocessing.mfcc_valid_frame_mask's
+# convention), so a difficult clip degrades to "no signal from this branch
+# for this frame" rather than aborting a batch.
+# ---------------------------------------------------------------------------
+FRAME_HOP_SECONDS = 0.01     # matches config.MEL_KWARGS["hop_length"]=160 at 16 kHz
+
+
+def _interpolate_unvoiced(f0_hz: np.ndarray) -> np.ndarray:
+    """Linearly interpolate zero (unvoiced) frames between voiced neighbors;
+    an edge run is filled with its nearest voiced value (np.interp's default
+    edge behaviour). An all-unvoiced contour is returned unchanged — there is
+    nothing to interpolate from, and the accompanying voicing mask already
+    marks every frame invalid, so the caller cannot mistake this for a real
+    (silent) pitch of 0 Hz."""
+    voiced = f0_hz > 0
+    if not voiced.any():
+        return f0_hz.copy()
+    idx = np.arange(len(f0_hz))
+    interpolated = f0_hz.copy()
+    interpolated[~voiced] = np.interp(idx[~voiced], idx[voiced], f0_hz[voiced])
+    return interpolated
+
+
+def _hz_to_semitones(f0_hz: np.ndarray, reference_hz: float = 100.0) -> np.ndarray:
+    """Semitones relative to 100 Hz — puts F0 on a scale where equal steps
+    are equal perceptual pitch changes regardless of a speaker's register,
+    which raw Hz is not (the whole point of a branch meant to be less
+    speaker-identity-coupled than it would be in linear Hz)."""
+    safe = np.clip(f0_hz, 1e-3, None)
+    return 12.0 * np.log2(safe / reference_hz)
+
+
+def extract_suprasegmental_sequence(waveform: np.ndarray, sr: int, valid_length: int,
+                                    total_frames: int) -> Dict[str, np.ndarray]:
+    """
+    Frame-level F0 (semitones re 100 Hz, unvoiced-interpolated), a binary
+    voicing mask (1 = real pitch estimate, 0 = interpolated/unvoiced), and
+    intensity (dB), sampled every FRAME_HOP_SECONDS over the real-audio
+    prefix `waveform[:valid_length]`, then zero-padded to `total_frames`.
+
+    Args:
+        waveform: 1-D numpy array, the TEMPORAL-PRESERVING profile's waveform
+            (see src.preprocessing.load_and_preprocess_supra) — a wider VAD
+            margin than the speech-focused profile MFCC/wav2vec2 use.
+        valid_length: real-audio sample count before this profile's own
+            zero-padding (load_and_preprocess_supra's second return value).
+        total_frames: the fixed frame-grid length to pad/truncate to —
+            callers pass src.preprocessing.mfcc_frame_count(config.MAX_SAMPLES)
+            so this branch shares exactly the same time axis as the
+            segmental branch's MFCC input.
+    Returns:
+        Dict of three (total_frames,) float32 arrays: "f0_semitones",
+        "voicing", "intensity_db".
+    """
+    from src.preprocessing import mfcc_frame_count
+
+    f0 = np.zeros(total_frames, dtype=np.float32)
+    voicing = np.zeros(total_frames, dtype=np.float32)
+    intensity = np.zeros(total_frames, dtype=np.float32)
+
+    valid_frames = min(mfcc_frame_count(valid_length), total_frames) if valid_length > 0 else 0
+    if valid_frames <= 1:
+        return {"f0_semitones": f0, "voicing": voicing, "intensity_db": intensity}
+
+    try:
+        segment = np.asarray(waveform[:valid_length], dtype=np.float64)
+        sound = parselmouth.Sound(segment, sampling_frequency=sr)
+        pitch = sound.to_pitch(time_step=FRAME_HOP_SECONDS,
+                               pitch_floor=PITCH_FLOOR, pitch_ceiling=PITCH_CEILING)
+        intensity_obj = sound.to_intensity(minimum_pitch=PITCH_FLOOR,
+                                           time_step=FRAME_HOP_SECONDS)
+
+        raw_f0 = pitch.selected_array["frequency"]
+        raw_voiced = (raw_f0 > 0).astype(np.float32)
+        raw_semitones = _hz_to_semitones(_interpolate_unvoiced(raw_f0))
+
+        times = pitch.ts()
+        raw_intensity = np.zeros(len(times), dtype=np.float32)
+        for i, t in enumerate(times):
+            try:
+                value = call(intensity_obj, "Get value at time", t, "Linear")
+                raw_intensity[i] = value if value is not None and not np.isnan(value) else 0.0
+            except Exception:
+                pass
+
+        n = min(valid_frames, len(raw_semitones), len(raw_intensity))
+        f0[:n] = raw_semitones[:n]
+        voicing[:n] = raw_voiced[:n]
+        intensity[:n] = raw_intensity[:n]
+    except Exception:
+        pass
+
+    return {"f0_semitones": f0, "voicing": voicing, "intensity_db": intensity}
+
+
+def extract_segmental_extra_sequence(waveform: np.ndarray, sr: int, valid_length: int,
+                                     total_frames: int) -> Dict[str, np.ndarray]:
+    """
+    Framewise formants F1-F3 (Hz) and framewise HNR (dB), sampled every
+    FRAME_HOP_SECONDS over the real-audio prefix, then zero-padded to
+    `total_frames` — the segmental branch's resonance/articulation and
+    voice-quality channels, concatenated onto MFCC+delta+delta-delta (see
+    src.models.segmental_pathway.SegmentalPathway). Unlike
+    extract_suprasegmental_sequence, this runs on the SPEECH-FOCUSED (VAD-
+    trimmed, 30ms-pad) profile — the same audio the MFCC channels already
+    consume, so every segmental channel shares one preprocessing profile.
+
+    Runtime note: this queries Formant/Harmonicity per-frame in a Python
+    loop (~total_frames x 4 Praat calls per utterance), computed once per
+    file and cached (see src.dataset's *_cached wrappers), not per epoch —
+    a real but one-time preprocessing cost, not a training-time one.
+    """
+    from src.preprocessing import mfcc_frame_count
+
+    f1 = np.zeros(total_frames, dtype=np.float32)
+    f2 = np.zeros(total_frames, dtype=np.float32)
+    f3 = np.zeros(total_frames, dtype=np.float32)
+    hnr = np.zeros(total_frames, dtype=np.float32)
+
+    valid_frames = min(mfcc_frame_count(valid_length), total_frames) if valid_length > 0 else 0
+    if valid_frames <= 1:
+        return {"f1_hz": f1, "f2_hz": f2, "f3_hz": f3, "hnr_db": hnr}
+
+    try:
+        segment = np.asarray(waveform[:valid_length], dtype=np.float64)
+        sound = parselmouth.Sound(segment, sampling_frequency=sr)
+        formant = sound.to_formant_burg(time_step=FRAME_HOP_SECONDS, max_number_of_formants=5,
+                                        maximum_formant=5500, window_length=0.025,
+                                        pre_emphasis_from=50)
+        harmonicity = call(sound, "To Harmonicity (cc)", FRAME_HOP_SECONDS, PITCH_FLOOR, 0.1, 1.0)
+
+        arrays = {1: f1, 2: f2, 3: f3}
+        for i in range(valid_frames):
+            t = i * FRAME_HOP_SECONDS
+            for formant_idx, arr in arrays.items():
+                try:
+                    value = call(formant, "Get value at time", formant_idx, t, "Hertz", "Linear")
+                    arr[i] = value if value is not None and not np.isnan(value) else 0.0
+                except Exception:
+                    pass
+            try:
+                h = call(harmonicity, "Get value at time", t, "Linear")
+                hnr[i] = h if (h is not None and not np.isnan(h) and h > HNR_SILENCE_FLOOR) else 0.0
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return {"f1_hz": f1, "f2_hz": f2, "f3_hz": f3, "hnr_db": hnr}

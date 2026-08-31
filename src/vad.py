@@ -61,9 +61,16 @@ def load_silero_vad():
     return _MODEL, _UTILS
 
 
-def get_speech_timestamps(waveform_1d: torch.Tensor, sr: int = config.VAD_SAMPLE_RATE
+def get_speech_timestamps(waveform_1d: torch.Tensor, sr: int = config.VAD_SAMPLE_RATE,
+                          speech_pad_ms: Optional[int] = None
                           ) -> List[Dict[str, int]]:
-    """Speech segments (sample indices) for a single-channel 1-D waveform."""
+    """Speech segments (sample indices) for a single-channel 1-D waveform.
+
+    speech_pad_ms overrides config.VAD_SPEECH_PAD_MS for this call only —
+    used by src.preprocessing.load_and_preprocess_supra to apply the wider
+    temporal-preserving margin (config.SUPRA_VAD_SPEECH_PAD_MS) without
+    mutating shared config state (relevant once DataLoader worker processes
+    call this concurrently)."""
     model, utils = load_silero_vad()
     get_ts = utils[0]
     with torch.no_grad():
@@ -72,7 +79,7 @@ def get_speech_timestamps(waveform_1d: torch.Tensor, sr: int = config.VAD_SAMPLE
             threshold=config.VAD_THRESHOLD,
             min_speech_duration_ms=config.VAD_MIN_SPEECH_MS,
             min_silence_duration_ms=config.VAD_MIN_SILENCE_MS,
-            speech_pad_ms=config.VAD_SPEECH_PAD_MS,
+            speech_pad_ms=speech_pad_ms if speech_pad_ms is not None else config.VAD_SPEECH_PAD_MS,
         )
 
 
@@ -90,12 +97,17 @@ def _fallback_stats(waveform: torch.Tensor, sr: int, reason: str) -> Dict:
     }
 
 
-def apply_vad(waveform: torch.Tensor, sr: int = config.VAD_SAMPLE_RATE
+def apply_vad(waveform: torch.Tensor, sr: int = config.VAD_SAMPLE_RATE,
+             speech_pad_ms: Optional[int] = None
              ) -> Tuple[torch.Tensor, Dict]:
     """
     Trim leading/trailing non-speech from a (1, samples) mono waveform,
     preserving internal pauses. Never discards the utterance: any failure
     mode falls back to returning `waveform` unchanged.
+
+    speech_pad_ms: see get_speech_timestamps — None (default) uses
+    config.VAD_SPEECH_PAD_MS (the speech-focused profile's margin); pass
+    config.SUPRA_VAD_SPEECH_PAD_MS for the temporal-preserving profile.
 
     Returns (processed_waveform, stats) — stats always has original_duration_s,
     speech_duration_s, speech_ratio, num_segments, fallback_used (+ reason),
@@ -107,7 +119,7 @@ def apply_vad(waveform: torch.Tensor, sr: int = config.VAD_SAMPLE_RATE
 
     try:
         waveform_1d = waveform.squeeze(0) if waveform.dim() == 2 else waveform
-        segments = get_speech_timestamps(waveform_1d, sr)
+        segments = get_speech_timestamps(waveform_1d, sr, speech_pad_ms=speech_pad_ms)
     except Exception as exc:
         print_status(f"Silero VAD failed ({exc}) — falling back to original waveform",
                      ok=False)

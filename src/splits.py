@@ -150,3 +150,59 @@ def get_severity_split(df: pd.DataFrame,
         ~df["Speaker_ID"].isin(config.DROPPED_FOR_BALANCE)]
     test_mask = df_balanced["Speaker_ID"].isin(held_out)
     return df_balanced[~test_mask], df_balanced[test_mask]
+
+
+# ---------------------------------------------------------------------------
+# Severity task, PRIMARY protocol: full-population Leave-One-Speaker-Out.
+#
+# Mirrors iter_loso_folds exactly, but over the 15 dysarthric speakers rather
+# than all 28 — the architecture plan's Part 2, Component 1/2: the brief
+# explicitly rejects discarding speakers to force a balanced class count
+# (build_severity_folds above), so this is the protocol the one-shot run
+# actually uses. Class imbalance (4 Very Low / 3 Low / 3 Mid / 5 High
+# speakers) is handled at the loss/metric level instead (class-weighted
+# CORAL loss, macro-F1, balanced accuracy, per-class recall) — not by
+# speaker removal.
+# ---------------------------------------------------------------------------
+def get_severity_loso_split(df: pd.DataFrame,
+                            test_speaker_id: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Split into (train, test) with one dysarthric speaker held out —
+    exactly get_loso_split, restricted to config.DYSARTHRIC_IDS."""
+    df_dysarthric = df[df["Speaker_ID"].isin(config.DYSARTHRIC_IDS)]
+    train_df = df_dysarthric[df_dysarthric["Speaker_ID"] != test_speaker_id]
+    test_df = df_dysarthric[df_dysarthric["Speaker_ID"] == test_speaker_id]
+    return train_df, test_df
+
+
+def iter_severity_loso_folds(df: pd.DataFrame
+                             ) -> Iterator[Tuple[str, pd.DataFrame, pd.DataFrame]]:
+    """Yield (held_out_speaker, train_df, test_df) for every one of the 15
+    dysarthric speakers — the primary severity protocol
+    (config.SEVERITY_PRIMARY_PROTOCOL == "full_loso")."""
+    for speaker_id in config.DYSARTHRIC_IDS:
+        train_df, test_df = get_severity_loso_split(df, speaker_id)
+        yield speaker_id, train_df, test_df
+
+
+def summarize_severity_loso_splits(df: pd.DataFrame) -> None:
+    """Print an overview of the primary severity LOSO protocol, parallel to
+    summarize_detection_splits — per-class speaker counts (so the 4/3/3/5
+    imbalance the loss/metrics must handle is visible up front), plus one
+    example fold's train/test sizes."""
+    print_header("Severity Splits (PRIMARY: full-population Leave-One-Speaker-Out)")
+    print_kv("Total LOSO folds", len(config.DYSARTHRIC_IDS))
+
+    severity_by_speaker = {s: sev for s, sev in config.SEVERITY_MAP.items()}
+    print_subheader("Speakers per severity class")
+    by_class: dict = {}
+    for speaker, severity in severity_by_speaker.items():
+        by_class.setdefault(severity, []).append(speaker)
+    for severity in ("Very Low", "Low", "Mid", "High"):
+        speakers = sorted(by_class.get(severity, []))
+        print_kv(severity, f"{len(speakers)} speaker(s) — {', '.join(speakers)}")
+
+    example_speaker = config.DYSARTHRIC_IDS[0]
+    train_df, test_df = get_severity_loso_split(df, example_speaker)
+    print_subheader(f"Example fold ({example_speaker} held out)")
+    print_kv("Train samples", len(train_df))
+    print_kv("Test samples", len(test_df))

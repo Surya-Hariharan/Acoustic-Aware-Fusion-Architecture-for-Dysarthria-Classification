@@ -23,6 +23,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 import torchaudio
@@ -41,6 +42,29 @@ def load_and_preprocess(filepath: str) -> Tuple[torch.Tensor, int]:
     speech must NOT be masked out the way padding must."""
     waveform, _ = _load_resampled(filepath)
     waveform, _ = vad_module.apply_vad(waveform, config.TARGET_SR)
+    return _pad_or_truncate(waveform)
+
+
+def load_and_preprocess_supra(filepath: str) -> Tuple[torch.Tensor, int]:
+    """
+    Temporal-preserving profile for the Suprasegmental branch ONLY (see
+    src.models.suprasegmental_pathway). Same Silero VAD trim as
+    load_and_preprocess (contiguous first-to-last speech, internal pauses
+    already preserved by design — src/vad.py), but with a wider
+    config.SUPRA_VAD_SPEECH_PAD_MS padding margin instead of
+    config.VAD_SPEECH_PAD_MS, to protect the onset/offset dynamics a
+    prosodic/temporal encoder needs from the tighter margin the
+    speech-focused profile uses for the Learned/Segmental branches.
+
+    Still pad/truncated to the same MAX_SAMPLES window as load_and_preprocess
+    (so both profiles' outputs collate into fixed-size batches identically),
+    with the real-audio length returned exactly as load_and_preprocess does,
+    for the same masking discipline (see mfcc_valid_frame_mask and
+    src.praat.extract_suprasegmental_sequence, which reads this value).
+    """
+    waveform, _ = _load_resampled(filepath)
+    waveform, _ = vad_module.apply_vad(waveform, config.TARGET_SR,
+                                       speech_pad_ms=config.SUPRA_VAD_SPEECH_PAD_MS)
     return _pad_or_truncate(waveform)
 
 
@@ -270,3 +294,67 @@ def extract_mfcc_features_cached(filepath: str) -> torch.Tensor:
     see extract_mfcc_features's docstring."""
     waveform, valid_length = load_and_preprocess_cached(filepath)
     return extract_mfcc_features(waveform, _shared_mfcc_transform(), valid_length=valid_length)
+
+
+@lru_cache(maxsize=config.PREPROCESS_CACHE_SIZE)
+def load_and_preprocess_supra_cached(filepath: str) -> Tuple[torch.Tensor, int]:
+    """Same contract as load_and_preprocess_supra, memoized per (process, filepath)."""
+    return load_and_preprocess_supra(filepath)
+
+
+@lru_cache(maxsize=config.PREPROCESS_CACHE_SIZE)
+def extract_segmental_extra_features_cached(filepath: str) -> torch.Tensor:
+    """
+    Framewise formants F1-F3 + HNR (src.praat.extract_segmental_extra_sequence),
+    on the SPEECH-FOCUSED profile (same audio MFCC uses), memoized per
+    (process, filepath) exactly like extract_mfcc_features_cached — this is
+    the expensive per-frame Praat query pass (see that function's runtime
+    note), so caching it is what keeps repeated epochs/folds affordable.
+
+    Returns a (4, total_frames) float32 tensor: f1_hz, f2_hz, f3_hz, hnr_db,
+    aligned frame-for-frame with extract_mfcc_features_cached's output.
+    """
+    from src.praat import extract_segmental_extra_sequence
+
+    waveform, valid_length = load_and_preprocess_cached(filepath)
+    total_frames = mfcc_frame_count(waveform.shape[-1])
+    sequences = extract_segmental_extra_sequence(
+        waveform.squeeze(0).numpy(), config.TARGET_SR, valid_length, total_frames)
+    return torch.from_numpy(
+        np.stack([sequences["f1_hz"], sequences["f2_hz"],
+                 sequences["f3_hz"], sequences["hnr_db"]], axis=0))
+
+
+@lru_cache(maxsize=config.PREPROCESS_CACHE_SIZE)
+def extract_segmental_features_cached(filepath: str) -> torch.Tensor:
+    """MFCC+delta+delta-delta (39 channels) concatenated with framewise
+    formant+HNR (4 channels) along the channel axis -> (43, frames), the
+    Segmental branch's full input (config.SEGMENTAL_CHANNELS — see
+    src.models.segmental_pathway.SegmentalPathway)."""
+    mfcc = extract_mfcc_features_cached(filepath).squeeze(0)         # (39, T)
+    extra = extract_segmental_extra_features_cached(filepath)        # (4, T)
+    return torch.cat([mfcc, extra], dim=0)                           # (43, T)
+
+
+@lru_cache(maxsize=config.PREPROCESS_CACHE_SIZE)
+def extract_suprasegmental_features_cached(filepath: str) -> torch.Tensor:
+    """
+    Framewise F0 (semitones) + voicing mask + intensity
+    (src.praat.extract_suprasegmental_sequence), on the TEMPORAL-PRESERVING
+    profile, memoized per (process, filepath).
+
+    Returns a (3, total_frames) float32 tensor: f0_semitones, voicing,
+    intensity_db, on the SAME frame grid as the segmental/MFCC branches
+    (both use mfcc_frame_count(MAX_SAMPLES) frames) even though the two
+    profiles' VAD spans differ — only the padding boundary (valid_length)
+    differs between them, not the fixed total_frames axis length.
+    """
+    from src.praat import extract_suprasegmental_sequence
+
+    waveform, valid_length = load_and_preprocess_supra_cached(filepath)
+    total_frames = mfcc_frame_count(waveform.shape[-1])
+    sequences = extract_suprasegmental_sequence(
+        waveform.squeeze(0).numpy(), config.TARGET_SR, valid_length, total_frames)
+    return torch.from_numpy(
+        np.stack([sequences["f0_semitones"], sequences["voicing"],
+                 sequences["intensity_db"]], axis=0))

@@ -92,12 +92,29 @@ def compute_class_weights(train_df: pd.DataFrame, task: str) -> torch.Tensor:
 # variant either is the MFCC CNN or fuses with it, so it needs the tensor.
 MODELS_WITHOUT_MFCC = frozenset({"deep_frozen", "deep_lora"})
 
+# The one-shot three-branch severity model — the only one whose Dataset
+# needs the segmental/suprasegmental tensors and a per-fold speaker label
+# map (see src.dataset.UASpeechDataset's include_three_branch/
+# speaker_label_map and src.models.gated_fusion.GatedFusionModel).
+MODELS_WITH_THREE_BRANCH = frozenset({"gated_fusion_three_branch"})
+
+
+def build_speaker_label_map(train_df: pd.DataFrame) -> Dict[str, int]:
+    """Contiguous 0..N-1 integer id per TRAINING speaker in this fold, for
+    the adversarial speaker head (src.models.gated_fusion.SpeakerHead).
+    Built fresh per fold (the training-speaker set changes every LOSO
+    fold) — sorted for determinism, not because the ordering itself
+    matters to the (discarded-at-inference) speaker head."""
+    speakers = sorted(train_df["Speaker_ID"].unique().tolist())
+    return {speaker: i for i, speaker in enumerate(speakers)}
+
 
 def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame,
                   batch_size: int, num_workers: int, pin_memory: bool,
                   praat_table: Optional[pd.DataFrame] = None,
                   frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None,
-                  model_name: Optional[str] = None
+                  model_name: Optional[str] = None,
+                  speaker_label_map: Optional[Dict[str, int]] = None
                   ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Wrap the three fold DataFrames into DataLoaders.
@@ -115,6 +132,14 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     backbone never updates), so it is computed once for the whole dataset via
     src.training.baseline.extract_frozen_embeddings_masked and handed to every
     fold's Dataset here rather than recomputed on every forward pass.
+
+    speaker_label_map (Speaker_ID -> contiguous int, see
+    build_speaker_label_map) is given only for MODELS_WITH_THREE_BRANCH, and
+    applied ONLY to the train/val Datasets — val speakers are always a
+    subset of this fold's training speakers (stratified_train_val_split
+    carves val out of the train portion), but the held-out TEST speaker is
+    never a key in this map by construction (that is the whole point of a
+    LOSO fold), so the test Dataset must never look it up.
     """
     praat_stats = None
     if praat_table is not None:
@@ -124,11 +149,14 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     # that needs it and doesn't get it fails loudly, whereas one that skips it
     # unnecessarily only costs time.
     include_mfcc = model_name not in MODELS_WITHOUT_MFCC
+    include_three_branch = model_name in MODELS_WITH_THREE_BRANCH
 
-    def dataset(df: pd.DataFrame) -> UASpeechDataset:
-        return UASpeechDataset(df, praat_table=praat_table, praat_stats=praat_stats,
-                               frozen_embedding_table=frozen_embedding_table,
-                               include_mfcc=include_mfcc)
+    def dataset(df: pd.DataFrame, with_speaker_labels: bool = False) -> UASpeechDataset:
+        return UASpeechDataset(
+            df, praat_table=praat_table, praat_stats=praat_stats,
+            frozen_embedding_table=frozen_embedding_table, include_mfcc=include_mfcc,
+            include_three_branch=include_three_branch,
+            speaker_label_map=(speaker_label_map if with_speaker_labels else None))
 
     # __getitem__ does real CPU work per utterance (torchaudio.load, resample,
     # VAD trim, MFCC + deltas) - with num_workers=0 that runs synchronously in
@@ -142,10 +170,10 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
         loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
 
     train_loader = DataLoader(
-        dataset(train_df), batch_size=batch_size, shuffle=True,
+        dataset(train_df, with_speaker_labels=True), batch_size=batch_size, shuffle=True,
         drop_last=len(train_df) > batch_size, **loader_kwargs)
     val_loader = DataLoader(
-        dataset(val_df), batch_size=batch_size, shuffle=False, **loader_kwargs)
+        dataset(val_df, with_speaker_labels=True), batch_size=batch_size, shuffle=False, **loader_kwargs)
     test_loader = DataLoader(
-        dataset(test_df), batch_size=batch_size, shuffle=False, **loader_kwargs)
+        dataset(test_df, with_speaker_labels=False), batch_size=batch_size, shuffle=False, **loader_kwargs)
     return train_loader, val_loader, test_loader

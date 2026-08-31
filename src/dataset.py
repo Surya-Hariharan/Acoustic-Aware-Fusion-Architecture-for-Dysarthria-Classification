@@ -16,7 +16,10 @@ from torch.utils.data import Dataset
 from src import config
 from src.praat import praat_vector
 from src.preprocessing import (extract_mfcc_features_cached,
-                               load_and_preprocess_cached, mfcc_frame_count)
+                               extract_segmental_features_cached,
+                               extract_suprasegmental_features_cached,
+                               load_and_preprocess_cached,
+                               load_and_preprocess_supra_cached, mfcc_frame_count)
 
 
 class UASpeechDataset(Dataset):
@@ -33,8 +36,28 @@ class UASpeechDataset(Dataset):
                  praat_table: Optional[pd.DataFrame] = None,
                  praat_stats: Optional[Tuple] = None,
                  frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None,
-                 include_mfcc: bool = True):
+                 include_mfcc: bool = True,
+                 include_three_branch: bool = False,
+                 speaker_label_map: Optional[Dict[str, int]] = None):
         self.df = dataframe.reset_index(drop=True)
+
+        # Three-branch severity architecture only (src.models.gated_fusion) —
+        # adds "segmental" (43ch, speech-focused profile) and "supra" (3ch,
+        # temporal-preserving profile) tensors, plus "supra_valid_frames".
+        # False for every legacy model (default), which never reads these
+        # keys, matching include_mfcc's "absent key, no cost" convention.
+        self.include_three_branch = include_three_branch
+
+        # Filename-keyed int speaker id for the GRL speaker head (see
+        # src.models.gated_fusion.SpeakerHead) — built per-fold from that
+        # fold's TRAINING speakers only (src.training.data.build_speaker_label_map),
+        # since which speakers are "in the fold" changes every LOSO fold.
+        # None (default, and always for the test split) means no
+        # "speaker_index" key — src.training.engine.run_epoch already treats
+        # a missing key as "this model doesn't need it" for every other
+        # optional field (praat, deep_embedding), so the adversarial loss is
+        # simply skipped wherever this is None (see GatedFusionModel.training_step).
+        self.speaker_label_map = speaker_label_map
 
         # MFCC extraction (STFT + mel filterbank + DCT + two delta passes) runs
         # per utterance on the DataLoader worker and is pure waste for the
@@ -110,5 +133,18 @@ class UASpeechDataset(Dataset):
         if self.frozen_embedding_table is not None:
             item["deep_embedding"] = torch.from_numpy(
                 self.frozen_embedding_table[row["Filepath"]]).float()
+
+        if self.include_three_branch:
+            item["segmental"] = extract_segmental_features_cached(row["Filepath"])  # (43, T)
+            item["supra"] = extract_suprasegmental_features_cached(row["Filepath"])  # (3, T)
+
+            _, supra_valid_length = load_and_preprocess_supra_cached(row["Filepath"])
+            supra_valid_frames = min(mfcc_frame_count(supra_valid_length),
+                                     item["supra"].shape[-1])
+            item["supra_valid_frames"] = torch.tensor(supra_valid_frames, dtype=torch.long)
+
+        if self.speaker_label_map is not None:
+            item["speaker_index"] = torch.tensor(
+                self.speaker_label_map[row["Speaker_ID"]], dtype=torch.long)
 
         return item
