@@ -20,8 +20,9 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DATA_DIR     = PROJECT_ROOT / "data"            # root data folder
-ARCHIVE_DIR  = DATA_DIR / "archives"            # place UASpeech .tgz files here
-AUDIO_DIR    = DATA_DIR / "extracted"           # extracted .wav files land here
+ARCHIVE_DIR  = DATA_DIR / "raw"                 # place UASpeech .tgz files here
+AUDIO_DIR    = DATA_DIR / "extracted"           # extracted .wav files land here (audio/original only)
+CORPUS_DOCS_DIR = DATA_DIR / "uaspeech_corpus_docs"  # extracted doc/mlf/license/readme, kept out of AUDIO_DIR
 OUTPUT_DIR   = PROJECT_ROOT / "outputs"         # reports / CSVs
 FIGURE_DIR   = OUTPUT_DIR / "figures"           # saved plots
 ERROR_FIGURE_DIR = FIGURE_DIR / "errors"        # Phase 5: per-utterance error diagnostics
@@ -64,9 +65,14 @@ EXPERIMENTS_DIR      = OUTPUT_DIR / "experiments"
 # a copy-and-format step; this is the gated source of truth.
 RESULTS_DIR          = OUTPUT_DIR / "results"
 
+# Filenames as actually distributed to this project (data/raw/) — the
+# corpus's "audio/original" release, not "audio/normalized" or
+# "audio/noisereduce" (both absent from these archives; see
+# src/extraction.py's module docstring for what that means for this
+# pipeline's preprocessing assumptions).
 ARCHIVE_FILES = [
-    "UASpeech_normalized_C.tgz",                # healthy controls
-    "UASpeech_normalized_FM.tgz",               # dysarthric speakers
+    "UASpeech_original_C.tgz",                  # healthy controls
+    "UASpeech_original_FM.tgz",                 # dysarthric speakers
 ]
 
 # ---------------------------------------------------------------------------
@@ -321,7 +327,7 @@ DEFAULT_SEED           = 42
 
 def ensure_directories() -> None:
     """Create every project directory that the pipeline writes to or reads from."""
-    for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, OUTPUT_DIR, FIGURE_DIR,
+    for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, CORPUS_DOCS_DIR, OUTPUT_DIR, FIGURE_DIR,
                        ERROR_FIGURE_DIR, CHECKPOINT_DIR, LOG_DIR, PREDICTIONS_DIR,
                        METRICS_DIR, CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR,
                        EXPERIMENTS_DIR, RESULTS_DIR,

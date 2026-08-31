@@ -1,7 +1,7 @@
 # Dataset (large audio files stay out of git)
 data/
 !data/.gitkeep
-!data/archives/.gitkeep
+!data/raw/.gitkeep
 !data/extracted/.gitkeep
 
 # Safety net: never commit raw corpus audio/alignment files, wherever they land

@@ -50,7 +50,7 @@ The three bottlenecked embeddings are combined by a **learned gate** (not concat
 
 ## Dataset
 
-UA-Speech: 765 isolated words per speaker across three blocks (B1–B3), captured by an eight-microphone array at 16 kHz. The audio is **not** redistributed here — obtain it from the dataset authors and place the archives in `data/archives/`. Corpus reference material (word-level MLF alignments, the lexicon/word list, the base-paper PDF, the corpus's own license and readme) lives in `data/uaspeech_corpus_docs/`, kept separate from the audio the pipeline actually scans.
+UA-Speech: 765 isolated words per speaker across three blocks (B1–B3), captured by an eight-microphone array at 16 kHz. The audio is **not** redistributed here — obtain it from the dataset authors and place the archives in `data/raw/`. The corpus ships three audio releases (`original`, `normalized`, `noisereduce`); this project's archives contain only `audio/original`, so extraction pulls from that variant — see `src/extraction.py`'s module docstring for what that implies for preprocessing (no corpus-level loudness normalization). Corpus reference material (word-level MLF alignments, the lexicon/word list, the base-paper PDF, the corpus's own license and readme) lives in `data/uaspeech_corpus_docs/`, kept separate from the audio the pipeline actually scans.
 
 Following the base-paper protocol, this project uses **microphone channel M6 only**, across all blocks and all word categories, with no word-type filtering.
 
@@ -129,7 +129,7 @@ notebooks/
     05_detection_error_analysis.ipynb       (was 05_error_analysis.ipynb)
     06_detection_results.ipynb              (was 06_results.ipynb)
 data/
-  archives/                     Place the UA-Speech .tgz archives here
+  raw/                          Place the UA-Speech .tgz archives here
   extracted/                    Extracted .wav files land here (one folder per speaker)
   uaspeech_corpus_docs/         Corpus reference material: mlf/, doc/ (lexicon, wordlist,
                                  base-paper PDF), readme_UASpeech.txt, UASPEECH_LICENSE.txt
@@ -221,7 +221,7 @@ tests/                          pytest suite: architecture shapes, CORAL/complem
 pip install -r requirements.txt
 ```
 
-Copy `UASpeech_normalized_C.tgz` and `UASpeech_normalized_FM.tgz` into `data/archives/`, then run the notebooks in order.
+Copy `UASpeech_original_C.tgz` and `UASpeech_original_FM.tgz` into `data/raw/`, then run the notebooks in order.
 
 ```bash
 # 1. Data pipeline + three-branch architecture data audit
