@@ -30,7 +30,7 @@ before scoring. A pooled set covering both classes has all metrics defined.
 from typing import Dict
 
 import numpy as np
-from sklearn.metrics import (accuracy_score, confusion_matrix,
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score, confusion_matrix,
                              precision_recall_fscore_support, roc_auc_score)
 
 from src import config
@@ -62,6 +62,25 @@ def _macro_specificity(cm: np.ndarray) -> float:
     return float(np.nanmean(specificities))
 
 
+def ordinal_mae(y_true: np.ndarray, y_pred: np.ndarray, task: str) -> float:
+    """
+    Mean absolute rank error: mean(|y_true - y_pred|), treating class index
+    as ordinal rank. Meaningful only for severity (config.SEVERITY_LABEL_MAP
+    is 0=Very Low .. 3=High, already rank-encoded in label order) — NaN for
+    detection, where class indices carry no ordering.
+
+    This is generic to ANY severity model's predictions (not CORAL-specific):
+    src.models.gated_fusion.GatedFusionModel's y_pred is
+    argmax(coral_class_probs(...)), a valid ordinal point-estimate (the
+    "mode" decoding), so no separate rank-decoding path is needed here — see
+    src.losses.coral_class_probs's docstring for why this y_pred already IS
+    an ordinal-aware prediction, not a plain nominal argmax.
+    """
+    if task != "severity" or len(y_true) == 0:
+        return float("nan")
+    return float(np.mean(np.abs(y_true.astype(np.int64) - y_pred.astype(np.int64))))
+
+
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
                     task: str) -> Dict[str, float]:
     """
@@ -72,7 +91,8 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
                 (N, num_classes) softmax probabilities for severity.
         task: "detection" or "severity".
     Returns:
-        Dict of scalar metrics: accuracy, precision, recall, specificity, f1,
+        Dict of scalar metrics: accuracy, balanced_accuracy, precision,
+        recall, specificity, f1 (macro/binary), f1_weighted, ordinal_mae,
         auroc — each NaN where undefined on these labels (see the module
         docstring) — plus n_classes_present and n_samples, so a caller can
         distinguish "not measurable on this fold" from "measured as zero"
@@ -94,10 +114,14 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
     # they would be undefined — see the module docstring on why 0.0 is the
     # wrong answer here.
     if n_classes_present < 2:
-        precision = recall = f1 = specificity = auroc = float("nan")
+        precision = recall = f1 = f1_weighted = specificity = auroc = float("nan")
+        balanced_accuracy = float("nan")
     else:
         precision, recall, f1, _ = precision_recall_fscore_support(
             y_true, y_pred, labels=labels, average=average, zero_division=0)
+        _, _, f1_weighted, _ = precision_recall_fscore_support(
+            y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+        balanced_accuracy = float(balanced_accuracy_score(y_true, y_pred))
         specificity = (_binary_specificity(cm) if task == "detection"
                        else _macro_specificity(cm))
         try:
@@ -113,10 +137,13 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
 
     return {
         "accuracy": float(accuracy),
+        "balanced_accuracy": balanced_accuracy,
         "precision": float(precision),
         "recall": float(recall),          # sensitivity
         "specificity": float(specificity),
-        "f1": float(f1),
+        "f1": float(f1),                  # macro (severity) / binary (detection)
+        "f1_weighted": float(f1_weighted),
+        "ordinal_mae": ordinal_mae(y_true, y_pred, task),
         "auroc": float(auroc),
         "n_classes_present": n_classes_present,
         "n_samples": int(len(y_true)),
