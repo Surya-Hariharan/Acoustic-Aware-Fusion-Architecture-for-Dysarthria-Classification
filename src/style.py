@@ -30,7 +30,24 @@ MODEL_COLORS = {
     "attention_fusion": "#8172b3",         # Model E — cross-attention
     "attention_fusion_praat": "#937860",   # Model F — cross-attention + Praat
     "baseline_svm": "#8c8c8c",             # Phase 2 base-paper reproduction
+    "gated_fusion_three_branch": "#2e6f6f",  # the one-shot three-branch severity model
 }
+
+# One color per BRANCH of the three-branch architecture — deliberately a
+# separate dict from MODEL_COLORS (not merged in) so color_for_run's
+# substring-match resolver below can't accidentally match a short branch
+# name ("learned", "supra") against an unrelated run name.
+BRANCH_COLORS = {
+    "learned": "#4c72b0",
+    "segmental": "#dd8452",
+    "supra": "#55a868",
+}
+
+
+def branch_color(branch_name: str) -> str:
+    """BRANCH_COLORS[branch_name], or a neutral fallback."""
+    return BRANCH_COLORS.get(branch_name, "#4c72b0")
+
 
 CORRECT_COLOR = "#55a868"
 ERROR_COLOR = "#c44e52"

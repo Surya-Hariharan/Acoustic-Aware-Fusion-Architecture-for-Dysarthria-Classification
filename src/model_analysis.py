@@ -18,26 +18,31 @@ plots and saves them to outputs/figures/.
 """
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import torch
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 from src import config
-from src.console import print_kv
-from src.praat import FEATURE_COLUMNS
-from src.style import apply_style, model_color
+from src.console import print_kv, progress
+from src.praat import FEATURE_COLUMNS, FEATURE_GROUPS
+from src.style import apply_style, branch_color, model_color
 
 apply_style()
 
 
-def _finish(fig, filename: str, show: bool) -> str:
-    """Save a figure to outputs/figures/, optionally display it, then release it."""
-    out_path = config.FIGURE_DIR / filename
+def _finish(fig, filename: str, show: bool, subdir: Optional[Path] = None) -> str:
+    """Save a figure to outputs/figures/ (or a named subdirectory —
+    config.{REPRESENTATION,EXPLAINABILITY,ABLATION,METRIC}_FIGURE_DIR),
+    optionally display it, then release it."""
+    out_dir = subdir or config.FIGURE_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / filename
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     if show:
         plt.show()
@@ -76,15 +81,37 @@ def plot_ablation_comparison(comparison_df: pd.DataFrame,
     ax.tick_params(axis="x", rotation=30)
     ax.legend(title="", loc="lower right", fontsize=9)
     fig.tight_layout()
-    return _finish(fig, "ablation_comparison.png", show)
+    return _finish(fig, "ablation_comparison.png", show, subdir=config.ABLATION_FIGURE_DIR)
 
 
 # ---------------------------------------------------------------------------
 # Embedding-space visualization (t-SNE / PCA / UMAP)
 # ---------------------------------------------------------------------------
-def load_run_embeddings(run_name: str) -> pd.DataFrame:
-    """Every test-fold embedding for a run, as a DataFrame with a `filename` key
-    and an `embedding` column of vectors."""
+BRANCH_EMBEDDING_KEYS = {
+    "fused": "embeddings",
+    "learned": "branch_learned",
+    "segmental": "branch_segmental",
+    "supra": "branch_supra",
+}
+
+
+def load_run_embeddings(run_name: str, embedding_type: str = "fused") -> pd.DataFrame:
+    """
+    Every test-fold embedding for a run, as a DataFrame with `filename`,
+    `y_true`, `speaker_ids`, and an `embedding` column of vectors.
+
+    embedding_type selects WHICH saved array to load — "fused" (Z_unified,
+    every model), or "learned"/"segmental"/"supra" (GatedFusionModel only —
+    see src.training.engine.EpochResult.branch_embeddings /
+    src.training.reporting.save_embeddings). Raises a clear error if a
+    branch-specific type is requested for a run that never saved one
+    (e.g. a legacy ablation-ladder run).
+    """
+    if embedding_type not in BRANCH_EMBEDDING_KEYS:
+        raise ValueError(f"Unknown embedding_type '{embedding_type}'. "
+                         f"Choose from {list(BRANCH_EMBEDDING_KEYS)}.")
+    array_key = BRANCH_EMBEDDING_KEYS[embedding_type]
+
     run_dir = config.EMBEDDINGS_DIR / run_name
     if not run_dir.exists():
         raise FileNotFoundError(f"No embeddings for run '{run_name}' at {run_dir}.")
@@ -97,31 +124,47 @@ def load_run_embeddings(run_name: str) -> pd.DataFrame:
                 f"{path} has no 'filenames' array — it was written before "
                 f"utterance identity was carried through. Re-run '{run_name}'."
             )
+        if array_key not in data:
+            raise ValueError(
+                f"{path} has no '{array_key}' array — embedding_type="
+                f"'{embedding_type}' requires a run trained with the "
+                "three-branch architecture (src.models.gated_fusion.GatedFusionModel)."
+            )
         frames.append(pd.DataFrame({
             "filename": data["filenames"],
             "y_true": data["y_true"],
-            "embedding": list(data["embeddings"]),
+            "speaker_id": data["speaker_ids"] if "speaker_ids" in data else None,
+            "embedding": list(data[array_key]),
         }))
     return pd.concat(frames, ignore_index=True)
 
 
 def plot_embedding_map(run_name: str, preds: pd.DataFrame, task: str = "detection",
-                       method: str = "tsne", max_points: int = 3000, seed: int = 42,
+                       method: str = "tsne", embedding_type: str = "fused",
+                       color_by: str = "severity", max_points: int = 3000, seed: int = 42,
                        show: bool = False) -> str:
     """
-    2D projection of the learned test-fold embeddings, coloured by true class,
-    with misclassified points marked.
+    2D projection of a test-fold embedding set.
 
-    method="tsne" (default): local structure, the same view Phase 5's error
-    analysis uses to ask whether errors cluster.
-    method="pca": linear, deterministic — a sanity check the nonlinear
-    methods' layout can be compared against.
-    method="umap": nonlinear like t-SNE but tends to preserve more global
-    structure between clusters; needs the optional `umap-learn` package.
+    method="tsne" (default): local structure. "pca": linear, deterministic —
+    a sanity check the nonlinear methods' layout can be compared against.
+    "umap": nonlinear like t-SNE but tends to preserve more global structure
+    between clusters; needs the optional `umap-learn` package.
+
+    embedding_type: "fused" (Z_unified, works for any run) or
+    "learned"/"segmental"/"supra" (GatedFusionModel branch embeddings —
+    see load_run_embeddings).
+
+    color_by: "severity" (or "detection" — the true class label,
+    misclassified points marked with an X) or "speaker" (colors by
+    Speaker_ID instead, with NO misclassification marker — the diagnostic
+    this view is for is whether points cluster by SPEAKER rather than by
+    class; visual separation here is a representation diagnostic, not proof
+    of speaker leakage or its absence).
     """
-    embeddings = load_run_embeddings(run_name)
-    merged = embeddings.merge(preds[["filename", "correct", "y_true_label"]],
-                              on="filename", how="inner")
+    embeddings = load_run_embeddings(run_name, embedding_type=embedding_type)
+    merge_cols = ["filename", "correct", "y_true_label"]
+    merged = embeddings.merge(preds[merge_cols], on="filename", how="inner")
     if merged.empty:
         raise ValueError(f"No embedding rows for '{run_name}' matched its predictions.")
 
@@ -143,22 +186,33 @@ def plot_embedding_map(run_name: str, preds: pd.DataFrame, task: str = "detectio
 
     merged["x"], merged["y"] = coords[:, 0], coords[:, 1]
 
-    correct = merged[merged["correct"].astype(bool)]
-    wrong = merged[~merged["correct"].astype(bool)]
-
     fig, ax = plt.subplots(figsize=(9, 8))
-    sns.scatterplot(data=correct, x="x", y="y", hue="y_true_label", palette="viridis",
-                    s=14, alpha=0.45, linewidth=0, ax=ax)
-    ax.scatter(wrong["x"], wrong["y"], marker="x", s=42, c="#c44e52",
-               linewidths=1.2, label=f"misclassified (n={len(wrong)})")
+    if color_by == "speaker":
+        if merged["speaker_id"].isna().all():
+            raise ValueError(f"Run '{run_name}' has no saved speaker_id — cannot color by speaker.")
+        sns.scatterplot(data=merged, x="x", y="y", hue="speaker_id", palette="tab20",
+                        s=16, alpha=0.6, linewidth=0, ax=ax, legend=False)
+        ax.set_title(f"{run_name} — {method.upper()} of {embedding_type} embeddings, colored by SPEAKER",
+                    fontsize=13)
+    elif color_by in ("severity", "detection"):
+        correct = merged[merged["correct"].astype(bool)]
+        wrong = merged[~merged["correct"].astype(bool)]
+        sns.scatterplot(data=correct, x="x", y="y", hue="y_true_label", palette="viridis",
+                        s=14, alpha=0.45, linewidth=0, ax=ax)
+        ax.scatter(wrong["x"], wrong["y"], marker="x", s=42, c="#c44e52",
+                  linewidths=1.2, label=f"misclassified (n={len(wrong)})")
+        ax.legend(loc="best", fontsize=9)
+        ax.set_title(f"{run_name} — {method.upper()} of {embedding_type} embeddings ({task})",
+                    fontsize=13)
+    else:
+        raise ValueError(f"Unknown color_by '{color_by}'. Choose from 'severity', 'detection', 'speaker'.")
 
-    ax.set_title(f"{run_name} — {method.upper()} of test embeddings ({task})", fontsize=14)
     ax.set_xlabel(f"{method}-1")
     ax.set_ylabel(f"{method}-2")
-    ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
 
-    return _finish(fig, f"embedding_map_{method}_{run_name}.png", show)
+    return _finish(fig, f"embedding_map_{method}_{embedding_type}_{color_by}_{run_name}.png", show,
+                   subdir=config.REPRESENTATION_FIGURE_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +281,8 @@ def plot_attention_heatmap(run_name: str, task: str = "detection",
     fig.suptitle(f"{run_name}, fold {fold_id} — cross-attention — {item['filename']}",
                 fontsize=13)
     fig.tight_layout()
-    return _finish(fig, f"attention_map_{run_name}_{item['filename']}.png", show)
+    return _finish(fig, f"attention_map_{run_name}_{item['filename']}.png", show,
+                   subdir=config.EXPLAINABILITY_FIGURE_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +423,7 @@ def plot_shap_summary(explanation, feature_columns, title: str = "SHAP Feature I
     ax.set_xlabel("mean |SHAP value|")
     ax.set_title(title, fontsize=14)
     fig.tight_layout()
-    return _finish(fig, filename, show)
+    return _finish(fig, filename, show, subdir=config.EXPLAINABILITY_FIGURE_DIR)
 
 
 def plot_shap_beeswarm(explanation, title: str = "SHAP Summary",
@@ -394,7 +449,7 @@ def plot_shap_beeswarm(explanation, title: str = "SHAP Summary",
     fig.set_size_inches(9, max(4, 0.35 * len(explanation.feature_names)))
     fig.axes[0].set_title(title, fontsize=14)
     fig.tight_layout()
-    return _finish(fig, filename, show)
+    return _finish(fig, filename, show, subdir=config.EXPLAINABILITY_FIGURE_DIR)
 
 
 def plot_shap_waterfall(explanation, index: int = 0,
@@ -418,7 +473,7 @@ def plot_shap_waterfall(explanation, index: int = 0,
     if title:
         fig.suptitle(title, fontsize=13)
     fig.tight_layout()
-    return _finish(fig, filename, show)
+    return _finish(fig, filename, show, subdir=config.EXPLAINABILITY_FIGURE_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -499,4 +554,338 @@ def plot_shap_comparison(comparison: pd.DataFrame,
     ax.set_title(title, fontsize=14)
     ax.legend(title="", loc="lower right", fontsize=9)
     fig.tight_layout()
-    return _finish(fig, "shap_comparison_fusion_models.png", show)
+    return _finish(fig, "shap_comparison_fusion_models.png", show, subdir=config.EXPLAINABILITY_FIGURE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# Branch ablation (three-branch severity architecture only) — inference-time
+# contribution analysis on the ONE trained checkpoint, not a retrained model
+# family. See src.models.gated_fusion.GatedFusionModel.ablate() and the
+# architecture plan's Part 2, Component 15 for why this replaces training
+# separate branch-dropped models: dropping a branch changes what the FROZEN
+# gate/classifier see, which is exactly "how much does this model rely on
+# this branch", without spending any of the one-shot training budget.
+# ---------------------------------------------------------------------------
+# Plain ASCII hyphens (not a Unicode minus sign) deliberately — these labels
+# are printed to Windows consoles/notebooks whose default codepage (cp1252)
+# cannot encode U+2212 and raises UnicodeEncodeError on print().
+BRANCH_ABLATION_VARIANTS = {"Full": None, "- Learned": "learned",
+                            "- Segmental": "segmental", "- Suprasegmental": "supra"}
+
+
+def evaluate_branch_ablation(model, loader, device, task: str = "severity") -> pd.DataFrame:
+    """
+    Runs GatedFusionModel.ablate() over one fold's test loader for each of
+    {full, -learned, -segmental, -suprasegmental} and reports the resulting
+    metrics plus the drop relative to the full model. Call this ONLY.
+    """
+    from src.training.metrics import compute_metrics
+
+    model.eval()
+    records = []
+    with torch.no_grad():
+        for label, drop_branch in progress(BRANCH_ABLATION_VARIANTS.items(),
+                                           "Branch ablation", total=len(BRANCH_ABLATION_VARIANTS)):
+            all_true, all_pred, all_prob = [], [], []
+            for batch in loader:
+                waveform = batch["waveform"].squeeze(1).to(device)
+                mfcc = batch["mfcc"].to(device)
+                supra = batch["supra"].to(device)
+                waveform_length = batch["waveform_length"].to(device)
+                attention_mask = (torch.arange(waveform.shape[1], device=device)[None, :]
+                                  < waveform_length[:, None])
+                supra_valid_frames = batch["supra_valid_frames"].to(device)
+                labels = batch["severity_label"].to(device)
+
+                logits = model.ablate(waveform=waveform, mfcc=mfcc, attention_mask=attention_mask,
+                                      supra=supra, supra_valid_frames=supra_valid_frames,
+                                      drop_branch=drop_branch)
+                probs = torch.softmax(logits.float(), dim=1)
+                all_true.append(labels.cpu().numpy())
+                all_pred.append(probs.argmax(dim=1).cpu().numpy())
+                all_prob.append(probs.cpu().numpy())
+
+            y_true, y_pred, y_prob = np.concatenate(all_true), np.concatenate(all_pred), np.concatenate(all_prob)
+            m = compute_metrics(y_true, y_pred, y_prob, task)
+            records.append({"variant": label, "macro_f1": m["f1"],
+                            "balanced_accuracy": m["balanced_accuracy"],
+                            "ordinal_mae": m["ordinal_mae"], "accuracy": m["accuracy"]})
+
+    df = pd.DataFrame(records).set_index("variant")
+    full = df.loc["Full"]
+    df["macro_f1_drop"] = full["macro_f1"] - df["macro_f1"]
+    df["balanced_accuracy_drop"] = full["balanced_accuracy"] - df["balanced_accuracy"]
+    df["ordinal_mae_increase"] = df["ordinal_mae"] - full["ordinal_mae"]
+    return df
+
+
+def plot_branch_ablation(ablation_df: pd.DataFrame, metric: str = "macro_f1",
+                         title: Optional[str] = None, show: bool = False) -> str:
+    """Grouped bar chart of evaluate_branch_ablation()'s output for one
+    metric — Full vs. each branch removed."""
+    colors = {"Full": "#333333", "- Learned": branch_color("learned"),
+             "- Segmental": branch_color("segmental"),
+             "- Suprasegmental": branch_color("supra")}
+    variants = list(ablation_df.index)
+    values = ablation_df[metric].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.bar(variants, values, color=[colors.get(v, "#4c72b0") for v in variants])
+    ax.set_ylabel(metric.replace("_", " "))
+    ax.set_title(title or f"Branch ablation — {metric.replace('_', ' ')}", fontsize=13)
+    ax.tick_params(axis="x", rotation=15)
+    fig.tight_layout()
+    return _finish(fig, f"branch_ablation_{metric}.png", show, subdir=config.ABLATION_FIGURE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# Gate analysis (three-branch severity architecture only). Gate weights are
+# saved per-utterance alongside branch embeddings (see
+# src.training.reporting.save_embeddings) — this section aggregates and
+# visualizes them. A gate value reflects LEARNED reliance, not causal
+# importance — see the architecture plan's Part 2, Component 9 and the
+# limitations table (src.results.build_limitations_table).
+# ---------------------------------------------------------------------------
+def load_run_gate_weights(run_name: str) -> pd.DataFrame:
+    """Every test-fold's per-utterance gate weights for a run, as a
+    DataFrame with filename/y_true/gate_learned/gate_segmental/gate_supra."""
+    run_dir = config.EMBEDDINGS_DIR / run_name
+    if not run_dir.exists():
+        raise FileNotFoundError(f"No embeddings for run '{run_name}' at {run_dir}.")
+
+    frames = []
+    for path in sorted(run_dir.glob("*.npz")):
+        data = np.load(path, allow_pickle=True)
+        if "gate_weights" not in data:
+            raise ValueError(f"{path} has no 'gate_weights' array — gate analysis requires "
+                             "a run trained with GatedFusionModel.")
+        gates = data["gate_weights"]
+        frames.append(pd.DataFrame({
+            "filename": data["filenames"], "y_true": data["y_true"],
+            "gate_learned": gates[:, 0], "gate_segmental": gates[:, 1], "gate_supra": gates[:, 2],
+        }))
+    return pd.concat(frames, ignore_index=True)
+
+
+GATE_COLUMNS = ["gate_learned", "gate_segmental", "gate_supra"]
+GATE_LABELS = ["Learned", "Segmental", "Suprasegmental"]
+
+
+def summarize_gate_values(gate_df: pd.DataFrame) -> pd.DataFrame:
+    """Mean/median/std gate weight per branch, over every test utterance."""
+    summary = gate_df[GATE_COLUMNS].agg(["mean", "median", "std"]).T
+    summary.index = GATE_LABELS
+    summary.columns = ["mean", "median", "std"]
+    return summary
+
+
+def summarize_gate_values_by_severity(gate_df: pd.DataFrame,
+                                      y_true_label: pd.Series) -> pd.DataFrame:
+    """Mean gate weight per branch, per severity class — investigates
+    whether gate behavior shifts with severity (e.g. the model leaning more
+    on the suprasegmental branch for more severe speakers)."""
+    df = gate_df[GATE_COLUMNS].copy()
+    df["severity"] = y_true_label.to_numpy()
+    grouped = df.groupby("severity")[GATE_COLUMNS].mean()
+    grouped.columns = GATE_LABELS
+    order = [c for c in config.SEVERITY_CLASS_NAMES if c in grouped.index]
+    return grouped.reindex(order)
+
+
+def plot_gate_distribution(gate_df: pd.DataFrame, show: bool = False) -> str:
+    """Bar (mean) + violin (full distribution) of gate weights per branch."""
+    colors = [branch_color(b) for b in ("learned", "segmental", "supra")]
+    means = gate_df[GATE_COLUMNS].mean().to_numpy()
+    long = gate_df[GATE_COLUMNS].melt(var_name="branch", value_name="gate")
+    long["branch"] = long["branch"].map(dict(zip(GATE_COLUMNS, GATE_LABELS)))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].bar(GATE_LABELS, means, color=colors)
+    axes[0].set_ylabel("mean gate weight")
+    axes[0].set_title("Mean gate contribution")
+    sns.violinplot(data=long, x="branch", y="gate", order=GATE_LABELS,
+                   palette=colors, ax=axes[1])
+    axes[1].set_title("Gate weight distribution")
+    axes[1].set_xlabel("")
+    fig.tight_layout()
+    return _finish(fig, "gate_distribution.png", show, subdir=config.ABLATION_FIGURE_DIR)
+
+
+def plot_gate_by_severity(gate_df: pd.DataFrame, y_true_label: pd.Series, show: bool = False) -> str:
+    """Grouped bar chart of mean gate weight per branch, per severity class."""
+    df = gate_df[GATE_COLUMNS].copy()
+    df["severity"] = y_true_label.to_numpy()
+    long = df.melt(id_vars="severity", value_vars=GATE_COLUMNS, var_name="branch", value_name="gate")
+    long["branch"] = long["branch"].map(dict(zip(GATE_COLUMNS, GATE_LABELS)))
+    order = [c for c in config.SEVERITY_CLASS_NAMES if c in df["severity"].unique()]
+    colors = {label: branch_color(key) for key, label in zip(("learned", "segmental", "supra"), GATE_LABELS)}
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sns.barplot(data=long, x="severity", y="gate", hue="branch", order=order,
+               hue_order=GATE_LABELS, palette=colors, ax=ax)
+    ax.set_ylabel("mean gate weight")
+    ax.set_xlabel("")
+    ax.set_title("Gate contribution by severity class", fontsize=13)
+    ax.legend(title="", loc="upper right", fontsize=9)
+    fig.tight_layout()
+    return _finish(fig, "gate_by_severity.png", show, subdir=config.ABLATION_FIGURE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# Cross-branch complementarity diagnostic (numerical + heatmap). Reuses
+# src.losses.redundancy_penalty — the SAME function/normalization the
+# training loss uses — so this is not a second, inconsistent metric.
+# ---------------------------------------------------------------------------
+def plot_complementarity_heatmap(z_learned: np.ndarray, z_segmental: np.ndarray,
+                                 z_supra: np.ndarray, show: bool = False
+                                 ) -> Tuple[str, pd.DataFrame]:
+    """
+    3x3 branch-pair redundancy-penalty matrix (mean squared cross-
+    correlation, config.LAMBDA_COMP's own units — see src.losses.
+    redundancy_penalty), both as a heatmap and a small numeric table. Lower
+    values support the "branches are not duplicating each other" claim;
+    this is descriptive, not a hypothesis test.
+    """
+    from src.losses import redundancy_penalty
+
+    branches = {"Learned": z_learned, "Segmental": z_segmental, "Suprasegmental": z_supra}
+    names = list(branches)
+    matrix = np.full((len(names), len(names)), np.nan)
+    for i, a in enumerate(names):
+        for j, b in enumerate(names):
+            if i == j:
+                continue
+            za = torch.as_tensor(branches[a], dtype=torch.float32)
+            zb = torch.as_tensor(branches[b], dtype=torch.float32)
+            matrix[i, j] = redundancy_penalty(za, zb).item()
+
+    table = pd.DataFrame(matrix, index=names, columns=names)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(table, annot=True, fmt=".4f", cmap="magma", ax=ax,
+               cbar_kws={"label": "mean squared cross-correlation"})
+    ax.set_title("Cross-branch complementarity (redundancy) — lower is more complementary",
+                fontsize=12)
+    fig.tight_layout()
+    path = _finish(fig, "complementarity_heatmap.png", show, subdir=config.ABLATION_FIGURE_DIR)
+    return path, table
+
+
+# ---------------------------------------------------------------------------
+# Feature-group SHAP, per-class SHAP, and permutation importance — extends
+# the existing RandomForest-surrogate SHAP methodology (compute_shap_values
+# above) rather than replacing it. src.praat.FEATURE_GROUPS assigns every
+# FEATURE_COLUMNS entry to exactly one of Spectral/Formant/Voice-Quality/
+# Pitch/Energy/Temporal-Voicing (see the architecture plan's Part 2,
+# Component 15 / brief Section 18).
+# ---------------------------------------------------------------------------
+def shap_summary_table(explanation, feature_columns) -> pd.DataFrame:
+    """{feature, mean_abs_shap} table — the numeric form of plot_shap_summary,
+    reused by both feature-group aggregation and the SHAP/permutation
+    ranking comparison below."""
+    shap_values = _shap_values_array(explanation)
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    return pd.DataFrame({"feature": list(feature_columns), "mean_abs_shap": mean_abs})
+
+
+def aggregate_shap_by_group(explanation, feature_columns) -> pd.DataFrame:
+    """Feature-level SHAP -> feature-GROUP SHAP, by summing mean|SHAP|
+    within each src.praat.FEATURE_GROUPS group. Group-level importance is
+    the more defensible research claim when many individual features are
+    correlated (e.g. jitter_local/jitter_rap/jitter_ppq5/jitter_ddp all
+    measuring the same underlying phenomenon)."""
+    table = shap_summary_table(explanation, feature_columns)
+    table["group"] = table["feature"].map(FEATURE_GROUPS)
+    return (table.groupby("group")["mean_abs_shap"].sum()
+           .sort_values(ascending=False).reset_index())
+
+
+def plot_shap_group_importance(group_df: pd.DataFrame,
+                               title: str = "SHAP Feature-Group Importance",
+                               show: bool = False) -> str:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.barh(group_df["group"][::-1], group_df["mean_abs_shap"][::-1], color="#4c72b0")
+    ax.set_xlabel("summed mean |SHAP value| within group")
+    ax.set_title(title, fontsize=13)
+    fig.tight_layout()
+    return _finish(fig, "shap_group_importance.png", show, subdir=config.EXPLAINABILITY_FIGURE_DIR)
+
+
+def plot_shap_per_class(explanations: List, feature_columns, class_names,
+                        top_k: int = 12, show: bool = False) -> str:
+    """Per-class SHAP bar charts, one panel per severity class — the
+    per-class Explanation list compute_shap_values() already returns for
+    task='severity' but this project's plotting never visualized before."""
+    n = len(class_names)
+    fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 6), sharey=False)
+    if n == 1:
+        axes = [axes]
+    for ax, explanation, name in zip(axes, explanations, class_names):
+        table = shap_summary_table(explanation, feature_columns).sort_values(
+            "mean_abs_shap", ascending=False).head(top_k)
+        ax.barh(table["feature"][::-1], table["mean_abs_shap"][::-1], color="#4c72b0")
+        ax.set_title(name, fontsize=12)
+        ax.set_xlabel("mean |SHAP|")
+    fig.suptitle("Per-class SHAP feature importance", fontsize=14)
+    fig.tight_layout()
+    return _finish(fig, "shap_per_class.png", show, subdir=config.EXPLAINABILITY_FIGURE_DIR)
+
+
+def compute_permutation_importance(surrogate, X: np.ndarray, y: np.ndarray, feature_columns,
+                                   seed: int = 42, n_repeats: int = 20) -> pd.DataFrame:
+    """
+    Permutation importance on the SAME RandomForest surrogate SHAP already
+    fits (compute_shap_values) — an independent cross-check against the
+    SHAP ranking, not a replacement for it (architecture plan Part 2,
+    Component 15 / brief Section 30). scoring is macro-F1 for >2 classes
+    (severity) or accuracy for binary (detection), matching each task's
+    primary reported metric.
+    """
+    from sklearn.inspection import permutation_importance
+
+    scoring = "f1_macro" if len(np.unique(y)) > 2 else "accuracy"
+    result = permutation_importance(surrogate, X, y, n_repeats=n_repeats,
+                                    random_state=seed, scoring=scoring)
+    return pd.DataFrame({
+        "feature": list(feature_columns),
+        "importance_mean": result.importances_mean,
+        "importance_std": result.importances_std,
+    }).sort_values("importance_mean", ascending=False).reset_index(drop=True)
+
+
+def aggregate_permutation_importance_by_group(perm_df: pd.DataFrame) -> pd.DataFrame:
+    df = perm_df.copy()
+    df["group"] = df["feature"].map(FEATURE_GROUPS)
+    return (df.groupby("group")["importance_mean"].sum()
+           .sort_values(ascending=False).reset_index())
+
+
+def plot_permutation_importance(perm_df: pd.DataFrame, top_k: int = 15,
+                                title: str = "Permutation Importance", show: bool = False) -> str:
+    top = perm_df.head(top_k)
+    fig, ax = plt.subplots(figsize=(8, max(4, 0.35 * len(top))))
+    ax.barh(top["feature"][::-1], top["importance_mean"][::-1],
+           xerr=top["importance_std"][::-1], color="#dd8452")
+    ax.set_xlabel("mean decrease in score when the feature is permuted")
+    ax.set_title(title, fontsize=13)
+    fig.tight_layout()
+    return _finish(fig, "permutation_importance.png", show, subdir=config.EXPLAINABILITY_FIGURE_DIR)
+
+
+def compare_shap_and_permutation_rankings(shap_table: pd.DataFrame, perm_df: pd.DataFrame,
+                                          top_k: int = 10) -> Tuple[pd.DataFrame, float, float]:
+    """
+    Rank-correlation comparison between the SHAP and permutation-importance
+    feature rankings. Returns (top-k side-by-side rank table, Spearman rho,
+    p-value). Agreement between the two methods is NOT guaranteed and is
+    not claimed here — report whatever the numbers show (architecture plan
+    Part 2, Component 15 / brief Section 30).
+    """
+    from scipy.stats import spearmanr
+
+    shap_rank = shap_table.set_index("feature")["mean_abs_shap"].rank(ascending=False)
+    perm_rank = perm_df.set_index("feature")["importance_mean"].rank(ascending=False)
+    combined = pd.DataFrame({"shap_rank": shap_rank, "permutation_rank": perm_rank}).dropna()
+    corr, p_value = spearmanr(combined["shap_rank"], combined["permutation_rank"])
+    top = combined.sort_values("shap_rank").head(top_k)
+    return top, float(corr), float(p_value)
