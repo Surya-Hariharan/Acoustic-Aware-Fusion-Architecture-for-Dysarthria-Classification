@@ -23,3 +23,9 @@ tqdm==4.67.3
 python-dotenv==1.1.1
 umap-learn==0.5.7
 shap==0.48.0
+joblib==1.5.3          # sklearn model persistence (src/training/checkpoint.py) —
+                        # a transitive scikit-learn dependency, but imported directly
+                        # here, so pinned explicitly rather than left implicit.
+
+# Testing
+pytest==9.1.1           # tests/ (pytest tests/) — not needed to run the pipeline itself
