@@ -28,6 +28,19 @@ ERROR_FIGURE_DIR = FIGURE_DIR / "errors"        # Phase 5: per-utterance error d
 MANIFEST_PATH = OUTPUT_DIR / "m6_manifest.csv"  # scanned+filtered+labeled M6 utterances
 PRAAT_FEATURES_PATH = OUTPUT_DIR / "praat_features.csv"  # Phase 4: per-utterance acoustic features
 
+# Three-branch severity architecture's figure/table/diagnostic subdirectories
+# (architecture plan Work Package C) — kept as separate named constants
+# rather than folded into FIGURE_DIR/ERROR_FIGURE_DIR so each analysis
+# module writes to an unambiguous, predictable location instead of every
+# figure type landing flat in FIGURE_DIR.
+SIGNAL_FIGURE_DIR         = FIGURE_DIR / "signals"          # waveform/spectrogram/MFCC/F0 panels
+REPRESENTATION_FIGURE_DIR = FIGURE_DIR / "representations"  # PCA/UMAP embedding maps
+EXPLAINABILITY_FIGURE_DIR = FIGURE_DIR / "explainability"   # SHAP, permutation importance
+ABLATION_FIGURE_DIR       = FIGURE_DIR / "ablation"         # branch ablation, gate analysis
+METRIC_FIGURE_DIR         = FIGURE_DIR / "metrics"          # confusion matrices, ROC/PR overlays
+TABLES_DIR                = OUTPUT_DIR / "tables"           # paper-ready CSV tables
+DIAGNOSTICS_DIR           = OUTPUT_DIR / "diagnostics"      # VAD stats, feature-audit dumps, etc.
+
 # Training pipeline outputs (train.py)
 CHECKPOINT_DIR       = OUTPUT_DIR / "checkpoints"
 LOG_DIR              = OUTPUT_DIR / "logs"
@@ -109,16 +122,37 @@ SEVERITY_MAP = {
     "M08": "High",     "F05": "High",
 }
 
-# Speakers dropped to balance severity classes at 3 speakers each.
-# Matches the base paper's exclusion criterion exactly (Javanmardi et al.,
-# ICASSP 2023, arXiv:2309.14107): "one male speaker from 'very low' level of
-# intelligibility and two male speakers from 'high' level of intelligibility"
-# were left out to reach 3-per-class / 81 (3^4) leave-one-per-class-out folds.
-# M12 is the dropped Very Low male; M08 and M09 are the two dropped High
-# males (the paper doesn't name which two, so this pair is still a choice,
-# but — unlike the previous ["M12","M08","F05"] — it no longer contradicts
-# the paper by dropping the female High speaker F05 instead of a male one).
+# SECONDARY-ANALYSIS ONLY. The three-branch severity architecture's PRIMARY
+# protocol (src.splits.iter_severity_loso_folds) is full-population Leave-
+# One-Speaker-Out across all 15 dysarthric speakers — it does NOT drop any
+# speaker. Discarding 3 of 15 speakers (20% of an already-small population)
+# to force a balanced 3-per-class split is a real statistical-power cost, and
+# the architecture handles class imbalance instead at the loss/metric level
+# (class-weighted CORAL loss, macro-F1, balanced accuracy, per-class recall).
+#
+# This list is kept only so the ORIGINAL base-paper-style protocol — 3-per-
+# class, leave-one-speaker-per-class-out (src.splits.build_severity_folds /
+# get_severity_split, 81 = 3^4 combinations) — remains available as an
+# explicitly-labeled, budget-capped SECONDARY sanity check, matching
+# Javanmardi et al., ICASSP 2023 (arXiv:2309.14107): "one male speaker from
+# 'very low' level of intelligibility and two male speakers from 'high'
+# level of intelligibility" were left out. The paper doesn't name which two
+# High speakers, so M08/M09 (both male, like the paper's excluded pair) is
+# still a choice, not a reproduction of an unpublished detail.
+#
+# NOTE ON DOCUMENTATION DRIFT: an earlier README revision listed this set as
+# ["M12", "M08", "F05"] — that dropped the female High speaker instead of a
+# second male one, contradicting the paper's own "two male speakers" wording.
+# The current value below is the corrected one; the README has been updated
+# to match (see "Severity — secondary balanced analysis").
 DROPPED_FOR_BALANCE = ["M12", "M08", "M09"]     # 1 Very Low, 2 High (all male)
+
+# Primary severity evaluation protocol for the one-shot three-branch run.
+# "full_loso": Leave-One-Speaker-Out across all 15 dysarthric speakers
+# (src.splits.iter_severity_loso_folds) — the default and the one used for
+# the reported result. "balanced_lopco": the legacy 3-per-class, 81-fold
+# leave-one-per-class-out protocol above, run only as a secondary check.
+SEVERITY_PRIMARY_PROTOCOL = "full_loso"
 
 # ---------------------------------------------------------------------------
 # Dataset protocol
@@ -155,6 +189,16 @@ VAD_MIN_SILENCE_MS  = 100     # internal gaps shorter than this stay merged into
 VAD_SPEECH_PAD_MS   = 30      # padding added around the kept [first..last] speech span
 VAD_SAMPLE_RATE     = 16_000  # must match TARGET_SR — Silero only accepts 8k/16k
 VAD_STATS_PATH      = OUTPUT_DIR / "vad_stats.csv"   # per-utterance VAD stats (Stage 9)
+
+# Temporal-preserving profile, feeding ONLY the Suprasegmental branch. Same
+# Silero VAD trim as the speech-focused profile above (contiguous first-to-
+# last speech, internal pauses already preserved by design), but with a much
+# wider padding margin around the kept span, to protect the onset/offset
+# dynamics (breathiness ramp-in, voicing decay) that a prosodic/temporal
+# encoder needs and a 30ms margin can clip. Still pad/truncated to the same
+# MAX_SAMPLES window for batching (see src.preprocessing.load_and_preprocess_supra),
+# with valid_length propagated so padding is masked, not treated as silence.
+SUPRA_VAD_SPEECH_PAD_MS = 150
 
 # Per-(process, filepath) memoization cap for src.preprocessing's cached
 # loaders — see load_and_preprocess_cached / extract_mfcc_features_cached.
@@ -200,7 +244,14 @@ ACOUSTIC_EMBED_DIM = 128                        # 1D-CNN output embedding size
 LORA_RANK          = 8
 LORA_ALPHA         = 16
 LORA_DROPOUT       = 0.1
+# q/k/v only for the seven legacy ablation variants (src/training/models.py),
+# kept unchanged so their already-defined behaviour doesn't shift. The new
+# GatedFusionModel (src/models/gated_fusion.py) uses LORA_TARGET_MODULES_WIDE
+# instead — adding the attention output projection gives this one-shot run's
+# only trainable model slightly deeper adaptation, at a small, budget-checked
+# parameter cost (see the plan's Part 2 Component 4).
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj"]   # self-attention layers
+LORA_TARGET_MODULES_WIDE = ["q_proj", "k_proj", "v_proj", "out_proj"]
 
 # Phase 6: attention-based fusion. The 768-dim deep and 128-dim acoustic frame
 # sequences are projected into a shared FUSION_ATTN_DIM space so cross-attention
@@ -209,6 +260,36 @@ FUSION_ATTN_DIM     = 256
 FUSION_ATTN_HEADS   = 4          # 256 / 4 = 64 dims per head
 FUSION_ATTN_DROPOUT = 0.1
 PRAAT_EMBED_DIM     = 256        # Praat pathway (Model F): FEATURE_COLUMNS -> one token
+
+# ---------------------------------------------------------------------------
+# Three-branch gated-fusion severity architecture (src/models/gated_fusion.py)
+#
+# Every branch is bottlenecked to a small, fixed dimension BEFORE fusion —
+# the mechanism that forces each branch to keep only decision-relevant
+# information (see the architecture plan's Part 2, Component 7). Read from
+# here everywhere downstream (feature-audit printer, tests) rather than
+# hardcoded, so a change here is guaranteed to be reflected everywhere.
+# ---------------------------------------------------------------------------
+LEARNED_EMBED_DIM   = 128        # Z_learned: wav2vec2+LoRA, mean-pooled, projected 768->128
+SEGMENTAL_EMBED_DIM  = 64        # Z_segmental: MFCC+formant+HNR frame-CNN, projected 128->64
+SUPRA_EMBED_DIM      = 64        # Z_supra: F0/voicing/energy frame-CNN, projected ->64
+FUSED_EMBED_DIM       = SEGMENTAL_EMBED_DIM + SUPRA_EMBED_DIM + LEARNED_EMBED_DIM  # 256
+
+# Framewise segmental channels: 13 MFCC + 13 delta + 13 delta-delta (existing)
+# plus 3 framewise formants (F1-F3) and framewise HNR — see src.praat's
+# extract_formant_sequence / extract_hnr_sequence.
+SEGMENTAL_CHANNELS = 3 * N_MFCC + 3 + 1          # 43
+# Framewise suprasegmental channels: F0 (semitones, interpolated), a binary
+# voicing mask (1 = real pitch estimate, 0 = interpolated/unvoiced), and
+# intensity/energy (dB) — see src.praat's extract_f0_sequence /
+# extract_intensity_sequence.
+SUPRA_CHANNELS = 3
+
+# Fixed BEFORE the one training run (see the plan's Part 2, Component 12) —
+# never swept or tuned against results from this run.
+LAMBDA_COMP    = 0.05    # complementarity (cross-branch redundancy) penalty weight
+LAMBDA_SPEAKER = 0.1     # speaker-invariance (gradient-reversal) loss weight
+GRL_LAMBDA     = 1.0     # gradient-reversal strength inside the GRL layer itself
 
 # ---------------------------------------------------------------------------
 # Training (train.py)
@@ -243,5 +324,7 @@ def ensure_directories() -> None:
     for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, OUTPUT_DIR, FIGURE_DIR,
                        ERROR_FIGURE_DIR, CHECKPOINT_DIR, LOG_DIR, PREDICTIONS_DIR,
                        METRICS_DIR, CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR,
-                       EXPERIMENTS_DIR, RESULTS_DIR):
+                       EXPERIMENTS_DIR, RESULTS_DIR,
+                       SIGNAL_FIGURE_DIR, REPRESENTATION_FIGURE_DIR, EXPLAINABILITY_FIGURE_DIR,
+                       ABLATION_FIGURE_DIR, METRIC_FIGURE_DIR, TABLES_DIR, DIAGNOSTICS_DIR):
         directory.mkdir(parents=True, exist_ok=True)

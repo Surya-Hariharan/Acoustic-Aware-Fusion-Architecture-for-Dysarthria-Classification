@@ -34,9 +34,17 @@ from src.models.attention_fusion import (AttentionFusionModel,
                                          AttentionFusionPraatModel)
 from src.models.deep_pathway import DeepPathway
 from src.models.concat_fusion import FusionModel
+from src.models.gated_fusion import GatedFusionModel
 
 MODEL_NAMES = ("acoustic", "deep_frozen", "deep_lora", "fusion_frozen", "fusion",
                "attention_fusion", "attention_fusion_praat")
+
+# The one-shot three-branch severity architecture (architecture plan, all of
+# Part 2) — a separate registry from MODEL_NAMES above, which lists the
+# seven legacy detection/severity ablation variants kept intact but not run
+# in this pass (see src.splits.iter_severity_loso_folds / the plan's scope
+# decision to train only this model for this run).
+SEVERITY_MODEL_NAME = "gated_fusion_three_branch"
 
 # One-line description per variant, used in the run banner and the ablation
 # table so a reader never has to decode a bare model string.
@@ -48,6 +56,10 @@ MODEL_DESCRIPTIONS = {
     "fusion": "Model D — LoRA wav2vec + MFCC CNN, concatenated",
     "attention_fusion": "Model E — LoRA wav2vec + MFCC CNN, cross-attended",
     "attention_fusion_praat": "Model F — Model E + Praat features (third pathway)",
+    SEVERITY_MODEL_NAME: ("Three-branch gated fusion — Learned (wav2vec2+LoRA, 128D) + "
+                          "Segmental (MFCC+formant+HNR CNN, 64D) + Suprasegmental "
+                          "(F0/voicing/energy CNN, 64D), gated fusion, CORAL ordinal head, "
+                          "cross-branch complementarity + speaker-invariance regularization"),
 }
 
 # Models whose DataLoader must also carry Phase 4's Praat feature vector.
@@ -134,8 +146,15 @@ class DeepClassifier(nn.Module):
             waveform, mfcc, praat, attention_mask, deep_embedding))
 
 
-def build_model(model_name: str, num_classes: int) -> nn.Module:
-    """Instantiate one of the six architecture variants by name."""
+def build_model(model_name: str, num_classes: int, num_speakers: int = 1) -> nn.Module:
+    """Instantiate one of the seven legacy ablation variants, or the
+    three-branch severity architecture, by name.
+
+    num_speakers: only consumed by SEVERITY_MODEL_NAME (sizes its
+    adversarial speaker head to the current fold's training-speaker count —
+    see src.models.gated_fusion.GatedFusionModel); ignored by every other
+    model.
+    """
     if model_name == "acoustic":
         return AcousticClassifier(num_classes=num_classes)
     if model_name == "deep_frozen":
@@ -150,7 +169,10 @@ def build_model(model_name: str, num_classes: int) -> nn.Module:
         return AttentionFusionModel(num_classes=num_classes)
     if model_name == "attention_fusion_praat":
         return AttentionFusionPraatModel(num_classes=num_classes)
-    raise ValueError(f"Unknown model '{model_name}'. Choose from {MODEL_NAMES}.")
+    if model_name == SEVERITY_MODEL_NAME:
+        return GatedFusionModel(num_classes=num_classes, num_speakers=num_speakers)
+    raise ValueError(f"Unknown model '{model_name}'. Choose from "
+                     f"{MODEL_NAMES + (SEVERITY_MODEL_NAME,)}.")
 
 
 def parameter_counts(model: nn.Module) -> Dict[str, float]:
