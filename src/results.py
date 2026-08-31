@@ -950,3 +950,184 @@ def export_results_for_paper(run_names: Optional[List[str]] = None,
     print_kv("Tables exported", f"{len(exported_tables)} -> {out_dir / 'tables'}")
     print_kv("Figures exported", f"{len(exported_figures)} -> {out_dir / 'figures'}")
     return out_dir
+
+
+# ---------------------------------------------------------------------------
+# Three-branch severity architecture — paper-ready tables (Tables 1-8 + a
+# limitations table). Every function here reads real, already-computed
+# artifacts (the manifest, a run's pooled metrics/predictions, or a
+# DataFrame the caller already produced via src.model_analysis) — nothing
+# is hardcoded, so a table always reflects the actual run. Tables that
+# depend on the trained checkpoint (branch ablation, gate contribution,
+# explainability) take that DataFrame as an argument rather than
+# recomputing it, keeping this module decoupled from src.model_analysis's
+# heavier machinery (SHAP/UMAP/branch-ablation forward passes).
+# ---------------------------------------------------------------------------
+def build_dataset_table(manifest: pd.DataFrame) -> pd.DataFrame:
+    """Table 1 — Speaker | Severity | Number of utterances, for the 15
+    dysarthric speakers the primary severity protocol evaluates."""
+    df = manifest[manifest["Speaker_ID"].isin(config.DYSARTHRIC_IDS)]
+    table = (df.groupby(["Speaker_ID", "Severity"]).size()
+            .reset_index(name="num_utterances")
+            .sort_values(["Severity", "Speaker_ID"]))
+    return table.reset_index(drop=True)
+
+
+def build_feature_architecture_table() -> pd.DataFrame:
+    """Table 2 — Branch | Input | Feature category | Channels | Encoder |
+    Bottleneck, read from config.py constants and src.training.reporting.
+    feature_audit() — never hardcoded."""
+    from src.training.reporting import feature_audit
+
+    audit = feature_audit(num_classes=4)
+    return pd.DataFrame([
+        {"branch": "Learned", "input": "raw 16kHz waveform (speech-focused profile)",
+         "feature_category": "wav2vec2 contextual representation",
+         "channels": config.WAV2VEC_EMBED_DIM, "encoder": "wav2vec2-base-960h + LoRA",
+         "bottleneck": audit["learned_branch"]["dimensions"]},
+        {"branch": "Segmental", "input": "MFCC+delta+delta-delta + framewise formants + HNR",
+         "feature_category": "spectral / resonance / voice-quality (framewise)",
+         "channels": audit["segmental_branch"]["input_channels"], "encoder": "3-layer 1D-CNN",
+         "bottleneck": audit["segmental_branch"]["dimensions"]},
+        {"branch": "Suprasegmental", "input": "F0 + voicing mask + intensity (temporal-preserving profile)",
+         "feature_category": "pitch / energy / voicing (framewise)",
+         "channels": audit["suprasegmental_branch"]["input_channels"], "encoder": "2-layer 1D-CNN",
+         "bottleneck": audit["suprasegmental_branch"]["dimensions"]},
+    ])
+
+
+def build_model_dimensions_table() -> pd.DataFrame:
+    """Table 3 — the exact tensor-dimension chain per branch, from
+    feature_audit()'s real tensors."""
+    from src.training.reporting import feature_audit
+
+    audit = feature_audit(num_classes=4)
+    return pd.DataFrame([
+        {"stage": "Learned", "transform": f"{config.WAV2VEC_EMBED_DIM} -> {audit['learned_branch']['dimensions']}"},
+        {"stage": "Segmental", "transform": f"{audit['segmental_branch']['input_channels']} x T -> {audit['segmental_branch']['dimensions']}"},
+        {"stage": "Suprasegmental", "transform": f"{audit['suprasegmental_branch']['input_channels']} x T -> {audit['suprasegmental_branch']['dimensions']}"},
+        {"stage": "Fusion", "transform": str(audit["fusion"]["fused_dim"])},
+    ])
+
+
+def build_final_metrics_table(run_name: str) -> pd.DataFrame:
+    """Table 4 — pooled Accuracy / Balanced Accuracy / Macro-F1 /
+    Weighted-F1 / Ordinal MAE for one run, from its pooled metrics JSON."""
+    metrics = load_pooled_metrics(run_name)
+    rows = [("Accuracy", metrics.get("accuracy")), ("Balanced Accuracy", metrics.get("balanced_accuracy")),
+           ("Macro-F1", metrics.get("f1")), ("Weighted-F1", metrics.get("f1_weighted")),
+           ("Ordinal MAE", metrics.get("ordinal_mae")), ("AUROC", metrics.get("auroc"))]
+    return pd.DataFrame(rows, columns=["metric", "value"])
+
+
+def build_per_class_metrics_table(run_name: str, task: str = "severity") -> pd.DataFrame:
+    """Table 5 — per-class precision/recall/F1/support, pooled across every
+    fold's held-out predictions."""
+    from sklearn.metrics import precision_recall_fscore_support
+
+    preds = load_run_predictions(run_name)
+    class_names = config.SEVERITY_CLASS_NAMES if task == "severity" else config.DETECTION_CLASS_NAMES
+    labels = list(range(len(class_names)))
+    precision, recall, f1, support = precision_recall_fscore_support(
+        preds["y_true"], preds["y_pred"], labels=labels, zero_division=np.nan)
+    return pd.DataFrame({"class": class_names, "precision": precision, "recall": recall,
+                         "f1": f1, "support": support})
+
+
+def build_branch_ablation_table(ablation_df: pd.DataFrame) -> pd.DataFrame:
+    """Table 6 — thin passthrough of
+    src.model_analysis.evaluate_branch_ablation()'s output, reset to a plain
+    column (not index) for CSV export."""
+    return ablation_df.reset_index().rename(columns={"index": "variant"})
+
+
+def build_gate_contribution_table(gate_summary_df: pd.DataFrame) -> pd.DataFrame:
+    """Table 7 — thin passthrough of
+    src.model_analysis.summarize_gate_values()'s output."""
+    return gate_summary_df.reset_index().rename(columns={"index": "branch"})
+
+
+def build_explainability_table(shap_group_df: pd.DataFrame,
+                               permutation_group_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Table 8 — feature-group SHAP importance, optionally merged with
+    feature-group permutation importance for a side-by-side comparison
+    (src.model_analysis.aggregate_shap_by_group /
+    aggregate_permutation_importance_by_group)."""
+    table = shap_group_df.rename(columns={"mean_abs_shap": "shap_importance"})
+    if permutation_group_df is not None:
+        table = table.merge(
+            permutation_group_df.rename(columns={"importance_mean": "permutation_importance"}),
+            on="group", how="outer")
+    return table.sort_values(table.columns[1], ascending=False).reset_index(drop=True)
+
+
+LIMITATIONS = [
+    "UA-Speech has a limited number of dysarthric speakers.",
+    "Vocabulary overlap exists between speaker partitions.",
+    "Speaker-independent does not mean unseen-word evaluation.",
+    "F0 extraction can be unreliable in dysarthric speech.",
+    "CORAL imposes an ordinal latent structure.",
+    "SHAP uses a surrogate model and should not be interpreted as causal attribution.",
+    "Gate values indicate learned reliance, not causal importance.",
+    "Branch ablation is inference-time contribution analysis, not causal proof.",
+    "UA-Speech severity categories are intelligibility-derived and should not be "
+    "described as direct clinical motor-severity measurements.",
+    "A single training run prevents extensive hyperparameter optimization.",
+]
+
+
+def build_limitations_table() -> pd.DataFrame:
+    """The final results notebook's limitations table — fixed, scientifically
+    reviewed statements (not derived from run data, so this reads the same
+    regardless of which run is being reported on)."""
+    return pd.DataFrame({"limitation": LIMITATIONS})
+
+
+def export_paper_tables(run_name: str, manifest: Optional[pd.DataFrame] = None,
+                        ablation_df: Optional[pd.DataFrame] = None,
+                        gate_summary_df: Optional[pd.DataFrame] = None,
+                        shap_group_df: Optional[pd.DataFrame] = None,
+                        permutation_group_df: Optional[pd.DataFrame] = None,
+                        task: str = "severity", out_dir: Optional[Path] = None
+                        ) -> Dict[str, Path]:
+    """
+    Write every available paper table (1-8 + limitations) as CSV under
+    config.TABLES_DIR. Table 2/3 (architecture, no run needed) and the
+    limitations table are always written; table 1 (dataset) is written when
+    `manifest` is given; tables 4/5 (run-dependent) and 6-8 (checkpoint-
+    dependent, via the caller's precomputed DataFrames) are each skipped —
+    not an error — when the underlying run/DataFrame doesn't exist yet, so
+    this is safe to call before the one-shot training run has produced any
+    results (post-hoc analysis, and this export, can be run incrementally).
+    """
+    out_dir = Path(out_dir or config.TABLES_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: Dict[str, Path] = {}
+
+    tables = {"table2_feature_architecture": build_feature_architecture_table(),
+             "table3_model_dimensions": build_model_dimensions_table(),
+             "limitations": build_limitations_table()}
+    try:
+        tables["table4_final_metrics"] = build_final_metrics_table(run_name)
+    except FileNotFoundError as e:
+        print_kv("table4_final_metrics skipped", str(e))
+    try:
+        tables["table5_per_class_metrics"] = build_per_class_metrics_table(run_name, task=task)
+    except FileNotFoundError as e:
+        print_kv("table5_per_class_metrics skipped", str(e))
+    if manifest is not None:
+        tables["table1_dataset"] = build_dataset_table(manifest)
+    if ablation_df is not None:
+        tables["table6_branch_ablation"] = build_branch_ablation_table(ablation_df)
+    if gate_summary_df is not None:
+        tables["table7_gate_contribution"] = build_gate_contribution_table(gate_summary_df)
+    if shap_group_df is not None:
+        tables["table8_explainability"] = build_explainability_table(shap_group_df, permutation_group_df)
+
+    for name, df in tables.items():
+        path = out_dir / f"{name}.csv"
+        df.to_csv(path, index=False)
+        written[name] = path
+
+    print_kv("Paper tables exported", f"{len(written)} -> {out_dir}")
+    return written

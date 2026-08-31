@@ -31,7 +31,7 @@ import seaborn as sns
 from scipy.stats import mannwhitneyu
 
 from src import config
-from src.console import print_kv
+from src.console import print_kv, progress
 from src.praat import (FEATURE_COLUMNS, PITCH_CEILING, PITCH_FLOOR,
                        severity_group)
 from src.preprocessing import (build_mfcc_transform, extract_mfcc_features,
@@ -415,3 +415,254 @@ def plot_error_feature_distributions(preds: pd.DataFrame, comparison: pd.DataFra
     else:
         plt.close(fig)
     return str(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Representative-utterance signal panel — a 7-panel figure (waveform,
+# spectrogram, MFCC, delta-MFCC, F0 + voicing, energy/intensity, formant
+# trajectories) for ANY utterance, not only misclassified ones (unlike
+# plot_utterance_diagnostics above, which is error-gallery-specific). This
+# is the data-pipeline/representation-analysis artifact — architecture plan
+# Work Package F, brief Sections 17/31-32.
+# ---------------------------------------------------------------------------
+def _formant_trajectories(filepath: str):
+    """(times, f1, f2, f3) over the original audio, or (None, None, None, None)
+    on any Praat failure — mirrors _pitch_contour's never-raise contract."""
+    from parselmouth.praat import call
+
+    try:
+        sound = parselmouth.Sound(filepath)
+        formant = sound.to_formant_burg(time_step=0.01, max_number_of_formants=5,
+                                        maximum_formant=5500, window_length=0.025,
+                                        pre_emphasis_from=50)
+    except Exception:
+        return None, None, None, None
+
+    times = formant.xs()
+    f1 = np.full(len(times), np.nan)
+    f2 = np.full(len(times), np.nan)
+    f3 = np.full(len(times), np.nan)
+    for i, t in enumerate(times):
+        for arr, idx in ((f1, 1), (f2, 2), (f3, 3)):
+            try:
+                value = call(formant, "Get value at time", idx, t, "Hertz", "Linear")
+                if value is not None and not np.isnan(value):
+                    arr[i] = value
+            except Exception:
+                pass
+    return times, f1, f2, f3
+
+
+def _intensity_contour(filepath: str):
+    """(times, intensity_db) over the original audio, or (None, None)."""
+    try:
+        sound = parselmouth.Sound(filepath)
+        intensity = sound.to_intensity(minimum_pitch=PITCH_FLOOR)
+    except Exception:
+        return None, None
+    return intensity.xs(), intensity.values[0]
+
+
+def plot_utterance_signal_panel(row, out_dir: Optional[Path] = None,
+                                show: bool = False) -> Optional[str]:
+    """
+    7-panel research-quality signal figure for ONE utterance (representative
+    OR misclassified — unlike plot_utterance_diagnostics, no correctness
+    framing is assumed): waveform, spectrogram, MFCC, delta-MFCC, F0 contour
+    with voiced/unvoiced shading, energy/intensity, and formant trajectories
+    (F1-F3). All time-domain panels share the ORIGINAL audio's time axis;
+    the MFCC/delta-MFCC panels use the preprocessed (VAD-trimmed, 4s
+    padded) window — the same original-vs-processed split as
+    plot_utterance_diagnostics, and for the same reason (telling a hard
+    utterance apart from a preprocessing artifact).
+
+    `row` needs at least "Filepath" and "filename" (a plain manifest row is
+    enough — no prediction/correctness columns required, unlike the error
+    gallery's plot_utterance_diagnostics).
+    """
+    filepath = row["Filepath"] if hasattr(row, "__getitem__") else row.Filepath
+    if not isinstance(filepath, str) or not Path(filepath).exists():
+        print_kv("Skipped", f"{row.get('filename', row.get('Filename', '?'))} — audio not found")
+        return None
+
+    sound = parselmouth.Sound(filepath)
+    original = sound.values[0]
+    sr = sound.sampling_frequency
+    times = np.arange(len(original)) / sr
+
+    processed, valid_length = load_and_preprocess(filepath)
+    mfcc = extract_mfcc_features(processed, build_mfcc_transform(),
+                                 valid_length=valid_length)[0].numpy()   # (39, frames)
+    mfcc_only, delta_only = mfcc[:13], mfcc[13:26]
+
+    fig, axes = plt.subplots(4, 2, figsize=(14, 15))
+
+    axes[0, 0].plot(times, original, linewidth=0.5, color="#3b6ea5")
+    axes[0, 0].set_title("Waveform")
+    axes[0, 0].set_xlabel("Time (s)")
+    axes[0, 0].set_ylabel("Amplitude")
+
+    axes[0, 1].specgram(original, Fs=sr, NFFT=400, noverlap=240, cmap="magma")
+    axes[0, 1].set_title("Spectrogram")
+    axes[0, 1].set_xlabel("Time (s)")
+    axes[0, 1].set_ylabel("Frequency (Hz)")
+
+    im1 = axes[1, 0].imshow(mfcc_only, aspect="auto", origin="lower", cmap="viridis")
+    axes[1, 0].set_title("MFCC")
+    axes[1, 0].set_xlabel("Frame")
+    axes[1, 0].set_ylabel("Coefficient (13)")
+    fig.colorbar(im1, ax=axes[1, 0], fraction=0.046)
+
+    im2 = axes[1, 1].imshow(delta_only, aspect="auto", origin="lower", cmap="viridis")
+    axes[1, 1].set_title("Delta-MFCC")
+    axes[1, 1].set_xlabel("Frame")
+    axes[1, 1].set_ylabel("Coefficient (13)")
+    fig.colorbar(im2, ax=axes[1, 1], fraction=0.046)
+
+    pitch = sound.to_pitch(time_step=None, pitch_floor=PITCH_FLOOR, pitch_ceiling=PITCH_CEILING)
+    pitch_times, pitch_f0_full = pitch.xs(), pitch.selected_array["frequency"]
+    voiced_mask = pitch_f0_full > 0
+    axes[2, 0].fill_between(pitch_times, 0, 1, where=voiced_mask, color=CORRECT_COLOR,
+                            alpha=0.15, transform=axes[2, 0].get_xaxis_transform(), step="mid")
+    if voiced_mask.sum() >= MIN_VOICED_FRAMES:
+        axes[2, 0].plot(pitch_times[voiced_mask], pitch_f0_full[voiced_mask],
+                        "o", markersize=2.5, color="#c44e52")
+        axes[2, 0].set_ylim(PITCH_FLOOR, min(PITCH_CEILING, float(pitch_f0_full[voiced_mask].max()) * 1.2))
+    else:
+        axes[2, 0].text(0.5, 0.5, "no voiced frames", ha="center", va="center",
+                        transform=axes[2, 0].transAxes, fontsize=11, color="grey")
+    axes[2, 0].set_title("F0 contour (shaded = voiced)")
+    axes[2, 0].set_xlabel("Time (s)")
+    axes[2, 0].set_ylabel("F0 (Hz)")
+
+    intensity_times, intensity_values = _intensity_contour(filepath)
+    if intensity_times is not None:
+        axes[2, 1].plot(intensity_times, intensity_values, color="#dd8452", linewidth=1.0)
+    axes[2, 1].set_title("Energy / intensity")
+    axes[2, 1].set_xlabel("Time (s)")
+    axes[2, 1].set_ylabel("Intensity (dB)")
+
+    formant_times, f1, f2, f3 = _formant_trajectories(filepath)
+    if formant_times is not None:
+        axes[3, 0].plot(formant_times, f1, ".", markersize=2, label="F1", color="#4c72b0")
+        axes[3, 0].plot(formant_times, f2, ".", markersize=2, label="F2", color="#55a868")
+        axes[3, 0].plot(formant_times, f3, ".", markersize=2, label="F3", color="#c44e52")
+        axes[3, 0].legend(fontsize=8, loc="upper right")
+        axes[3, 0].set_ylim(0, 5500)
+    axes[3, 0].set_title("Formant trajectories")
+    axes[3, 0].set_xlabel("Time (s)")
+    axes[3, 0].set_ylabel("Frequency (Hz)")
+
+    axes[3, 1].axis("off")
+
+    label = row.get("filename", row.get("Filename", Path(filepath).stem))
+    severity = row.get("Severity", row.get("y_true_label"))
+    title = f"{label}" + (f"  —  {severity}" if severity is not None else "")
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout()
+
+    out_dir = Path(out_dir or config.SIGNAL_FIGURE_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{Path(str(label)).stem}.png"
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return str(out_path)
+
+
+def select_representative_utterances(df: pd.DataFrame, n_per_class: int = 2,
+                                     seed: int = 42) -> pd.DataFrame:
+    """Deterministically sample n_per_class dysarthric utterances per
+    severity class (one per speaker where possible) — the fixed set of
+    utterances every representative-utterance figure/embedding artifact is
+    generated for, so results are reproducible across reruns."""
+    severity_df = df[df["Severity"].isin(config.SEVERITY_CLASS_NAMES)]
+    parts = []
+    for severity, group in severity_df.groupby("Severity"):
+        n = min(n_per_class, len(group))
+        parts.append(group.sample(n, random_state=seed))
+    return pd.concat(parts, ignore_index=True) if parts else severity_df.head(0)
+
+
+def save_representative_utterance_artifacts(
+        manifest: pd.DataFrame, model=None, device=None, n_per_class: int = 2,
+        seed: int = 42, out_signal_dir: Optional[Path] = None,
+        out_embedding_dir: Optional[Path] = None) -> pd.DataFrame:
+    """
+    For a fixed, seeded set of representative utterances (one row per
+    severity class x n_per_class), save: the 7-panel signal figure
+    (plot_utterance_signal_panel), and — if `model` (a GatedFusionModel) and
+    `device` are given — the four branch embeddings (.npy) and a prediction
+    summary (.json) per utterance, matching the brief's
+    artifacts/{signals,representations,predictions}/ tree (architecture
+    plan Work Package F).
+
+    Returns the DataFrame of utterances selected, with a `signal_figure`
+    column added (path, or None if audio was unavailable).
+    """
+    import json
+
+    from src.preprocessing import (extract_segmental_features_cached,
+                                   extract_suprasegmental_features_cached,
+                                   load_and_preprocess_cached,
+                                   load_and_preprocess_supra_cached, mfcc_frame_count)
+
+    selected = select_representative_utterances(manifest, n_per_class=n_per_class, seed=seed)
+    out_signal_dir = Path(out_signal_dir or config.SIGNAL_FIGURE_DIR)
+    out_embedding_dir = Path(out_embedding_dir or (config.EMBEDDINGS_DIR / "representative"))
+    out_signal_dir.mkdir(parents=True, exist_ok=True)
+    out_embedding_dir.mkdir(parents=True, exist_ok=True)
+
+    figure_paths = []
+    for _, row in progress(selected.iterrows(), "Representative-utterance artifacts",
+                           total=len(selected)):
+        figure_paths.append(plot_utterance_signal_panel(row, out_dir=out_signal_dir, show=False))
+
+        if model is not None and device is not None:
+            import torch
+
+            filepath = row["Filepath"]
+            waveform, valid_length = load_and_preprocess_cached(filepath)
+            segmental = extract_segmental_features_cached(filepath)
+            supra = extract_suprasegmental_features_cached(filepath)
+            supra_waveform, supra_valid_length = load_and_preprocess_supra_cached(filepath)
+            total_frames = mfcc_frame_count(waveform.shape[-1])
+            supra_valid_frames = min(mfcc_frame_count(supra_valid_length), total_frames)
+
+            waveform_b = waveform.to(device)
+            attention_mask = torch.zeros(1, waveform.shape[-1], dtype=torch.bool, device=device)
+            attention_mask[0, :valid_length] = True
+            mfcc_b = segmental.unsqueeze(0).to(device)
+            supra_b = supra.unsqueeze(0).to(device)
+            supra_valid_frames_b = torch.tensor([supra_valid_frames], dtype=torch.long, device=device)
+
+            model.eval()
+            with torch.no_grad():
+                z_learned, z_segmental, z_supra = model.encode_branches(
+                    waveform_b, mfcc_b, supra_b, attention_mask, supra_valid_frames_b)
+                z_unified, gates = model.fuse(z_learned, z_segmental, z_supra)
+                logits = model.classifier(z_unified)
+                probs = torch.softmax(logits.float(), dim=1)[0].cpu().numpy()
+
+            stem = Path(str(row["Filename"])).stem
+            np.save(out_embedding_dir / f"{stem}_learned.npy", z_learned[0].cpu().numpy())
+            np.save(out_embedding_dir / f"{stem}_segmental.npy", z_segmental[0].cpu().numpy())
+            np.save(out_embedding_dir / f"{stem}_suprasegmental.npy", z_supra[0].cpu().numpy())
+            np.save(out_embedding_dir / f"{stem}_fused.npy", z_unified[0].cpu().numpy())
+
+            prediction = {
+                "filename": row["Filename"], "speaker_id": row["Speaker_ID"],
+                "true_severity": row["Severity"],
+                "predicted_severity": config.SEVERITY_CLASS_NAMES[int(probs.argmax())],
+                "class_probabilities": dict(zip(config.SEVERITY_CLASS_NAMES, probs.tolist())),
+                "gate_weights": {"learned": float(gates[0, 0]), "segmental": float(gates[0, 1]),
+                                "supra": float(gates[0, 2])},
+            }
+            with open(out_embedding_dir / f"{stem}_prediction.json", "w") as f:
+                json.dump(prediction, f, indent=2)
+
+    selected = selected.copy()
+    selected["signal_figure"] = figure_paths
+    return selected
