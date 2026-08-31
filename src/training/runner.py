@@ -29,14 +29,14 @@ from src.console import (V, print_architecture, print_banner, print_fold_progres
 from src.praat import FEATURE_COLUMNS as PRAAT_FEATURE_COLUMNS
 from src.praat import load_praat_table
 from src.splits import (build_severity_folds, get_severity_split, iter_loso_folds,
-                        iter_screening_folds, sample_severity_folds)
+                        iter_screening_folds, iter_severity_loso_folds, sample_severity_folds)
 from src.training.checkpoint import load_checkpoint, save_checkpoint
-from src.training.data import (TASK_LABEL_COLUMN, build_loaders,
+from src.training.data import (TASK_LABEL_COLUMN, build_loaders, build_speaker_label_map,
                                compute_class_weights, stratified_train_val_split)
 from src.training.early_stopping import EarlyStopping
 from src.training.engine import EpochResult, build_optimizer, run_epoch
 from src.training.metrics import compute_confusion_matrix, compute_metrics
-from src.training.models import (MODEL_DESCRIPTIONS,
+from src.training.models import (MODEL_DESCRIPTIONS, SEVERITY_MODEL_NAME,
                                  MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING,
                                  MODELS_REQUIRING_PRAAT, build_model)
 from src.training.reporting import (FOLD_CACHED, FOLD_COMPLETED, FOLD_FAILED,
@@ -89,8 +89,19 @@ class TrainingConfig:
     # Severity: None runs all 81 leave-one-per-class-out combinations (the
     # base-paper protocol); an int randomly subsamples that many combos
     # (src.splits.sample_severity_folds) — 81 folds x every ablation variant
-    # is the single largest GPU-time item in the training notebook.
+    # is the single largest GPU-time item in the training notebook. Only
+    # consulted when severity_protocol == "balanced_lopco" below.
     severity_fold_sample: Optional[int] = None
+
+    # Severity protocol switch (architecture plan Part 2, Component 1-2):
+    # "full_loso" (default, matches config.SEVERITY_PRIMARY_PROTOCOL) — the
+    # one-shot run's PRIMARY protocol, Leave-One-Speaker-Out across all 15
+    # dysarthric speakers, no speaker dropped for balance (src.splits.
+    # iter_severity_loso_folds). "balanced_lopco" — the legacy base-paper
+    # 3-per-class, 81 (or severity_fold_sample-subsampled) leave-one-per-
+    # class-out protocol (build_severity_folds/get_severity_split above),
+    # run only as an explicitly-labeled SECONDARY sanity check.
+    severity_protocol: str = config.SEVERITY_PRIMARY_PROTOCOL
 
     # 1 = every batch steps the optimizer (unchanged default behaviour). >1
     # accumulates that many batches' gradients before stepping, simulating a
@@ -109,6 +120,8 @@ def build_folds(df: pd.DataFrame, task: str, cfg: Optional["TrainingConfig"] = N
             yield from iter_screening_folds(df, cfg.screening_folds, cfg.seed)
         else:
             yield from iter_loso_folds(df)
+    elif cfg.severity_protocol == "full_loso":
+        yield from iter_severity_loso_folds(df)
     else:
         combos = build_severity_folds(df)
         if cfg.severity_fold_sample is not None:
@@ -186,12 +199,19 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
         val_df = _limit_samples(val_df, max(2, cfg.limit_samples // 4), label_column)
         test_df = _limit_samples(test_df, cfg.limit_samples, label_column)
 
+    # Only meaningful for SEVERITY_MODEL_NAME (see build_model/GatedFusionModel's
+    # adversarial speaker head) — harmless to build unconditionally for every
+    # other model, since build_loaders only forwards it when the model actually
+    # needs the three-branch Dataset fields.
+    speaker_label_map = build_speaker_label_map(train_df)
+
     train_loader, val_loader, test_loader = build_loaders(
         train_df, val_df, test_df, cfg.batch_size, cfg.num_workers,
         pin_memory=(device.type == "cuda"), praat_table=praat_table,
-        frozen_embedding_table=frozen_embedding_table, model_name=cfg.model)
+        frozen_embedding_table=frozen_embedding_table, model_name=cfg.model,
+        speaker_label_map=speaker_label_map)
 
-    model = build_model(cfg.model, num_classes).to(device)
+    model = build_model(cfg.model, num_classes, num_speakers=len(speaker_label_map)).to(device)
     optimizer = build_optimizer(model, cfg.lr_head, cfg.lr_backbone, cfg.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5,
                                   patience=max(1, cfg.patience // 2))
@@ -277,7 +297,8 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
                 {"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
                  "epochs_completed": epochs_completed,
                  "fold_time_s": fold_time_s, "train_time_s": train_time_s,
-                 "inference_time_s": inference_time_s})
+                 "inference_time_s": inference_time_s,
+                 **(test_result.extras or {})})
     save_confusion_matrix(
         config.CONFUSION_MATRIX_DIR / run_name / f"{fold_id}.png",
         compute_confusion_matrix(test_result.y_true, test_result.y_pred, cfg.task),
@@ -287,7 +308,8 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
                    title=f"{run_name} — fold {fold_id}")
     save_embeddings(config.EMBEDDINGS_DIR / run_name / f"{fold_id}.npz",
                     test_result.embeddings, test_result.y_true, test_result.speaker_ids,
-                    test_result.filenames)
+                    test_result.filenames, branch_embeddings=test_result.branch_embeddings,
+                    gate_weights=test_result.gate_weights)
 
     writer.close()
     print_kv(f"Fold {fold_id} held-out test", ", ".join(
@@ -301,10 +323,13 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
 
 def _registry_kwargs(cfg: TrainingConfig, run_name: str, expected_folds: int) -> Dict:
     """The run-identifying fields every record_fold() call in run_training shares."""
+    if cfg.task == "detection":
+        cv_protocol = cfg.cv_protocol
+    else:
+        cv_protocol = ("severity_loso" if cfg.severity_protocol == "full_loso"
+                       else "severity_lopco")
     return {"run_name": run_name, "model": cfg.model, "task": cfg.task,
-            "cv_protocol": (cfg.cv_protocol if cfg.task == "detection"
-                            else "severity_lopco"),
-            "expected_folds": expected_folds}
+            "cv_protocol": cv_protocol, "expected_folds": expected_folds}
 
 
 def run_training(df: pd.DataFrame, cfg: TrainingConfig,
@@ -353,8 +378,10 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     if cfg.task == "detection":
         protocol = ("Leave-One-Speaker-Out" if cfg.cv_protocol != "screening"
                     else f"screening ({cfg.screening_folds}-fold, speaker-grouped)")
+    elif cfg.severity_protocol == "full_loso":
+        protocol = "full-population Leave-One-Speaker-Out (PRIMARY, all 15 dysarthric speakers)"
     else:
-        protocol = "balanced leave-one-speaker-per-class-out"
+        protocol = "balanced leave-one-speaker-per-class-out (SECONDARY, 3/class)"
         if cfg.severity_fold_sample is not None:
             protocol += f" (subsampled to {cfg.severity_fold_sample} of 81)"
 
