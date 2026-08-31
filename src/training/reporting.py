@@ -8,6 +8,7 @@ Also home to the EXPERIMENT REGISTRY (see below), the single record of what
 was actually evaluated — as opposed to what merely left a file behind.
 """
 
+import hashlib
 import json
 import shutil
 from dataclasses import asdict
@@ -21,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import torch
 from sklearn.metrics import roc_curve
 
 from src import config
@@ -109,9 +111,18 @@ def save_roc_curve(path: Path, y_true: np.ndarray, y_prob: np.ndarray, task: str
 
 
 def save_embeddings(path: Path, embeddings: np.ndarray, y_true: np.ndarray,
-                    speaker_ids, filenames=None) -> None:
+                    speaker_ids, filenames=None,
+                    branch_embeddings: Optional[Dict[str, np.ndarray]] = None,
+                    gate_weights: Optional[np.ndarray] = None) -> None:
     """Test-fold embeddings, keyed by filename so Phase 5's embedding map can be
-    coloured by whether each point was classified correctly."""
+    coloured by whether each point was classified correctly.
+
+    branch_embeddings ({"learned":, "segmental":, "supra":} arrays) and
+    gate_weights ((N,3) array, columns [learned, segmental, supra]) are
+    written as extra keys in the SAME .npz — populated only for
+    GatedFusionModel (see src.training.engine.EpochResult) — rather than a
+    second file, so a consumer that only wants the fused `embeddings` array
+    is unaffected and one file per fold stays the on-disk contract."""
     path.parent.mkdir(parents=True, exist_ok=True)
     arrays = {
         "embeddings": embeddings,
@@ -120,6 +131,11 @@ def save_embeddings(path: Path, embeddings: np.ndarray, y_true: np.ndarray,
     }
     if filenames is not None:
         arrays["filenames"] = np.asarray(filenames)
+    if branch_embeddings is not None:
+        for name, values in branch_embeddings.items():
+            arrays[f"branch_{name}"] = values
+    if gate_weights is not None:
+        arrays["gate_weights"] = gate_weights
     np.savez(path, **arrays)
 
 
@@ -435,3 +451,362 @@ def save_experiment_bundle(experiment_name: str, model_name: str, task: str,
         shutil.copy2(ckpt_file, ckpt_dst_dir / f"{ckpt_file.parent.name}_best.pt")
 
     return bundle_dir
+
+
+# ---------------------------------------------------------------------------
+# One-shot run freezing: the FEATURE AUDIT and FINAL RUN CONFIGURATION blocks
+# (architecture plan Part 2, Component 16), plus a config-hash guard.
+#
+# Every number below is derived from a real, instantiated GatedFusionModel's
+# tensors (via one dummy forward pass) or from src.config constants actually
+# read by that model — never hardcoded — so this output is guaranteed to
+# reflect the code that will actually run, not a comment that can drift from
+# it (see the same failure mode this project already fixed once for
+# DROPPED_FOR_BALANCE — a hand-maintained description of a value the code
+# had since changed).
+# ---------------------------------------------------------------------------
+FROZEN_CONFIG_PATH = config.RESULTS_DIR / "frozen_config.json"
+
+
+def _dummy_three_branch_batch(batch_size: int = 2, device: str = "cpu") -> Dict[str, torch.Tensor]:
+    """Minimal, correctly-shaped tensors for one GatedFusionModel forward
+    pass — no real audio needed, only used to read off tensor shapes."""
+    from src.preprocessing import mfcc_frame_count
+
+    total_frames = mfcc_frame_count(config.MAX_SAMPLES)
+    return {
+        "waveform": torch.zeros(batch_size, config.MAX_SAMPLES, device=device),
+        "mfcc": torch.zeros(batch_size, config.SEGMENTAL_CHANNELS, total_frames, device=device),
+        "supra": torch.zeros(batch_size, config.SUPRA_CHANNELS, total_frames, device=device),
+        "attention_mask": torch.ones(batch_size, config.MAX_SAMPLES, dtype=torch.bool, device=device),
+        "supra_valid_frames": torch.full((batch_size,), total_frames, dtype=torch.long, device=device),
+    }
+
+
+def feature_audit(model=None, num_classes: int = 4) -> Dict:
+    """
+    Derive the brief's "FEATURE AUDIT" block from a real model instance and
+    one dummy forward pass — every dimension is read off the actual tensors,
+    every feature name is read off src.praat's column lists, nothing here is
+    a hardcoded number that could silently drift from the code.
+    """
+    from src.praat import SEGMENTAL_FEATURE_COLUMNS, SUPRASEGMENTAL_FEATURE_COLUMNS
+    from src.training.models import build_model, SEVERITY_MODEL_NAME
+
+    owns_model = model is None
+    if owns_model:
+        model = build_model(SEVERITY_MODEL_NAME, num_classes, num_speakers=2)
+    model.eval()
+
+    batch = _dummy_three_branch_batch()
+    with torch.no_grad():
+        z_learned, z_segmental, z_supra = model.encode_branches(
+            batch["waveform"], batch["mfcc"], batch["supra"],
+            batch["attention_mask"], batch["supra_valid_frames"])
+        z_unified, gates = model.fuse(z_learned, z_segmental, z_supra)
+
+    audit = {
+        "learned_branch": {
+            "raw_hidden_shape": [batch["waveform"].shape[0], "T", config.WAV2VEC_EMBED_DIM],
+            "projected_shape": list(z_learned.shape),
+            "dimensions": z_learned.shape[-1],
+            "wav2vec2_model": config.WAV2VEC_MODEL_NAME,
+            "lora_target_modules": config.LORA_TARGET_MODULES_WIDE,
+            "lora_rank": config.LORA_RANK, "lora_alpha": config.LORA_ALPHA,
+            "lora_dropout": config.LORA_DROPOUT,
+        },
+        "segmental_branch": {
+            "input_channels": config.SEGMENTAL_CHANNELS,
+            "input_shape": list(batch["mfcc"].shape),
+            "projected_shape": list(z_segmental.shape),
+            "dimensions": z_segmental.shape[-1],
+            "engineered_feature_families": [
+                "MFCC (13)", "delta-MFCC (13)", "delta-delta-MFCC (13)",
+                "framewise F1/F2/F3 (3)", "framewise HNR (1)"],
+            "shap_surrogate_feature_names": list(SEGMENTAL_FEATURE_COLUMNS),
+        },
+        "suprasegmental_branch": {
+            "input_channels": config.SUPRA_CHANNELS,
+            "input_shape": list(batch["supra"].shape),
+            "projected_shape": list(z_supra.shape),
+            "dimensions": z_supra.shape[-1],
+            "engineered_feature_families": [
+                "F0 (semitones, voicing-interpolated)", "voicing mask", "intensity (dB)"],
+            "shap_surrogate_feature_names": list(SUPRASEGMENTAL_FEATURE_COLUMNS),
+        },
+        "fusion": {
+            "learned_dim": z_learned.shape[-1], "segmental_dim": z_segmental.shape[-1],
+            "supra_dim": z_supra.shape[-1], "fused_dim": z_unified.shape[-1],
+            "gate_weights_this_dummy_batch": gates.mean(dim=0).tolist(),
+        },
+    }
+
+    if owns_model:
+        del model
+    return audit
+
+
+def print_feature_audit(model=None, num_classes: int = 4) -> Dict:
+    """Print the brief's FEATURE AUDIT block (Section 13) and return the same
+    dict feature_audit() computes."""
+    audit = feature_audit(model=model, num_classes=num_classes)
+    print("\n========== FEATURE AUDIT ==========\n")
+    print("LEARNED BRANCH")
+    print(f"Raw hidden representation: [B, T, {config.WAV2VEC_EMBED_DIM}]")
+    print(f"Projected representation: {audit['learned_branch']['projected_shape']}")
+    print(f"Learned representation dimensions: {audit['learned_branch']['dimensions']}\n")
+
+    print("SEGMENTAL BRANCH")
+    print(f"Input feature channels: {audit['segmental_branch']['input_channels']}")
+    print(f"Input tensor: {audit['segmental_branch']['input_shape']}")
+    print(f"Projected representation: {audit['segmental_branch']['projected_shape']}")
+    print(f"Segmental representation dimensions: {audit['segmental_branch']['dimensions']}")
+    print("Segmental features (SHAP-surrogate table):")
+    for i, name in enumerate(audit["segmental_branch"]["shap_surrogate_feature_names"], start=1):
+        print(f"  {i}. {name}")
+    print()
+
+    print("SUPRASEGMENTAL BRANCH")
+    print(f"Input feature channels: {audit['suprasegmental_branch']['input_channels']}")
+    print(f"Input tensor: {audit['suprasegmental_branch']['input_shape']}")
+    print(f"Projected representation: {audit['suprasegmental_branch']['projected_shape']}")
+    print(f"Suprasegmental representation dimensions: {audit['suprasegmental_branch']['dimensions']}")
+    print("Suprasegmental features (SHAP-surrogate table):")
+    for i, name in enumerate(audit["suprasegmental_branch"]["shap_surrogate_feature_names"], start=1):
+        print(f"  {i}. {name}")
+    print()
+
+    fusion = audit["fusion"]
+    print("FUSION")
+    print(f"Learned: {fusion['learned_dim']}")
+    print(f"Segmental: {fusion['segmental_dim']}")
+    print(f"Suprasegmental: {fusion['supra_dim']}")
+    print(f"Total fused representation: {fusion['fused_dim']}")
+    print("\n====================================\n")
+    return audit
+
+
+def _git_commit_hash() -> Optional[str]:
+    """Best-effort `git rev-parse HEAD` for reproducibility (brief Section
+    43) — never raises; returns None if git isn't available, this isn't a
+    repo, or anything else goes wrong. Not load-bearing for training itself,
+    only for the frozen-config provenance record."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=config.PROJECT_ROOT,
+            capture_output=True, text=True, timeout=5)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _software_versions() -> Dict[str, Optional[str]]:
+    """Package/runtime versions actually installed in THIS process — read
+    from the imported modules themselves, not requirements.txt, so this
+    reflects what the run actually executed with. Any single missing
+    package degrades to None rather than aborting the whole block."""
+    import platform
+
+    versions: Dict[str, Optional[str]] = {"python": platform.python_version()}
+    for module_name in ("torch", "torchaudio", "transformers", "peft", "numpy", "pandas"):
+        try:
+            module = __import__(module_name)
+            versions[module_name] = getattr(module, "__version__", None)
+        except Exception:
+            versions[module_name] = None
+    try:
+        import torch
+        versions["cuda"] = torch.version.cuda if torch.cuda.is_available() else None
+    except Exception:
+        versions["cuda"] = None
+    return versions
+
+
+def build_final_run_configuration(cfg, df: pd.DataFrame, num_speakers_total: int) -> Dict:
+    """
+    Everything the brief's Section 23 "FINAL RUN CONFIGURATION" block needs,
+    read from `cfg` (a src.training.runner.TrainingConfig) and `df` (the
+    manifest) — never hardcoded. Call ONCE, before the real training run,
+    and pass the result to write_frozen_config() to freeze it.
+    """
+    from src import splits as splits_module
+
+    audit = feature_audit(num_classes=config.NUM_CLASSES[cfg.task])
+    fold_speakers = (config.DYSARTHRIC_IDS if cfg.severity_protocol == "full_loso"
+                     else sorted(set(config.DYSARTHRIC_IDS) - set(config.DROPPED_FOR_BALANCE)))
+
+    return {
+        "dataset": {
+            "speakers_total": num_speakers_total,
+            "severity_classes": config.SEVERITY_CLASS_NAMES,
+            "severity_protocol": cfg.severity_protocol,
+            "fold_speakers": fold_speakers,
+            "num_folds": len(fold_speakers) if cfg.severity_protocol == "full_loso" else 81,
+        },
+        "audio": {
+            "sampling_rate": config.TARGET_SR,
+            "clip_seconds": config.CLIP_SECONDS,
+            "max_samples": config.MAX_SAMPLES,
+            "speech_focused_vad_pad_ms": config.VAD_SPEECH_PAD_MS,
+            "temporal_preserving_vad_pad_ms": config.SUPRA_VAD_SPEECH_PAD_MS,
+        },
+        "learned_branch": audit["learned_branch"],
+        "segmental_branch": {k: v for k, v in audit["segmental_branch"].items()
+                             if k != "shap_surrogate_feature_names"},
+        "suprasegmental_branch": {k: v for k, v in audit["suprasegmental_branch"].items()
+                                  if k != "shap_surrogate_feature_names"},
+        "complementarity": {"method": "batch cross-covariance (Barlow-Twins-style, mean-normalized)",
+                            "lambda": config.LAMBDA_COMP},
+        "speaker_invariance": {"method": "gradient-reversal adversarial speaker head",
+                               "lambda": config.LAMBDA_SPEAKER,
+                               "grl_lambda": config.GRL_LAMBDA},
+        "fusion": {"method": "learned softmax gate over 3 branch embeddings",
+                  "fused_dim": audit["fusion"]["fused_dim"]},
+        "severity_head": {"method": "CORAL ordinal regression",
+                          "loss": "class-weighted CORAL binary cross-entropy sum"},
+        "optimizer": {"type": "AdamW", "lr_head": cfg.lr_head, "lr_backbone": cfg.lr_backbone,
+                     "weight_decay": cfg.weight_decay, "batch_size": cfg.batch_size,
+                     "epochs": cfg.epochs, "patience": cfg.patience,
+                     "grad_clip_norm": cfg.grad_clip, "seed": cfg.seed},
+        "run_name": cfg.run_name,
+        "model": cfg.model,
+        "task": cfg.task,
+        "provenance": {
+            "git_commit": _git_commit_hash(),
+            "software_versions": _software_versions(),
+        },
+    }
+
+
+def print_final_run_configuration(cfg, df: pd.DataFrame) -> Dict:
+    """Print the brief's Section 23 FINAL RUN CONFIGURATION block. Call
+    once, immediately before the real training run — everything printed is
+    also what write_frozen_config() persists."""
+    num_speakers_total = int(df["Speaker_ID"].nunique()) if "Speaker_ID" in df.columns else 0
+    final_config = build_final_run_configuration(cfg, df, num_speakers_total)
+
+    print("\n========== FINAL RUN CONFIGURATION ==========\n")
+    print(f"Run name: {final_config['run_name']}")
+    print(f"Model: {final_config['model']}")
+    print(f"Task: {final_config['task']}\n")
+
+    prov = final_config["provenance"]
+    print(f"Git commit: {prov['git_commit'] or 'unavailable'}")
+    print(f"Software versions: {prov['software_versions']}\n")
+
+    d = final_config["dataset"]
+    print(f"Speakers (total in manifest): {d['speakers_total']}")
+    print(f"Severity classes: {d['severity_classes']}")
+    print(f"Severity protocol: {d['severity_protocol']}")
+    print(f"Fold speakers ({len(d['fold_speakers'])}): {d['fold_speakers']}")
+    print(f"Number of folds: {d['num_folds']}\n")
+
+    a = final_config["audio"]
+    print(f"Sampling rate: {a['sampling_rate']}")
+    print(f"Clip duration handling: {a['clip_seconds']}s fixed window "
+         f"({a['max_samples']} samples)")
+    print(f"Speech-focused VAD pad: {a['speech_focused_vad_pad_ms']}ms")
+    print(f"Temporal-preserving VAD pad: {a['temporal_preserving_vad_pad_ms']}ms\n")
+
+    lb = final_config["learned_branch"]
+    print("Learned:")
+    print(f"  Model: {lb['wav2vec2_model']}")
+    print(f"  LoRA: rank={lb['lora_rank']}, alpha={lb['lora_alpha']}, "
+         f"dropout={lb['lora_dropout']}, targets={lb['lora_target_modules']}")
+    print(f"  Projection dimensions: {lb['dimensions']}\n")
+
+    sb = final_config["segmental_branch"]
+    print("Segmental:")
+    print(f"  Feature channel count: {sb['input_channels']}")
+    print(f"  Feature families: {sb['engineered_feature_families']}")
+    print(f"  Projection dimensions: {sb['dimensions']}\n")
+
+    pb = final_config["suprasegmental_branch"]
+    print("Suprasegmental:")
+    print(f"  Feature channel count: {pb['input_channels']}")
+    print(f"  Feature families: {pb['engineered_feature_families']}")
+    print(f"  Projection dimensions: {pb['dimensions']}\n")
+
+    c = final_config["complementarity"]
+    print(f"Complementarity: method={c['method']}, lambda={c['lambda']}\n")
+    s = final_config["speaker_invariance"]
+    print(f"Speaker invariance: method={s['method']}, lambda={s['lambda']}, "
+         f"grl_lambda={s['grl_lambda']}\n")
+    f = final_config["fusion"]
+    print(f"Fusion: method={f['method']}, fused_dim={f['fused_dim']}\n")
+    sh = final_config["severity_head"]
+    print(f"Severity: head={sh['method']}, loss={sh['loss']}\n")
+
+    o = final_config["optimizer"]
+    print(f"Optimizer: {o['type']}")
+    print(f"Learning rate (head / backbone): {o['lr_head']} / {o['lr_backbone']}")
+    print(f"Weight decay: {o['weight_decay']}")
+    print(f"Batch size: {o['batch_size']}")
+    print(f"Epochs (max, early-stopping patience {o['patience']}): {o['epochs']}")
+    print(f"Gradient clip norm: {o['grad_clip_norm']}")
+    print(f"Seed: {o['seed']}")
+    print("\n=============================================\n")
+
+    return final_config
+
+
+def _config_hash(final_config: Dict) -> str:
+    """Stable hash of a FINAL RUN CONFIGURATION dict — used only to detect
+    "this run_name was already frozen with a DIFFERENT configuration", not
+    for anything security-sensitive."""
+    payload = json.dumps(final_config, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def write_frozen_config(final_config: Dict, path: Optional[Path] = None) -> Path:
+    """
+    Persist the FINAL RUN CONFIGURATION, with its hash, to
+    outputs/results/frozen_config.json — call once, after
+    print_final_run_configuration() and before the real training run.
+    Architecture plan Part 4, step 4 / brief Section 23's "freeze the
+    configuration" instruction.
+    """
+    path = Path(path or FROZEN_CONFIG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"config": final_config, "config_hash": _config_hash(final_config),
+              "frozen_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+    return path
+
+
+def check_frozen_config_guard(final_config: Dict, path: Optional[Path] = None) -> None:
+    """
+    Minimal code-level backstop for the one-shot-training rule (brief
+    Section 23/25): if a frozen_config.json already exists for this
+    run_name's configuration and its hash does NOT match `final_config`,
+    raise — refusing to silently retrain a FINAL-tier run under an unchanged
+    run_name with different hyperparameters. A no-op if no frozen config has
+    been written yet (the normal case, before the one real run) or if the
+    hash matches exactly (a legitimate resume of the SAME configuration).
+
+    This is deliberately narrow: it protects against the specific failure
+    mode of quietly re-running the one-shot experiment with a tweaked
+    config under the same name, not a general hyperparameter-search guard —
+    see the architecture plan's Part 2, Component 16 for why a heavier
+    mechanism was judged unnecessary on top of the existing experiment
+    registry (src.results / tests/test_experiment_validity.py).
+    """
+    path = Path(path or FROZEN_CONFIG_PATH)
+    if not path.exists():
+        return
+    with open(path) as f:
+        frozen = json.load(f)
+    if frozen.get("config", {}).get("run_name") != final_config.get("run_name"):
+        return
+    if frozen.get("config_hash") != _config_hash(final_config):
+        raise RuntimeError(
+            f"A frozen configuration already exists at {path} for run_name "
+            f"'{final_config.get('run_name')}' with a DIFFERENT configuration "
+            "hash. The one-shot training rule forbids re-running this "
+            "experiment under the same name with changed hyperparameters — "
+            "use a new run_name if this is a deliberate, separate run, or "
+            "delete the frozen config file if the earlier freeze was itself "
+            "a mistake made before any real training happened.")
