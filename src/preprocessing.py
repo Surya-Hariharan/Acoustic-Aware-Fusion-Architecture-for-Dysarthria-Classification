@@ -358,3 +358,137 @@ def extract_suprasegmental_features_cached(filepath: str) -> torch.Tensor:
     return torch.from_numpy(
         np.stack([sequences["f0_semitones"], sequences["voicing"],
                  sequences["intensity_db"]], axis=0))
+
+
+# ---------------------------------------------------------------------------
+# Fold-scoped channel-wise standardization for the three-branch model's
+# framewise inputs (Segmental 43ch, Suprasegmental 3ch) — mirrors
+# src.praat.praat_standardizer/praat_vector's leakage discipline exactly:
+# statistics are computed from a fold's TRAIN split filepaths only, then
+# applied unchanged to that fold's val/test items, so the held-out LOSO
+# speaker never contributes to its own normalization.
+#
+# Raw per-file features stay in extract_segmental_features_cached /
+# extract_suprasegmental_features_cached above (fold-agnostic, cached once
+# and reused by every fold); only the mean/std statistics differ per fold,
+# so normalization is applied separately, at __getitem__ time (see
+# src.dataset.UASpeechDataset), not baked into the cache.
+#
+# Statistics are computed over VALID (non-padded) frames only — the
+# fixed 401-frame window is ~85% zero-padding on the median utterance (see
+# notebooks/01_data_pipeline.ipynb Stage 9), and letting that padding
+# dominate the mean/std would both mis-center every real value and hide
+# the real cross-channel scale difference (MFCC ~O(10), formant Hz ~O(1e3),
+# HNR/intensity dB ~O(10)) that motivates normalizing at all.
+# ---------------------------------------------------------------------------
+
+def _channel_mean_std(sum_, sum_sq, count) -> Tuple[np.ndarray, np.ndarray]:
+    """Shared mean/std-from-accumulators finish-up, with the same
+    constant-feature and non-finite guards as src.praat.praat_standardizer."""
+    if count == 0:
+        n = sum_.shape[0]
+        return np.zeros(n, dtype=np.float32), np.ones(n, dtype=np.float32)
+    mean = (sum_ / count)
+    var = np.clip(sum_sq / count - mean ** 2, 0.0, None)
+    std = np.sqrt(var).astype(np.float32)
+    mean = mean.astype(np.float32)
+    std[~np.isfinite(std) | (std == 0)] = 1.0
+    mean[~np.isfinite(mean)] = 0.0
+    return mean, std
+
+
+def segmental_standardizer(filepaths) -> Tuple[np.ndarray, np.ndarray]:
+    """Channel-wise (43,) mean/std of extract_segmental_features_cached's
+    output, accumulated over only the VALID (speech-focused-profile,
+    pre-padding) frames of the given filepaths — pass a fold's TRAIN split
+    filepaths only (see src.training.data.build_loaders), the same
+    leakage-safe convention as praat_standardizer(table, filenames)."""
+    n = config.SEGMENTAL_CHANNELS
+    sum_ = np.zeros(n, dtype=np.float64)
+    sum_sq = np.zeros(n, dtype=np.float64)
+    count = 0
+    for filepath in filepaths:
+        features = extract_segmental_features_cached(filepath).numpy()   # (43, T)
+        _, valid_length = load_and_preprocess_cached(filepath)
+        valid_frames = min(mfcc_frame_count(valid_length), features.shape[-1])
+        if valid_frames <= 0:
+            continue
+        valid = features[:, :valid_frames].astype(np.float64)
+        sum_ += valid.sum(axis=1)
+        sum_sq += (valid ** 2).sum(axis=1)
+        count += valid_frames
+    return _channel_mean_std(sum_, sum_sq, count)
+
+
+def normalize_segmental(features: torch.Tensor, valid_frames: int,
+                        stats: Tuple[np.ndarray, np.ndarray]) -> torch.Tensor:
+    """Apply segmental_standardizer's (mean, std) channel-wise to one
+    (43, T) tensor: (x - mean) / std over every frame, then the padded tail
+    (frames >= valid_frames) is forced back to exact zero — matching
+    extract_mfcc_features's own valid-then-repad convention (see its
+    docstring: "only the explicit pad step ... introduces zeros") rather
+    than reintroducing a nonzero value into frames every downstream
+    masked-pool already excludes."""
+    mean, std = stats
+    mean_t = torch.as_tensor(mean, dtype=features.dtype).unsqueeze(-1)
+    std_t = torch.as_tensor(std, dtype=features.dtype).unsqueeze(-1)
+    normalized = (features - mean_t) / std_t
+    if 0 <= valid_frames < normalized.shape[-1]:
+        normalized[:, valid_frames:] = 0.0
+    return normalized
+
+
+# Suprasegmental channel order, matching extract_suprasegmental_sequence's
+# returned dict order (f0_semitones, voicing, intensity_db) and the (3, T)
+# stacking above — kept as named indices rather than magic numbers so the
+# "skip the voicing channel" logic below is self-explanatory.
+SUPRA_F0_CHANNEL, SUPRA_VOICING_CHANNEL, SUPRA_INTENSITY_CHANNEL = 0, 1, 2
+SUPRA_CONTINUOUS_CHANNELS = (SUPRA_F0_CHANNEL, SUPRA_INTENSITY_CHANNEL)
+
+
+def suprasegmental_standardizer(filepaths) -> Tuple[np.ndarray, np.ndarray]:
+    """Channel-wise (2,) mean/std for the CONTINUOUS suprasegmental channels
+    only — f0_semitones and intensity_db — accumulated over VALID
+    (temporal-preserving-profile) frames of the given filepaths. The binary
+    voicing channel is deliberately excluded: it is already a well-scaled
+    {0, 1} indicator, and standardizing it would destroy the "1 = real pitch
+    estimate, 0 = unvoiced/invalid" semantics src.praat.praat.py's module
+    docstring and src/vad.py's masking discipline both depend on."""
+    n = len(SUPRA_CONTINUOUS_CHANNELS)
+    sum_ = np.zeros(n, dtype=np.float64)
+    sum_sq = np.zeros(n, dtype=np.float64)
+    count = 0
+    for filepath in filepaths:
+        features = extract_suprasegmental_features_cached(filepath).numpy()   # (3, T)
+        _, valid_length = load_and_preprocess_supra_cached(filepath)
+        valid_frames = min(mfcc_frame_count(valid_length), features.shape[-1])
+        if valid_frames <= 0:
+            continue
+        valid = features[np.ix_(SUPRA_CONTINUOUS_CHANNELS, range(valid_frames))].astype(np.float64)
+        sum_ += valid.sum(axis=1)
+        sum_sq += (valid ** 2).sum(axis=1)
+        count += valid_frames
+    return _channel_mean_std(sum_, sum_sq, count)
+
+
+def normalize_suprasegmental(features: torch.Tensor, valid_frames: int,
+                             stats: Tuple[np.ndarray, np.ndarray]) -> torch.Tensor:
+    """Apply suprasegmental_standardizer's (mean, std) to ONLY the
+    f0_semitones and intensity_db channels of one (3, T) tensor; the
+    voicing channel (index SUPRA_VOICING_CHANNEL) passes through
+    untouched, preserving its {0, 1} meaning. The padded tail of the
+    normalized channels is forced back to exact zero, same convention as
+    normalize_segmental (voicing's own padded tail is already 0 by
+    construction — see extract_suprasegmental_sequence — so it needs no
+    extra handling here)."""
+    mean, std = stats
+    normalized = features.clone()
+    continuous = features[list(SUPRA_CONTINUOUS_CHANNELS), :]
+    mean_t = torch.as_tensor(mean, dtype=features.dtype).unsqueeze(-1)
+    std_t = torch.as_tensor(std, dtype=features.dtype).unsqueeze(-1)
+    normalized_continuous = (continuous - mean_t) / std_t
+    if 0 <= valid_frames < normalized_continuous.shape[-1]:
+        normalized_continuous[:, valid_frames:] = 0.0
+    for i, channel in enumerate(SUPRA_CONTINUOUS_CHANNELS):
+        normalized[channel] = normalized_continuous[i]
+    return normalized

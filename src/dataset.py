@@ -19,7 +19,8 @@ from src.preprocessing import (extract_mfcc_features_cached,
                                extract_segmental_features_cached,
                                extract_suprasegmental_features_cached,
                                load_and_preprocess_cached,
-                               load_and_preprocess_supra_cached, mfcc_frame_count)
+                               load_and_preprocess_supra_cached, mfcc_frame_count,
+                               normalize_segmental, normalize_suprasegmental)
 
 
 class UASpeechDataset(Dataset):
@@ -38,7 +39,9 @@ class UASpeechDataset(Dataset):
                  frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None,
                  include_mfcc: bool = True,
                  include_three_branch: bool = False,
-                 speaker_label_map: Optional[Dict[str, int]] = None):
+                 speaker_label_map: Optional[Dict[str, int]] = None,
+                 segmental_stats: Optional[Tuple] = None,
+                 supra_stats: Optional[Tuple] = None):
         self.df = dataframe.reset_index(drop=True)
 
         # Three-branch severity architecture only (src.models.gated_fusion) —
@@ -47,6 +50,16 @@ class UASpeechDataset(Dataset):
         # False for every legacy model (default), which never reads these
         # keys, matching include_mfcc's "absent key, no cost" convention.
         self.include_three_branch = include_three_branch
+
+        # (mean, std) from src.preprocessing.segmental_standardizer /
+        # suprasegmental_standardizer, computed by src.training.data.build_loaders
+        # from ONE FOLD'S TRAIN SPLIT ONLY and reused unchanged for that fold's
+        # val/test Datasets — the same leakage discipline as praat_stats above.
+        # None (default) leaves segmental/supra raw/unnormalized, e.g. for any
+        # caller that builds a Dataset outside the fold machinery (notebooks,
+        # tests) without first computing fold statistics.
+        self.segmental_stats = segmental_stats
+        self.supra_stats = supra_stats
 
         # Filename-keyed int speaker id for the GRL speaker head (see
         # src.models.gated_fusion.SpeakerHead) — built per-fold from that
@@ -135,12 +148,30 @@ class UASpeechDataset(Dataset):
                 self.frozen_embedding_table[row["Filepath"]]).float()
 
         if self.include_three_branch:
-            item["segmental"] = extract_segmental_features_cached(row["Filepath"])  # (43, T)
-            item["supra"] = extract_suprasegmental_features_cached(row["Filepath"])  # (3, T)
+            segmental = extract_segmental_features_cached(row["Filepath"])  # (43, T)
+            supra = extract_suprasegmental_features_cached(row["Filepath"])  # (3, T)
+
+            # Segmental shares the speech-focused profile with MFCC, so its
+            # valid-frame count is the same waveform_length already computed
+            # above (not a second source of truth — mirrors mfcc_valid_frames).
+            segmental_valid_frames = min(mfcc_frame_count(waveform_length), segmental.shape[-1])
 
             _, supra_valid_length = load_and_preprocess_supra_cached(row["Filepath"])
             supra_valid_frames = min(mfcc_frame_count(supra_valid_length),
-                                     item["supra"].shape[-1])
+                                     supra.shape[-1])
+
+            # Fold-scoped, leakage-safe channel normalization (see
+            # src.preprocessing.segmental_standardizer / suprasegmental_standardizer
+            # and src.training.data.build_loaders, which computes these stats from
+            # ONE FOLD'S TRAIN SPLIT ONLY). None (e.g. a Dataset built without
+            # fold statistics) leaves the raw extracted values unchanged.
+            if self.segmental_stats is not None:
+                segmental = normalize_segmental(segmental, segmental_valid_frames, self.segmental_stats)
+            if self.supra_stats is not None:
+                supra = normalize_suprasegmental(supra, supra_valid_frames, self.supra_stats)
+
+            item["segmental"] = segmental
+            item["supra"] = supra
             item["supra_valid_frames"] = torch.tensor(supra_valid_frames, dtype=torch.long)
 
         if self.speaker_label_map is not None:

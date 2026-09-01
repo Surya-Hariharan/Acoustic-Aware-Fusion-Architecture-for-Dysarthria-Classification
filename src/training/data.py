@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from src import config
 from src.dataset import UASpeechDataset
 from src.praat import praat_standardizer
+from src.preprocessing import segmental_standardizer, suprasegmental_standardizer
 from src.scanning import (add_severity_labels, check_word_counts,
                           filter_mic_channel, scan_audio_files,
                           validate_wav_headers)
@@ -140,6 +141,13 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     carves val out of the train portion), but the held-out TEST speaker is
     never a key in this map by construction (that is the whole point of a
     LOSO fold), so the test Dataset must never look it up.
+
+    For MODELS_WITH_THREE_BRANCH, segmental/suprasegmental channel
+    normalization statistics (src.preprocessing.segmental_standardizer /
+    suprasegmental_standardizer) are likewise computed from train_df's
+    filepaths only and reused unchanged for val/test — the identical
+    leakage discipline as praat_stats above, applied to the two framewise
+    branches instead of the utterance-level Praat table.
     """
     praat_stats = None
     if praat_table is not None:
@@ -151,12 +159,24 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     include_mfcc = model_name not in MODELS_WITHOUT_MFCC
     include_three_branch = model_name in MODELS_WITH_THREE_BRANCH
 
+    # Channel-wise normalization statistics for the Segmental/Suprasegmental
+    # branches, computed from THIS FOLD'S TRAIN SPLIT FILEPATHS ONLY (never
+    # val/test) — the same leakage discipline as praat_stats above. Reused
+    # unchanged for this fold's val and test Datasets, so the held-out LOSO
+    # speaker's utterances never influence their own normalization.
+    segmental_stats = None
+    supra_stats = None
+    if include_three_branch:
+        segmental_stats = segmental_standardizer(train_df["Filepath"])
+        supra_stats = suprasegmental_standardizer(train_df["Filepath"])
+
     def dataset(df: pd.DataFrame, with_speaker_labels: bool = False) -> UASpeechDataset:
         return UASpeechDataset(
             df, praat_table=praat_table, praat_stats=praat_stats,
             frozen_embedding_table=frozen_embedding_table, include_mfcc=include_mfcc,
             include_three_branch=include_three_branch,
-            speaker_label_map=(speaker_label_map if with_speaker_labels else None))
+            speaker_label_map=(speaker_label_map if with_speaker_labels else None),
+            segmental_stats=segmental_stats, supra_stats=supra_stats)
 
     # __getitem__ does real CPU work per utterance (torchaudio.load, resample,
     # VAD trim, MFCC + deltas) - with num_workers=0 that runs synchronously in

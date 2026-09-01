@@ -127,6 +127,15 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
                                   if "supra_valid_frames" in batch else None)
             speaker_index = (batch["speaker_index"].to(device, non_blocking=True)
                              if "speaker_index" in batch else None)
+            # The full 43-channel MFCC+formant+HNR tensor (see
+            # src.dataset.UASpeechDataset's include_three_branch / config.
+            # SEGMENTAL_CHANNELS), present only for MODELS_WITH_THREE_BRANCH.
+            # GatedFusionModel.SegmentalPathway is built for exactly this
+            # 43-channel input — it must NOT receive the legacy 39-channel
+            # `mfcc` tensor above (that one still feeds AcousticPathway for
+            # every other model, unchanged).
+            segmental = batch["segmental"].to(device, non_blocking=True) if "segmental" in batch else None
+            segmental_pathway_input = segmental if segmental is not None else mfcc
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 step_extras: Dict[str, float] = {}
@@ -142,7 +151,7 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
                     # run_fold, which builds it identically for every model).
                     class_weights = getattr(criterion, "weight", None)
                     logits, loss, step_extras = model.training_step(
-                        waveform=waveform, mfcc=mfcc, supra=supra,
+                        waveform=waveform, mfcc=segmental_pathway_input, supra=supra,
                         attention_mask=attention_mask, labels=labels,
                         supra_valid_frames=supra_valid_frames,
                         speaker_index=speaker_index, class_weights=class_weights)
@@ -157,7 +166,7 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
                         # cost, not a per-epoch one.
                         if hasattr(model, "encode_branches") and hasattr(model, "fuse"):
                             z_learned, z_segmental, z_supra = model.encode_branches(
-                                waveform, mfcc, supra, attention_mask, supra_valid_frames)
+                                waveform, segmental_pathway_input, supra, attention_mask, supra_valid_frames)
                             features, gates_batch = model.fuse(z_learned, z_segmental, z_supra)
                             branch_embeddings_batch = {
                                 "learned": z_learned, "segmental": z_segmental, "supra": z_supra}
