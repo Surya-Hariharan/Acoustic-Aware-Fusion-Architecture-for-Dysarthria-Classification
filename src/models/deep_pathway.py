@@ -35,11 +35,24 @@ class DeepPathway(nn.Module):
     use_lora=False loads the plain backbone with every parameter frozen —
                    reproduces the base paper's frozen wav2vec 2.0 feature
                    extractor, used as an ablation baseline.
+    normalize_input=False (default) feeds the waveform to wav2vec2 exactly
+                   as src.preprocessing hands it over (unchanged behavior
+                   for every existing caller — the legacy fusion/concat/
+                   attention models in src/training/models.py and the
+                   frozen-embedding baseline in src/training/baseline.py).
+    normalize_input=True applies the checkpoint-compatible zero-mean/unit-
+                   variance normalization facebook/wav2vec2-base-960h's own
+                   Wav2Vec2FeatureExtractor performs (do_normalize=True) —
+                   per utterance, over that utterance's own valid samples
+                   only, so it carries no cross-utterance/fold statistics
+                   and cannot leak held-out-speaker information. Used by
+                   src.models.gated_fusion.GatedFusionModel only.
     """
 
-    def __init__(self, use_lora: bool = True):
+    def __init__(self, use_lora: bool = True, normalize_input: bool = False):
         super().__init__()
         self.use_lora = use_lora
+        self.normalize_input = normalize_input
         backbone_config = Wav2Vec2Config.from_pretrained(
             config.WAV2VEC_MODEL_NAME, token=config.HF_TOKEN)
         if not config.WAV2VEC_APPLY_SPEC_AUGMENT:
@@ -125,7 +138,47 @@ class DeepPathway(nn.Module):
         Returns:
             (batch, frames, 768) — ~199 frames for a 4-second clip.
         """
+        if self.normalize_input:
+            waveform = self._zero_mean_unit_var_norm(waveform, attention_mask)
         return self.wav2vec(waveform, attention_mask=attention_mask).last_hidden_state
+
+    @staticmethod
+    def _zero_mean_unit_var_norm(waveform: torch.Tensor,
+                                 attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        Per-utterance zero-mean/unit-variance waveform normalization, exactly
+        matching transformers.Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm
+        (the preprocessing facebook/wav2vec2-base-960h's own feature extractor
+        applies, do_normalize=True — verified against the live HF checkpoint
+        config). Statistics are computed from EACH utterance's own valid
+        (pre-padding) samples only: this is per-example, not a fold-level or
+        dataset-level statistic, so it carries no cross-utterance information
+        and cannot leak a held-out speaker's distribution into anything.
+
+        attention_mask (batch, samples), True/1 = real audio: when given, the
+        padded tail of the normalized waveform is forced back to exact zero
+        (matching HF's own convention) rather than left as an arbitrary
+        normalized padding value. None (single known-unpadded utterance)
+        normalizes over the whole tensor.
+        """
+        if attention_mask is None:
+            mean = waveform.mean(dim=-1, keepdim=True)
+            var = waveform.var(dim=-1, unbiased=False, keepdim=True)
+            return (waveform - mean) / torch.sqrt(var + 1e-7)
+
+        lengths = attention_mask.sum(dim=1)
+        normalized = waveform.clone()
+        for i in range(waveform.shape[0]):
+            length = int(lengths[i].item())
+            if length <= 0:
+                continue
+            valid = waveform[i, :length]
+            mean = valid.mean()
+            var = valid.var(unbiased=False)
+            normalized[i, :length] = (valid - mean) / torch.sqrt(var + 1e-7)
+            if length < waveform.shape[1]:
+                normalized[i, length:] = 0.0
+        return normalized
 
     def sequence_key_padding_mask(self, waveform: torch.Tensor,
                                   attention_mask: torch.Tensor) -> torch.Tensor:

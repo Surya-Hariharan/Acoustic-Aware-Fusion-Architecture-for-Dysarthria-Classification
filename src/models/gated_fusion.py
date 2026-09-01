@@ -125,7 +125,15 @@ class GatedFusionModel(nn.Module):
         super().__init__()
         self.num_classes = num_classes
 
-        self.deep_pathway = DeepPathway(use_lora=use_lora)
+        # normalize_input=True: this branch alone gets the checkpoint-
+        # compatible zero-mean/unit-variance waveform normalization
+        # facebook/wav2vec2-base-960h's own feature extractor expects (see
+        # DeepPathway's docstring) — per-utterance, so it introduces no
+        # cross-fold statistics and cannot leak. Every other DeepPathway
+        # consumer (src/training/models.py's legacy fusion models,
+        # src/training/baseline.py's frozen-embedding sweep) keeps
+        # normalize_input's default False, unchanged.
+        self.deep_pathway = DeepPathway(use_lora=use_lora, normalize_input=True)
         self.learned_projection = nn.Sequential(
             nn.Linear(config.WAV2VEC_EMBED_DIM, config.LEARNED_EMBED_DIM),
             nn.LayerNorm(config.LEARNED_EMBED_DIM),
