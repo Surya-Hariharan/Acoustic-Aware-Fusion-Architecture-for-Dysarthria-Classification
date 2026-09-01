@@ -2,10 +2,10 @@
 #   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 # then this file (plain PyPI has CPU-only wheels under these bare version numbers).
 #
-# Silero VAD (src/vad.py) loads via torch.hub.load("snakers4/silero-vad", ...) — no
-# extra pinned package needed beyond torch itself, but the FIRST run on a machine
-# needs internet access to download and cache the JIT model (~2MB, cached under
-# torch.hub's default cache dir afterward; every later run is fully offline).
+# Silero VAD (src/vad.py) loads via torch.hub.load("snakers4/silero-vad:v6.2.1", ...)
+# — no extra pinned package needed beyond torch itself, but the FIRST run on a
+# machine needs internet access to download and cache the JIT model (~2MB, cached
+# under torch.hub's default cache dir afterward; every later run is fully offline).
 torch==2.5.1
 torchaudio==2.5.1
 soundfile==0.14.0

@@ -21,10 +21,10 @@ is deterministic given fixed weights). apply_vad() below:
     with fallback_used=True recorded in the returned stats.
 
 Reproducibility note: torch.hub.load("snakers4/silero-vad", ...) resolves the
-repo's default branch unless pinned to a tag (e.g. "snakers4/silero-vad:v5.1.2").
-VAD_REPO below is unpinned for now (this project's local torch.hub cache makes
-repeat runs on one machine consistent regardless); pin it here if bit-for-bit
-reproducibility across machines/dates is required.
+repo's default branch unless pinned to a tag. VAD_REPO is pinned to the
+"v6.2.1" release tag (github.com/snakers4/silero-vad/releases/tag/v6.2.1) so
+that repeat runs across machines/dates resolve the same model code rather
+than silently tracking upstream's moving default branch.
 """
 
 import warnings
@@ -35,7 +35,7 @@ import torch
 from src import config
 from src.console import print_status
 
-VAD_REPO = "snakers4/silero-vad"
+VAD_REPO = "snakers4/silero-vad:v6.2.1"
 
 _MODEL = None
 _UTILS = None
