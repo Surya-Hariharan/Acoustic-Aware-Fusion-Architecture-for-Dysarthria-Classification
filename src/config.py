@@ -301,6 +301,16 @@ GRL_LAMBDA     = 1.0     # gradient-reversal strength inside the GRL layer itsel
 # ---------------------------------------------------------------------------
 # Training (train.py)
 # ---------------------------------------------------------------------------
+
+# Hard wall-clock ceiling for the primary severity one-shot run on the
+# target machine (RTX 4060 laptop, 8GB) — not a second more. Enforced via
+# src.training.budget.ExperimentBudgetManager.deadline_for(), threaded into
+# run_training(..., deadline=...) in notebooks/03_training.ipynb's MODE=
+# "FINAL" cell. A single named constant so every place that needs to know
+# the cap (the budget manager, any reporting that quotes it) reads the same
+# number rather than each hardcoding "10.0" independently.
+PRIMARY_SEVERITY_BUDGET_HOURS = 10.0
+
 NUM_CLASSES = {"detection": 2, "severity": 4}
 
 # The manifest carries text labels; these are the fixed class orderings used
@@ -308,19 +318,39 @@ NUM_CLASSES = {"detection": 2, "severity": 4}
 DETECTION_CLASS_NAMES = ["Healthy Control", "Dysarthric Patient"]
 SEVERITY_CLASS_NAMES  = ["Very Low", "Low", "Mid", "High"]
 
-DEFAULT_EPOCHS        = 20
+# Epoch ceiling early stopping should trigger well before, not a target to
+# reach — set from the primary severity run's compute budget (RTX 4060
+# laptop, 8GB, hard 10h cap for the 15-fold LOSO run — see
+# src.training.budget.ExperimentBudgetManager and notebooks/03_training.ipynb's
+# COMPUTE BUDGET stage) together with DEFAULT_PATIENCE below, not
+# independently. 20 -> 15: still generous headroom over what early stopping
+# on validation loss is expected to need on a 14-speaker training set per
+# fold; lower only trims the unused tail, it does not change what the model
+# learns before convergence.
+DEFAULT_EPOCHS        = 15
 # 32, not 16: AMP is already on for every CUDA run (src/training/runner.py),
 # and LoRA fine-tuning only backpropagates through a few hundred-K adapter
 # params, not the frozen backbone — a smaller batch was leaving GPU
 # throughput unused without buying any regularization benefit worth the
 # slower 28/81-fold sweep. wav2vec2-base at CLIP_SECONDS=4.0 with AMP fits
 # batch 32 comfortably on an 8 GB card (RTX 4060 and similar); drop to 16,
-# then 8, if a fold OOMs on a smaller GPU.
+# then 8, if a fold OOMs on a smaller GPU. Re-measure with
+# src.training.budget.benchmark_batch_sizes on the actual machine before
+# trusting this as more than a starting point — it has not been verified
+# against a live GPU in this checkout.
 DEFAULT_BATCH_SIZE    = 32
 DEFAULT_LR_HEAD       = 1e-3     # classifier head / acoustic pathway / LoRA adapters
 DEFAULT_LR_BACKBONE   = 1e-4     # wav2vec 2.0 backbone (only when fine-tuned)
 DEFAULT_WEIGHT_DECAY  = 1e-2
-DEFAULT_PATIENCE      = 5        # early stopping, in epochs without improvement
+# 5 -> 3: early stopping on validation loss is this architecture's primary
+# anti-overfitting gate (ties directly to "purely learnt, not overfitting"
+# taking priority over training accuracy) — a tighter patience stops compute
+# being spent past convergence on a 14-speaker per-fold training set, which
+# helps generalization, not just wall-clock cost. If a real run's fold-1
+# validation loss is still clearly decreasing when patience fires, loosen to
+# 4 for the remaining folds rather than trust this a priori number blindly
+# (see notebooks/03_training.ipynb's COMPUTE BUDGET, STEP 2 cell).
+DEFAULT_PATIENCE      = 3        # early stopping, in epochs without improvement
 DEFAULT_GRAD_CLIP_NORM = 1.0
 DEFAULT_VAL_FRACTION  = 0.1      # held out from each fold's train split
 DEFAULT_SEED           = 42
