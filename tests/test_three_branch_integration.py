@@ -224,6 +224,47 @@ def test_suprasegmental_normalization_preserves_the_voicing_mask():
     assert set(torch.unique(normalized_voicing).tolist()) <= {0.0, 1.0}
 
 
+def test_suprasegmental_normalization_does_not_fabricate_pitch_on_unvoiced_frames():
+    """Regression test: normalize_suprasegmental must leave the F0 channel's
+    explicit 'no pitch estimate' sentinel (exact 0, on every frame the
+    voicing channel marks unvoiced) exactly at 0 after normalization,
+    instead of shifting it to (0 - mean) / std. Also checks that the
+    F0 standardization statistics themselves are not pulled toward the
+    unvoiced sentinel (i.e. suprasegmental_standardizer excludes unvoiced
+    frames from the F0 mean/std it computes)."""
+    train_df, _ = _small_fold()
+    supra_stats = suprasegmental_standardizer(train_df["Filepath"])
+    mean, _ = supra_stats
+
+    ds_raw = UASpeechDataset(train_df, include_three_branch=True)
+    ds_norm = UASpeechDataset(train_df, include_three_branch=True, supra_stats=supra_stats)
+
+    found_unvoiced_frame = False
+    for i in range(len(train_df)):
+        raw_item = ds_raw[i]["supra"]
+        norm_item = ds_norm[i]["supra"]
+        voicing = raw_item[1]
+        unvoiced = voicing == 0
+        if not unvoiced.any():
+            continue
+        found_unvoiced_frame = True
+        f0_raw_unvoiced = raw_item[0][unvoiced]
+        f0_norm_unvoiced = norm_item[0][unvoiced]
+        assert torch.all(f0_raw_unvoiced == 0.0), (
+            "fixture assumption broken: unvoiced frames should carry the raw 0 sentinel")
+        assert torch.all(f0_norm_unvoiced == 0.0), (
+            "normalize_suprasegmental must not fabricate a nonzero pseudo-pitch value "
+            "on unvoiced frames — the F0 sentinel must survive normalization as exact 0")
+
+    assert found_unvoiced_frame, (
+        "fixture produced no unvoiced frames to exercise this regression test on — "
+        "widen _small_fold()'s sample")
+    # A voiced-only F0 mean should not be pulled toward the unvoiced-frame
+    # sentinel of exactly 0 semitones re 100 Hz (a real speaker's voiced
+    # pitch is essentially never that close to the reference frequency).
+    assert abs(float(mean[0])) > 1e-6
+
+
 def test_segmental_normalization_matches_manual_zscore_on_valid_frames():
     train_df, _ = _small_fold()
     stats = segmental_standardizer(train_df["Filepath"])

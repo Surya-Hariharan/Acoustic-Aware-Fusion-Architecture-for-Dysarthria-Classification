@@ -196,6 +196,17 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
 
     if cfg.limit_samples is not None:
         train_df = _limit_samples(train_df, cfg.limit_samples, label_column)
+        # Restrict val to train's (now-limited) speakers BEFORE capping it —
+        # src.training.data.build_loaders' speaker_label_map is built from
+        # this train_df alone and is documented to assume "val speakers are
+        # always a subset of this fold's training speakers". That holds
+        # naturally at full scale (~700 utterances/speaker), but capping
+        # train_df and val_df independently by class alone (not speaker) can
+        # otherwise leave a speaker in val_df with zero rows in the capped
+        # train_df, which crashes UASpeechDataset.__getitem__'s speaker_index
+        # lookup (KeyError) for the three-branch model — reproduced by the
+        # notebook's own SMOKE_RUN (limit_samples=16).
+        val_df = val_df[val_df["Speaker_ID"].isin(train_df["Speaker_ID"])]
         val_df = _limit_samples(val_df, max(2, cfg.limit_samples // 4), label_column)
         test_df = _limit_samples(test_df, cfg.limit_samples, label_column)
 

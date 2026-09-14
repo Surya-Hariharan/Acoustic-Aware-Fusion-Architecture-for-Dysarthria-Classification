@@ -384,16 +384,27 @@ def extract_suprasegmental_features_cached(filepath: str) -> torch.Tensor:
 
 def _channel_mean_std(sum_, sum_sq, count) -> Tuple[np.ndarray, np.ndarray]:
     """Shared mean/std-from-accumulators finish-up, with the same
-    constant-feature and non-finite guards as src.praat.praat_standardizer."""
-    if count == 0:
-        n = sum_.shape[0]
-        return np.zeros(n, dtype=np.float32), np.ones(n, dtype=np.float32)
-    mean = (sum_ / count)
-    var = np.clip(sum_sq / count - mean ** 2, 0.0, None)
+    constant-feature and non-finite guards as src.praat.praat_standardizer.
+
+    `count` may be a single scalar (every channel accumulated over the same
+    number of frames — segmental_standardizer) or a per-channel array
+    (channels accumulated over different frame subsets — e.g.
+    suprasegmental_standardizer's F0 channel, which is restricted to voiced
+    frames only while intensity uses every valid frame). A channel with
+    zero count falls back to (mean=0, std=1), same as the old all-zero case."""
+    count = np.asarray(count, dtype=np.float64)
+    n = sum_.shape[0]
+    no_data = (count == 0)
+    safe_count = np.where(no_data, 1.0, count)
+    mean = (sum_ / safe_count)
+    var = np.clip(sum_sq / safe_count - mean ** 2, 0.0, None)
     std = np.sqrt(var).astype(np.float32)
     mean = mean.astype(np.float32)
-    std[~np.isfinite(std) | (std == 0)] = 1.0
-    mean[~np.isfinite(mean)] = 0.0
+    invalid = no_data | ~np.isfinite(std) | (std == 0)
+    std = np.broadcast_to(std, (n,)).copy()
+    mean = np.broadcast_to(mean, (n,)).copy()
+    std[np.broadcast_to(invalid, (n,))] = 1.0
+    mean[np.broadcast_to(no_data | ~np.isfinite(mean), (n,))] = 0.0
     return mean, std
 
 
@@ -453,21 +464,37 @@ def suprasegmental_standardizer(filepaths) -> Tuple[np.ndarray, np.ndarray]:
     voicing channel is deliberately excluded: it is already a well-scaled
     {0, 1} indicator, and standardizing it would destroy the "1 = real pitch
     estimate, 0 = unvoiced/invalid" semantics src.praat.praat.py's module
-    docstring and src/vad.py's masking discipline both depend on."""
+    docstring and src/vad.py's masking discipline both depend on.
+
+    F0 statistics are accumulated over VOICED valid frames only. Unvoiced
+    valid frames carry extract_suprasegmental_sequence's explicit "0 = no
+    pitch estimate" sentinel (see its docstring: "Do not fabricate a contour
+    through unvoiced frames"), not a real pitch value — folding those zeros
+    into the F0 mean/std would bias both toward the sentinel and, after
+    normalize_suprasegmental applies them, turn every unvoiced frame's exact
+    0 into a fabricated nonzero pseudo-pitch value, exactly the outcome the
+    extraction step goes out of its way to avoid. Intensity has no such
+    sentinel (Praat reports a real energy value on unvoiced frames too), so
+    it is still accumulated over every valid frame."""
     n = len(SUPRA_CONTINUOUS_CHANNELS)
     sum_ = np.zeros(n, dtype=np.float64)
     sum_sq = np.zeros(n, dtype=np.float64)
-    count = 0
+    count = np.zeros(n, dtype=np.float64)
     for filepath in filepaths:
         features = extract_suprasegmental_features_cached(filepath).numpy()   # (3, T)
         _, valid_length = load_and_preprocess_supra_cached(filepath)
         valid_frames = min(mfcc_frame_count(valid_length), features.shape[-1])
         if valid_frames <= 0:
             continue
-        valid = features[np.ix_(SUPRA_CONTINUOUS_CHANNELS, range(valid_frames))].astype(np.float64)
-        sum_ += valid.sum(axis=1)
-        sum_sq += (valid ** 2).sum(axis=1)
-        count += valid_frames
+        voiced = features[SUPRA_VOICING_CHANNEL, :valid_frames].astype(bool)
+        for i, channel in enumerate(SUPRA_CONTINUOUS_CHANNELS):
+            frame_values = features[channel, :valid_frames].astype(np.float64)
+            selected = frame_values[voiced] if channel == SUPRA_F0_CHANNEL else frame_values
+            if selected.size == 0:
+                continue
+            sum_[i] += selected.sum()
+            sum_sq[i] += (selected ** 2).sum()
+            count[i] += selected.size
     return _channel_mean_std(sum_, sum_sq, count)
 
 
@@ -478,9 +505,16 @@ def normalize_suprasegmental(features: torch.Tensor, valid_frames: int,
     voicing channel (index SUPRA_VOICING_CHANNEL) passes through
     untouched, preserving its {0, 1} meaning. The padded tail of the
     normalized channels is forced back to exact zero, same convention as
-    normalize_segmental (voicing's own padded tail is already 0 by
-    construction — see extract_suprasegmental_sequence — so it needs no
-    extra handling here)."""
+    normalize_segmental.
+
+    F0's unvoiced-frame sentinel (exact 0, disambiguated by the voicing
+    channel — see extract_suprasegmental_sequence's docstring) is likewise
+    forced back to exact zero AFTER normalization, at every unvoiced frame
+    (valid or padded — the padded tail is already unvoiced by construction,
+    so this one rule subsumes the padded-tail zeroing for F0). Without this,
+    (0 - mean) / std is a nonzero constant, fabricating a pseudo-pitch value
+    on every unvoiced frame — see suprasegmental_standardizer's docstring.
+    Intensity has no such sentinel, so only its padded tail is re-zeroed."""
     mean, std = stats
     normalized = features.clone()
     continuous = features[list(SUPRA_CONTINUOUS_CHANNELS), :]
@@ -491,4 +525,6 @@ def normalize_suprasegmental(features: torch.Tensor, valid_frames: int,
         normalized_continuous[:, valid_frames:] = 0.0
     for i, channel in enumerate(SUPRA_CONTINUOUS_CHANNELS):
         normalized[channel] = normalized_continuous[i]
+    unvoiced = features[SUPRA_VOICING_CHANNEL] == 0
+    normalized[SUPRA_F0_CHANNEL][unvoiced] = 0.0
     return normalized
