@@ -36,7 +36,7 @@ from src.praat import (FEATURE_COLUMNS, PITCH_CEILING, PITCH_FLOOR,
                        severity_group)
 from src.preprocessing import (build_mfcc_transform, extract_mfcc_features,
                                load_and_preprocess)
-from src.style import CORRECT_COLOR, ERROR_COLOR, apply_style
+from src.style import CORRECT_COLOR, ERROR_COLOR, FORMANT_COLORS, SEQUENTIAL_CMAP, apply_style
 
 apply_style()
 
@@ -319,12 +319,12 @@ def plot_utterance_diagnostics(row, show: bool = False,
     axes[0, 0].set_xlabel("Time (s)")
     axes[0, 0].set_ylabel("Amplitude")
 
-    axes[0, 1].specgram(original, Fs=sr, NFFT=400, noverlap=240, cmap="magma")
+    axes[0, 1].specgram(original, Fs=sr, NFFT=400, noverlap=240, cmap=SEQUENTIAL_CMAP)
     axes[0, 1].set_title("Spectrogram (original audio)")
     axes[0, 1].set_xlabel("Time (s)")
     axes[0, 1].set_ylabel("Frequency (Hz)")
 
-    im = axes[1, 0].imshow(mfcc, aspect="auto", origin="lower", cmap="viridis")
+    im = axes[1, 0].imshow(mfcc, aspect="auto", origin="lower", cmap=SEQUENTIAL_CMAP)
     axes[1, 0].set_title("MFCC + delta + delta-delta (what the model saw)")
     axes[1, 0].set_xlabel("Frame")
     axes[1, 0].set_ylabel("Coefficient (39)")
@@ -502,18 +502,18 @@ def plot_utterance_signal_panel(row, out_dir: Optional[Path] = None,
     axes[0, 0].set_xlabel("Time (s)")
     axes[0, 0].set_ylabel("Amplitude")
 
-    axes[0, 1].specgram(original, Fs=sr, NFFT=400, noverlap=240, cmap="magma")
+    axes[0, 1].specgram(original, Fs=sr, NFFT=400, noverlap=240, cmap=SEQUENTIAL_CMAP)
     axes[0, 1].set_title("Spectrogram")
     axes[0, 1].set_xlabel("Time (s)")
     axes[0, 1].set_ylabel("Frequency (Hz)")
 
-    im1 = axes[1, 0].imshow(mfcc_only, aspect="auto", origin="lower", cmap="viridis")
+    im1 = axes[1, 0].imshow(mfcc_only, aspect="auto", origin="lower", cmap=SEQUENTIAL_CMAP)
     axes[1, 0].set_title("MFCC")
     axes[1, 0].set_xlabel("Frame")
     axes[1, 0].set_ylabel("Coefficient (13)")
     fig.colorbar(im1, ax=axes[1, 0], fraction=0.046)
 
-    im2 = axes[1, 1].imshow(delta_only, aspect="auto", origin="lower", cmap="viridis")
+    im2 = axes[1, 1].imshow(delta_only, aspect="auto", origin="lower", cmap=SEQUENTIAL_CMAP)
     axes[1, 1].set_title("Delta-MFCC")
     axes[1, 1].set_xlabel("Frame")
     axes[1, 1].set_ylabel("Coefficient (13)")
@@ -544,9 +544,9 @@ def plot_utterance_signal_panel(row, out_dir: Optional[Path] = None,
 
     formant_times, f1, f2, f3 = _formant_trajectories(filepath)
     if formant_times is not None:
-        axes[3, 0].plot(formant_times, f1, ".", markersize=2, label="F1", color="#4c72b0")
-        axes[3, 0].plot(formant_times, f2, ".", markersize=2, label="F2", color="#55a868")
-        axes[3, 0].plot(formant_times, f3, ".", markersize=2, label="F3", color="#c44e52")
+        axes[3, 0].plot(formant_times, f1, ".", markersize=2, label="F1", color=FORMANT_COLORS["F1"])
+        axes[3, 0].plot(formant_times, f2, ".", markersize=2, label="F2", color=FORMANT_COLORS["F2"])
+        axes[3, 0].plot(formant_times, f3, ".", markersize=2, label="F3", color=FORMANT_COLORS["F3"])
         axes[3, 0].legend(fontsize=8, loc="upper right")
         axes[3, 0].set_ylim(0, 5500)
     axes[3, 0].set_title("Formant trajectories")

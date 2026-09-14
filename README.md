@@ -188,10 +188,26 @@ Every utterance passes through one deterministic chain (`src/preprocessing.py`, 
 | Redundancy penalty | λ_comp = 0.05 | `config.LAMBDA_COMP` |
 | Speaker adversarial | λ_speaker = 0.1, GRL strength 1.0 | `config.LAMBDA_SPEAKER`, `config.GRL_LAMBDA` |
 | Optimizer | AdamW — lr 1e-3 (head/branches/LoRA), 1e-4 (backbone), weight decay 1e-2 | `config.DEFAULT_LR_HEAD`, `DEFAULT_LR_BACKBONE` |
-| Schedule | `ReduceLROnPlateau`, early stopping patience 5 on val loss | `config.DEFAULT_PATIENCE` |
-| Batch / epochs | 32 / 20 max, gradient clipping 1.0, AMP on CUDA | `config.DEFAULT_BATCH_SIZE`, `DEFAULT_EPOCHS` |
+| Schedule | `ReduceLROnPlateau`, early stopping patience 3 on val loss | `config.DEFAULT_PATIENCE` |
+| Batch / epochs | 32 / 15 max, gradient clipping 1.0, AMP on CUDA | `config.DEFAULT_BATCH_SIZE`, `DEFAULT_EPOCHS` |
 | Validation | 10% stratified, carved from each fold's train split | `config.DEFAULT_VAL_FRACTION` |
 | Seed | 42 | `config.DEFAULT_SEED` |
+| Compute budget | Hard 10h wall-clock cap for the 15-fold primary run (RTX 4060 laptop, 8GB) — enforced via a measured, not guessed, per-fold-epoch deadline | `config.PRIMARY_SEVERITY_BUDGET_HOURS`, `src.training.budget.ExperimentBudgetManager` |
+
+> [!NOTE]
+> **Patience 3 / epoch ceiling 15 is a compute-budget-driven tightening, not an
+> accuracy tweak.** Early stopping on validation loss is this architecture's
+> primary anti-overfitting mechanism; a tighter patience stops training past
+> convergence on a 14-speaker-per-fold training set rather than let it run
+> longer than the point it's actually still learning something general. The
+> epoch ceiling is a ceiling early stopping is expected to trigger well
+> before, not a target. `notebooks/03_training.ipynb`'s COMPUTE BUDGET stage
+> measures real per-fold-epoch cost on the actual training machine
+> (`ExperimentBudgetManager.benchmark`) and projects it against the 10h cap
+> (`.preflight()`) before the one-shot run is ever started; the `MODE=
+> "FINAL"` cell threads the resulting deadline into `run_training(...,
+> deadline=...)`, so the cap is enforced by measured wall-clock time, not
+> merely assumed to fit.
 
 > [!WARNING]
 > **SpecAugment is deliberately disabled.** `facebook/wav2vec2-base-960h` is a CTC checkpoint whose weights omit `masked_spec_embed`. Under Transformers 5.5.4, a positive masking probability would instantiate that parameter **randomly** and use it during training, injecting an unpretrained component into the learned branch. The pipeline therefore sets `apply_spec_augment=False`, `mask_time_prob=0.0`, and `mask_feature_prob=0.0` **before** model construction (`src/models/deep_pathway.py`), so the parameter is never created. The `lm_head` keys reported as unexpected at load time are the checkpoint's discarded CTC head and are expected. Regularization remains substantial without it: LayerDrop and five backbone dropouts at 0.1 (checkpoint defaults, untouched), LoRA dropout 0.1, weight decay, gradient clipping, early stopping, plus the redundancy and adversarial terms.
@@ -254,10 +270,17 @@ All logic lives in `src/`. Notebooks are the sole front end — they call `src/`
 notebooks/
   01_data_pipeline.ipynb     Manifest build (scan → verify → M6 filter → label → split → dataset),
                               VAD/padding diagnostics, three-branch data-pipeline audit
-  02_feature_analysis.ipynb  MFCC + VAD validation, Praat feature extraction, EDA,
-                              severity-group significance testing
+  02_feature_analysis.ipynb  Praat statistical EDA (MFCC + VAD validation, feature extraction,
+                              severity-group significance testing); speech-processing EDA
+                              (VAD+GAD voiced/unvoiced/silence segmentation, formant tracks,
+                              short-time time/frequency-domain parameters, wideband/narrowband
+                              spectrograms, cepstral analysis, MFCC, Linear Prediction analysis);
+                              feature-extraction summary (per-branch inventory table, trainable-
+                              parameter counts, Z_unified composition, channel breakdown)
   03_training.ipynb          One-shot training interface: frozen config, fold summary, model
-                              audit, dummy forward pass, smoke test, MODE-gated real run
+                              audit, dummy forward pass, measured compute-budget stage
+                              (batch-size benchmark, per-fold-epoch benchmark, wall-clock
+                              deadline wired into the real run), smoke test, MODE-gated real run
   04_model_analysis.ipynb    Branch embeddings, inference-time branch ablation, gate analysis,
                               PCA/UMAP, complementarity heatmap, SHAP, permutation importance
   05_error_analysis.ipynb    Confusion matrix, per-class and ordinal-error breakdown,
@@ -278,8 +301,12 @@ src/
   model_analysis.py          Branch ablation, embedding projections, gate analysis, SHAP
   error_analysis.py          Per-error diagnostics, signal panels
   results.py                 Cross-experiment aggregation, eligibility gate, paper tables
-  visualization.py           EDA, Praat figures, VAD-validation panel
-  console.py  style.py       Console formatting and plot styling
+  visualization.py           Praat statistical EDA figures, VAD-validation panel
+  eda.py                     Speech-processing EDA: short-time time/frequency-domain
+                              parameters, wideband/narrowband spectrograms, cepstral analysis,
+                              Linear Prediction analysis, VAD+GAD three-way segmentation
+  console.py  style.py       Console formatting and the shared plot color system (per-branch,
+                              per-formant, voicing-region, and severity-sequential palettes)
   models/
     gated_fusion.py          GatedFusionModel — gate, CORAL head, GRL head, branch ablation
     segmental_pathway.py     Segmental branch: 43 ch → 64
@@ -366,6 +393,8 @@ Every fold writes a checkpoint, TensorBoard log (`tensorboard --logdir outputs/l
 | Three branches, bottlenecks, gated fusion | Implemented, unit-tested |
 | CORAL head, redundancy penalty, speaker-adversarial GRL | Implemented, unit-tested |
 | Data pipeline, two VAD profiles, framewise extraction | Implemented; executed against the real corpus in Notebook 01 |
+| Speech-processing EDA, feature-extraction summary (Notebook 02) | Implemented; executed against the real corpus |
+| Compute-budget stage (Notebook 03) — measured batch size, per-fold-epoch benchmark, wall-clock deadline | Implemented; **not yet measured against real hardware** — the benchmark has not been run to completion in this checkout, so the 10h cap has not been confirmed sufficient for all 15 folds |
 | Training / analysis / results notebooks | Built, import- and shape-validated |
 | Test suite | **86 passing**, 0 failed, 0 skipped |
 | **The one-shot 15-fold severity run** | **Not executed** — Notebook 03 defaults to `MODE = "SMOKE"` |

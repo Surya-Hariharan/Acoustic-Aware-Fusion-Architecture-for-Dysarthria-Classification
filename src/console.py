@@ -216,6 +216,37 @@ def print_architecture(model, model_name: str = "") -> None:
                    "only the adapters and head learn.")
 
 
+def architecture_table(model, model_name: str = "") -> pd.DataFrame:
+    """Same per-submodule trainable/total parameter accounting as
+    print_architecture, as a DataFrame instead of console output — for
+    notebooks/02_feature_analysis.ipynb's parameter-count table (research-
+    paper tabular form), computed from the real instantiated model rather
+    than re-derived by hand."""
+    rows = []
+    for name, module in model.named_children():
+        module_total = sum(p.numel() for p in module.parameters())
+        if module_total == 0:
+            continue
+        module_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        rows.append({
+            "submodule": name,
+            "trainable_params": module_trainable,
+            "total_params": module_total,
+            "frozen_params": module_total - module_trainable,
+            "pct_trainable": 100.0 * module_trainable / module_total,
+        })
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    rows.append({
+        "submodule": "TOTAL",
+        "trainable_params": trainable,
+        "total_params": total,
+        "frozen_params": total - trainable,
+        "pct_trainable": 100.0 * trainable / total if total else 0.0,
+    })
+    return pd.DataFrame(rows)
+
+
 def print_fold_progress(fold_id: str, index: int, total: int,
                         n_train: int, n_val: int, n_test: int) -> None:
     """One fold's header inside a cross-validation run."""
