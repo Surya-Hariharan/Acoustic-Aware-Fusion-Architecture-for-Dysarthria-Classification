@@ -178,6 +178,9 @@ Every utterance passes through one deterministic chain (`src/preprocessing.py`, 
 > [!NOTE]
 > **F0 representation contract.** Voiced frames carry a real F0 estimate in semitones; unvoiced frames are exactly **0**, disambiguated by an explicit binary voicing channel. No contour is interpolated or fabricated through unvoiced regions — the model is shown where pitch genuinely was not measurable. Enforced by `tests/test_supra_sequence_masking.py`.
 
+> [!NOTE]
+> **Framewise Praat feature cache.** The Segmental and Suprasegmental branches' per-frame formant/HNR/F0/voicing/intensity extraction runs on the order of 2,000 individual `parselmouth` (Praat) calls per utterance — CPU-bound and single-threaded, and by far the largest cost in the pipeline if left uncached (the GPU sits idle waiting on it). `src/preprocessing.py`'s in-memory `lru_cache` alone doesn't help across DataLoader-worker or kernel restarts, so results are additionally persisted to disk under `outputs/feature_cache/`. `precompute_framewise_feature_cache(df)` builds this cache once, in parallel, for the whole corpus (~40 minutes the first time, on the order of seconds thereafter) — run as the first real step in `notebooks/03_training.ipynb`, before any benchmarking or training begins.
+
 ## Training strategy
 
 | Aspect | Setting | Source |

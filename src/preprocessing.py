@@ -19,6 +19,8 @@ giving the 39-dimensional per-frame representation used by the
 Acoustic Pathway (matching the base paper's baseline features).
 """
 
+import hashlib
+from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -260,10 +262,55 @@ def validate_mfcc_output(features: torch.Tensor, valid_length: int,
 # filepath (not by a mfcc_transform object) so the cache stays valid across
 # Dataset instances (a new one is built per fold) and across the LRU's
 # module-level lifetime. num_workers > 0 gives each DataLoader worker
-# process its own independent copy of these caches (no cross-worker
+# process its own independent copy of these in-memory caches (no cross-worker
 # sharing) — still a large win, since persistent_workers=True keeps a
-# fold's workers alive across all of that fold's epochs.
+# fold's workers alive across all of that fold's epochs. The two Praat-heavy
+# functions below (extract_segmental_extra_features_cached,
+# extract_suprasegmental_features_cached) additionally persist to disk (see
+# _disk_cache_path / precompute_framewise_feature_cache), which is what
+# actually gives cross-worker and cross-process-restart sharing for those.
 # ---------------------------------------------------------------------------
+def _disk_cache_path(cache_dir: Path, filepath: str) -> Path:
+    """Filesystem-safe cache location for `filepath` under `cache_dir`, keyed
+    the same way as the in-memory lru_caches above (filepath alone, fixed
+    config) — an md5 hash sidesteps Windows path-length limits and characters
+    that aren't valid in filenames."""
+    digest = hashlib.md5(filepath.encode("utf-8")).hexdigest()
+    return cache_dir / f"{digest}.npy"
+
+
+def _precompute_one(filepath: str) -> None:
+    """Populate the disk cache for one file — module-level (not a closure) so
+    it is picklable and safe to hand to ProcessPoolExecutor on Windows."""
+    extract_segmental_extra_features_cached(filepath)
+    extract_suprasegmental_features_cached(filepath)
+
+
+def precompute_framewise_feature_cache(df: pd.DataFrame, n_workers: int = 4) -> None:
+    """
+    One-time, parallel build of the disk-backed framewise-feature cache for
+    every file in `df["Filepath"]`.
+
+    The three-branch model's per-frame Praat extraction (~2,000 parselmouth
+    calls/file — see extract_segmental_extra_features_cached and
+    extract_suprasegmental_features_cached below) is CPU-bound and, without
+    this, gets recomputed from scratch on every process/worker restart across
+    every benchmark candidate, every fold, every epoch. Running it once here,
+    in parallel across n_workers processes, turns that repeated cost into a
+    single disk-read from then on. Progress is reported per FILE, not per
+    training batch, so real work is visible instead of a per-batch bar whose
+    ticks are each minutes long on a cold cache.
+    """
+    from src.console import progress
+
+    filepaths = df["Filepath"].tolist()
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        for _ in progress(executor.map(_precompute_one, filepaths, chunksize=8),
+                          "Pre-warming framewise Praat feature cache",
+                          total=len(filepaths), unit="file"):
+            pass
+
+
 _CACHED_MFCC_TRANSFORM = None
 
 
@@ -313,16 +360,29 @@ def extract_segmental_extra_features_cached(filepath: str) -> torch.Tensor:
 
     Returns a (4, total_frames) float32 tensor: f1_hz, f2_hz, f3_hz, hnr_db,
     aligned frame-for-frame with extract_mfcc_features_cached's output.
+
+    Also persisted to disk under config.SEGMENTAL_EXTRA_CACHE_DIR — the
+    in-memory lru_cache above is cold on every process/DataLoader-worker
+    restart, but this ~2,000-Praat-call-per-file pass is expensive enough
+    that paying it more than once per file, ever, is the single largest
+    training cost. The disk cache makes it a one-time cost project-wide.
     """
     from src.praat import extract_segmental_extra_sequence
+
+    cache_path = _disk_cache_path(config.SEGMENTAL_EXTRA_CACHE_DIR, filepath)
+    if cache_path.exists():
+        return torch.from_numpy(np.load(cache_path))
 
     waveform, valid_length = load_and_preprocess_cached(filepath)
     total_frames = mfcc_frame_count(waveform.shape[-1])
     sequences = extract_segmental_extra_sequence(
         waveform.squeeze(0).numpy(), config.TARGET_SR, valid_length, total_frames)
-    return torch.from_numpy(
-        np.stack([sequences["f1_hz"], sequences["f2_hz"],
-                 sequences["f3_hz"], sequences["hnr_db"]], axis=0))
+    result = np.stack([sequences["f1_hz"], sequences["f2_hz"],
+                       sequences["f3_hz"], sequences["hnr_db"]], axis=0).astype(np.float32)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, result)
+    return torch.from_numpy(result)
 
 
 @lru_cache(maxsize=config.PREPROCESS_CACHE_SIZE)
@@ -348,16 +408,26 @@ def extract_suprasegmental_features_cached(filepath: str) -> torch.Tensor:
     (both use mfcc_frame_count(MAX_SAMPLES) frames) even though the two
     profiles' VAD spans differ — only the padding boundary (valid_length)
     differs between them, not the fixed total_frames axis length.
+
+    Also persisted to disk under config.SUPRASEGMENTAL_CACHE_DIR — see
+    extract_segmental_extra_features_cached's docstring for why.
     """
     from src.praat import extract_suprasegmental_sequence
+
+    cache_path = _disk_cache_path(config.SUPRASEGMENTAL_CACHE_DIR, filepath)
+    if cache_path.exists():
+        return torch.from_numpy(np.load(cache_path))
 
     waveform, valid_length = load_and_preprocess_supra_cached(filepath)
     total_frames = mfcc_frame_count(waveform.shape[-1])
     sequences = extract_suprasegmental_sequence(
         waveform.squeeze(0).numpy(), config.TARGET_SR, valid_length, total_frames)
-    return torch.from_numpy(
-        np.stack([sequences["f0_semitones"], sequences["voicing"],
-                 sequences["intensity_db"]], axis=0))
+    result = np.stack([sequences["f0_semitones"], sequences["voicing"],
+                       sequences["intensity_db"]], axis=0).astype(np.float32)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, result)
+    return torch.from_numpy(result)
 
 
 # ---------------------------------------------------------------------------

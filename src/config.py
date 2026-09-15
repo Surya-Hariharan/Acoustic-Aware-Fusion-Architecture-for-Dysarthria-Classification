@@ -29,6 +29,15 @@ ERROR_FIGURE_DIR = FIGURE_DIR / "errors"        # Phase 5: per-utterance error d
 MANIFEST_PATH = OUTPUT_DIR / "m6_manifest.csv"  # scanned+filtered+labeled M6 utterances
 PRAAT_FEATURES_PATH = OUTPUT_DIR / "praat_features.csv"  # Phase 4: per-utterance acoustic features
 
+# Disk-persisted cache for the three-branch model's per-frame Praat features
+# (framewise formants/HNR, framewise F0/voicing/intensity) — these run ~2,000
+# individual parselmouth calls per file, so an in-memory-only lru_cache (see
+# src/preprocessing.py) is cold on every process/worker restart and is the
+# single largest cost in training. This directory lets that cost be paid once.
+FEATURE_CACHE_DIR = OUTPUT_DIR / "feature_cache"
+SEGMENTAL_EXTRA_CACHE_DIR = FEATURE_CACHE_DIR / "segmental_extra"
+SUPRASEGMENTAL_CACHE_DIR = FEATURE_CACHE_DIR / "suprasegmental"
+
 # Three-branch severity architecture's figure/table/diagnostic subdirectories
 # (architecture plan Work Package C) — kept as separate named constants
 # rather than folded into FIGURE_DIR/ERROR_FIGURE_DIR so each analysis
@@ -363,5 +372,6 @@ def ensure_directories() -> None:
                        METRICS_DIR, CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR,
                        EXPERIMENTS_DIR, RESULTS_DIR,
                        SIGNAL_FIGURE_DIR, REPRESENTATION_FIGURE_DIR, EXPLAINABILITY_FIGURE_DIR,
-                       ABLATION_FIGURE_DIR, METRIC_FIGURE_DIR, TABLES_DIR, DIAGNOSTICS_DIR):
+                       ABLATION_FIGURE_DIR, METRIC_FIGURE_DIR, TABLES_DIR, DIAGNOSTICS_DIR,
+                       FEATURE_CACHE_DIR, SEGMENTAL_EXTRA_CACHE_DIR, SUPRASEGMENTAL_CACHE_DIR):
         directory.mkdir(parents=True, exist_ok=True)
