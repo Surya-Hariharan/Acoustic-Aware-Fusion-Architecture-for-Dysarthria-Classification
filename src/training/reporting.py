@@ -498,7 +498,7 @@ def feature_audit(model=None, num_classes: int = 4) -> Dict:
         model = build_model(SEVERITY_MODEL_NAME, num_classes, num_speakers=2)
     model.eval()
 
-    batch = _dummy_three_branch_batch()
+    batch = _dummy_three_branch_batch(device=next(model.parameters()).device)
     with torch.no_grad():
         z_learned, z_segmental, z_supra = model.encode_branches(
             batch["waveform"], batch["mfcc"], batch["supra"],
