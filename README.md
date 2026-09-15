@@ -35,6 +35,7 @@ Rather than choosing between them or concatenating them flatly, this architectur
 ## Architecture
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"primaryColor": "#1f2937", "primaryTextColor": "#f5f5f5", "primaryBorderColor": "#9aa0a6", "lineColor": "#9aa0a6", "fontSize": "14px"}}}%%
 flowchart TD
     UA["UA-Speech corpus<br/>audio/original variant"]
     MIC["Microphone channel M6 only<br/>28 speakers · 765 words each · 21,420 utterances"]
@@ -84,9 +85,9 @@ flowchart TD
     ELRN -.-> RED
     ESUP -.-> RED
 
-    classDef branch fill:#e8f0fe,stroke:#3367d6,stroke-width:2px
-    classDef fusion fill:#fce8e6,stroke:#d93025,stroke-width:2px
-    classDef aux fill:#f1f3f4,stroke:#80868b,stroke-dasharray:4 3
+    classDef branch fill:#1a3a6b,stroke:#5b9bff,stroke-width:2px,color:#eaf1ff
+    classDef fusion fill:#6b1a1a,stroke:#ff6b5b,stroke-width:2px,color:#ffe8e5
+    classDef aux fill:#3a3a3a,stroke:#b0b6bb,stroke-dasharray:4 3,color:#f0f0f0
     class SEG,LRN,SUP,ESEG,ELRN,ESUP branch
     class GATE,HEAD fusion
     class SPK,RED aux
@@ -204,10 +205,10 @@ Every utterance passes through one deterministic chain (`src/preprocessing.py`, 
 > before, not a target. `notebooks/03_training.ipynb`'s COMPUTE BUDGET stage
 > measures real per-fold-epoch cost on the actual training machine
 > (`ExperimentBudgetManager.benchmark`) and projects it against the 10h cap
-> (`.preflight()`) before the one-shot run is ever started; the `MODE=
-> "FINAL"` cell threads the resulting deadline into `run_training(...,
-> deadline=...)`, so the cap is enforced by measured wall-clock time, not
-> merely assumed to fit.
+> (`.preflight()`) before the one-shot run is ever started; the final-run
+> cell threads the resulting deadline into `run_training(..., deadline=...)`,
+> so the cap is enforced by measured wall-clock time, not merely assumed to
+> fit.
 
 > [!WARNING]
 > **SpecAugment is deliberately disabled.** `facebook/wav2vec2-base-960h` is a CTC checkpoint whose weights omit `masked_spec_embed`. Under Transformers 5.5.4, a positive masking probability would instantiate that parameter **randomly** and use it during training, injecting an unpretrained component into the learned branch. The pipeline therefore sets `apply_spec_augment=False`, `mask_time_prob=0.0`, and `mask_feature_prob=0.0` **before** model construction (`src/models/deep_pathway.py`), so the parameter is never created. The `lm_head` keys reported as unexpected at load time are the checkpoint's discarded CTC head and are expected. Regularization remains substantial without it: LayerDrop and five backbone dropouts at 0.1 (checkpoint defaults, untouched), LoRA dropout 0.1, weight decay, gradient clipping, early stopping, plus the redundancy and adversarial terms.
@@ -226,41 +227,10 @@ All protocols are **speaker-disjoint**: no speaker ever appears in both the trai
 
 **Primary severity — full-population LOSO.** All 15 dysarthric speakers, no speaker dropped. The 4/3/3/5 class imbalance is handled at the loss and metric level (class-weighted CORAL, macro-F1, balanced accuracy, per-class recall, ordinal MAE) rather than by discarding speakers.
 
-**Secondary severity — legacy balanced protocol.** `config.DROPPED_FOR_BALANCE` excludes M12, M08, and M09 to reach three speakers per class, giving 3⁴ = 81 leave-one-per-class-out iterations. The reference work gives no explicit exclusion list, so this particular set of three speakers is **an assumption of this implementation**, not a reproduction. It is retained only as an explicitly labelled secondary check and is **not** the reported number.
+**Secondary severity — legacy balanced protocol.** `config.DROPPED_FOR_BALANCE` excludes M12, M08, and M09 to reach three speakers per class, giving 3⁴ = 81 leave-one-per-class-out iterations. This particular set of three speakers is a design choice made to reach class balance, not a canonical selection. It is retained only as an explicitly labelled secondary check and is **not** the reported number.
 
 > [!NOTE]
 > The 10% validation split is carved from each fold's *training* portion at the utterance level, so validation speakers are a subset of training speakers. This is sound for model selection and early stopping, but validation metrics are optimistically biased and must never be reported as generalization performance.
-
-## Research context
-
-This project builds on, but does not reproduce, the following work:
-
-> Javanmardi, F., Tirronen, S., Kodali, M., Kadiri, S. R., and Alku, P.
-> *Wav2vec-based Detection and Severity Level Classification of Dysarthria from Speech.* ICASSP 2023. [arXiv:2309.14107](https://arxiv.org/abs/2309.14107)
-
-**What the reference work does.** A **frozen** wav2vec 2.0 is used as a fixed feature extractor feeding an SVM classifier; a per-layer sweep finds that early-layer embeddings favour detection while final-layer embeddings favour severity.
-
-**How this implementation differs.** These are architectural and methodological differences, stated as design decisions — not as demonstrated improvements, since the comparative experiment has not been run.
-
-| Dimension | Reference work | This implementation |
-|---|---|---|
-| Backbone use | Frozen feature extractor | LoRA-adapted (q/k/v, 12 layers) |
-| Classifier | SVM on pooled embeddings | End-to-end three-branch network |
-| Representations | wav2vec 2.0 only | Segmental + suprasegmental + learned |
-| Fusion | None (single representation) | Learned gate + redundancy penalty |
-| Severity head | Nominal classification | CORAL ordinal |
-| Speaker confounds | Not explicitly addressed | Gradient-reversal adversarial head |
-| Severity protocol | Balanced, speakers dropped | Full-population 15-fold LOSO (primary) |
-
-**Shared with the reference work:** the UA-Speech corpus, the M6-only microphone protocol, the four-level severity taxonomy, and the 39-dimensional MFCC baseline feature definition.
-
-Additional methods used:
-
-> Cao, W., Mirjalili, V., and Raschka, S. *Rank consistent ordinal regression for neural networks with application to age estimation.* Pattern Recognition Letters, 2020. (CORAL head)
->
-> Ganin, Y. and Lempitsky, V. *Unsupervised domain adaptation by backpropagation.* ICML 2015. (Gradient reversal)
->
-> Hu, E. J. et al. *LoRA: Low-Rank Adaptation of Large Language Models.* ICLR 2022.
 
 ## Repository structure
 
@@ -278,9 +248,10 @@ notebooks/
                               feature-extraction summary (per-branch inventory table, trainable-
                               parameter counts, Z_unified composition, channel breakdown)
   03_training.ipynb          One-shot training interface: frozen config, fold summary, model
-                              audit, dummy forward pass, measured compute-budget stage
-                              (batch-size benchmark, per-fold-epoch benchmark, wall-clock
-                              deadline wired into the real run), smoke test, MODE-gated real run
+                              audit, measured compute-budget stage (batch-size benchmark,
+                              per-fold-epoch benchmark, wall-clock deadline wired into the real
+                              run), the one real 15-fold training run, results reporting, and a
+                              final checkpoint summary
   04_model_analysis.ipynb    Branch embeddings, inference-time branch ablation, gate analysis,
                               PCA/UMAP, complementarity heatmap, SHAP, permutation importance
   05_error_analysis.ipynb    Confusion matrix, per-class and ordinal-error breakdown,
@@ -366,12 +337,7 @@ pytest                        # full suite — 86 tests
 jupyter notebook notebooks/01_data_pipeline.ipynb
 ```
 
-Run the notebooks in numerical order. Notebook 03 is gated:
-
-```python
-MODE = "SMOKE"     # default — the real 15-fold run does NOT execute
-# MODE = "FINAL"   # deliberate human action only — the one-shot experiment
-```
+Run the notebooks in numerical order. Notebook 03 runs the one real 15-fold training run unconditionally — no gating flag to flip.
 
 Training can also be driven directly:
 
@@ -397,7 +363,7 @@ Every fold writes a checkpoint, TensorBoard log (`tensorboard --logdir outputs/l
 | Compute-budget stage (Notebook 03) — measured batch size, per-fold-epoch benchmark, wall-clock deadline | Implemented; **not yet measured against real hardware** — the benchmark has not been run to completion in this checkout, so the 10h cap has not been confirmed sufficient for all 15 folds |
 | Training / analysis / results notebooks | Built, import- and shape-validated |
 | Test suite | **86 passing**, 0 failed, 0 skipped |
-| **The one-shot 15-fold severity run** | **Not executed** — Notebook 03 defaults to `MODE = "SMOKE"` |
+| **The one-shot 15-fold severity run** | **Not executed** — Notebook 03 has not yet been run end-to-end in this checkout |
 | Full 15-fold branch ablation | Not executed (see below) |
 
 ### Diagnostic findings — Notebook 01
