@@ -25,9 +25,27 @@ repo's default branch unless pinned to a tag. VAD_REPO is pinned to the
 "v6.2.1" release tag (github.com/snakers4/silero-vad/releases/tag/v6.2.1) so
 that repeat runs across machines/dates resolve the same model code rather
 than silently tracking upstream's moving default branch.
+
+Concurrent-download note: torch.hub.load() downloads+extracts a repo zipball
+into a directory named "<owner>_<repo>_<ref>" under torch.hub.get_dir(), but
+GitHub's zipball extracts to "<owner>-<repo>-<short_commit_sha>" internally,
+so torch.hub renames the extracted folder after the fact. That
+download-extract-rename sequence is NOT process-safe: if several processes
+call torch.hub.load() for the same repo at the same moment (e.g. every
+ProcessPoolExecutor worker in precompute_framewise_feature_cache lazily
+loading VAD on its first file), they race on the same target directory,
+"Directory not empty" is raised mid-rename, and the cache is left with the
+commit-hash-named directory but no "<owner>_<repo>_<ref>/hubconf.py" — every
+later load in every worker then fails identically, forever, once per file.
+warmup_silero_vad() (called once, synchronously, in the main process before
+workers are spawned) exists specifically to populate the on-disk cache
+BEFORE any concurrency starts, so worker processes' own load_silero_vad()
+calls are local reads, not downloads.
 """
 
+import shutil
 import warnings
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -39,9 +57,13 @@ VAD_REPO = "snakers4/silero-vad:v6.2.1"
 
 _MODEL = None
 _UTILS = None
+# Set once a load fails in this process; short-circuits every later call so a
+# broken/unreachable torch.hub cache is retried once, not once per file (see
+# _ensure_loaded_or_disabled).
+_INIT_ERROR: Optional[str] = None
 
 
-def load_silero_vad():
+def load_silero_vad(force_reload: bool = False):
     """Load (and cache at module level) the Silero VAD JIT model + its utils tuple.
 
     Loaded once per process, kept in eval() (no dropout) — every call to
@@ -50,15 +72,99 @@ def load_silero_vad():
     are responsible for the fallback-to-original-waveform contract.
     """
     global _MODEL, _UTILS
-    if _MODEL is None:
+    if _MODEL is None or force_reload:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model, utils = torch.hub.load(
                 repo_or_dir=VAD_REPO, model="silero_vad",
-                force_reload=False, trust_repo=True, verbose=False)
+                force_reload=force_reload, trust_repo=True, verbose=False)
         model.eval()
         _MODEL, _UTILS = model, utils
     return _MODEL, _UTILS
+
+
+def _clear_stale_silero_cache() -> None:
+    """Remove any torch.hub cache entries for this repo only (matched by
+    "silero-vad"/"silero_vad" in the entry name, inside torch.hub.get_dir()
+    alone) — never touches the rest of ~/.cache/torch. Used to recover from
+    the partial-extraction state left by the concurrent-download race
+    described in the module docstring, without blindly wiping the whole
+    torch hub cache."""
+    hub_dir = Path(torch.hub.get_dir())
+    if not hub_dir.exists():
+        return
+    for entry in hub_dir.iterdir():
+        if "silero-vad" in entry.name or "silero_vad" in entry.name:
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+
+
+def warmup_silero_vad() -> None:
+    """Load Silero VAD once, synchronously, and verify it actually runs on a
+    dummy waveform — call this ONCE in the main process, before handing work
+    to ProcessPoolExecutor workers (see precompute_framewise_feature_cache).
+
+    Populating the on-disk torch.hub cache here, before any worker process
+    exists, is what prevents the multi-process download race described in
+    this module's docstring. On first failure, retries exactly once after
+    clearing any stale/partial cache entries for this repo; if that also
+    fails, raises RuntimeError with a diagnostic instead of leaving 21,000+
+    per-file calls to each silently retry the same broken load.
+    """
+    global _INIT_ERROR
+    _INIT_ERROR = None
+    try:
+        load_silero_vad()
+    except Exception as first_exc:
+        print_status(
+            f"Silero VAD load failed ({first_exc}) — clearing torch.hub cache "
+            f"entries for this repo and retrying once", ok=False)
+        _clear_stale_silero_cache()
+        try:
+            load_silero_vad(force_reload=True)
+        except Exception as exc:
+            _INIT_ERROR = str(exc)
+            raise RuntimeError(
+                f"Silero VAD failed to initialize ({VAD_REPO}) after a "
+                f"cache-clear-and-retry: {exc}\n"
+                f"torch.hub cache dir: {Path(torch.hub.get_dir())}\n"
+                f"Check network access to github.com and huggingface.co from "
+                f"this environment, or set config.VAD_ENABLED = False to "
+                f"deliberately run without VAD."
+            ) from exc
+
+    model, utils = _MODEL, _UTILS
+    get_ts = utils[0]
+    dummy = torch.zeros(config.VAD_SAMPLE_RATE)          # 1s of silence, smoke test only
+    with torch.no_grad():
+        get_ts(dummy, model, sampling_rate=config.VAD_SAMPLE_RATE)
+    print_status(f"Silero VAD initialized and verified ({VAD_REPO})", ok=True)
+
+
+def _ensure_loaded_or_disabled() -> bool:
+    """True if the model is ready to use in THIS process. On first failure,
+    records the reason once (_INIT_ERROR) and returns False for every later
+    call in this process, so apply_vad falls back to the raw waveform without
+    retrying a broken torch.hub load or re-printing a failure message per
+    file — see the module docstring's concurrent-download race and item 4 of
+    the fix (fail/log once, then explicit fallback, not 21,000 messages)."""
+    global _INIT_ERROR
+    if _MODEL is not None:
+        return True
+    if _INIT_ERROR is not None:
+        return False
+    try:
+        load_silero_vad()
+        return True
+    except Exception as exc:
+        _INIT_ERROR = str(exc)
+        print_status(
+            f"Silero VAD failed to initialize in this process ({exc}) — "
+            f"every file processed by this process will fall back to the "
+            f"original (non-VAD-trimmed) waveform", ok=False)
+        return False
 
 
 def get_speech_timestamps(waveform_1d: torch.Tensor, sr: int = config.VAD_SAMPLE_RATE,
@@ -116,6 +222,9 @@ def apply_vad(waveform: torch.Tensor, sr: int = config.VAD_SAMPLE_RATE,
     original_duration_s = waveform.shape[-1] / sr
     if not config.VAD_ENABLED:
         return waveform, _fallback_stats(waveform, sr, "vad_disabled")
+
+    if not _ensure_loaded_or_disabled():
+        return waveform, _fallback_stats(waveform, sr, f"vad_init_failed: {_INIT_ERROR}")
 
     try:
         waveform_1d = waveform.squeeze(0) if waveform.dim() == 2 else waveform

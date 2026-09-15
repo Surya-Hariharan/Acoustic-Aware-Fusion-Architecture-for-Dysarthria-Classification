@@ -300,8 +300,27 @@ def precompute_framewise_feature_cache(df: pd.DataFrame, n_workers: int = 4) -> 
     single disk-read from then on. Progress is reported per FILE, not per
     training batch, so real work is visible instead of a per-batch bar whose
     ticks are each minutes long on a cold cache.
+
+    Every file above this docstring goes through Silero VAD first (see
+    src/vad.py, called from load_and_preprocess_cached). Silero is lazily
+    loaded via torch.hub on first use; if that first use happened inside each
+    of n_workers worker processes independently, they would race to
+    download+extract the same repo into the same shared torch.hub cache dir
+    at once, corrupting it (this is exactly what produced the repeated
+    "Silero VAD failed ... No such file or directory ... hubconf.py" errors
+    seen on Kaggle). Calling warmup_silero_vad() here, synchronously, BEFORE
+    the executor is created, loads and verifies the model once in the main
+    process — which both populates the on-disk cache (so every worker's own
+    lazy load is a fast local read, not a download) and fails loudly, once,
+    with a clear diagnostic if Silero genuinely cannot be loaded at all,
+    instead of quietly falling back to the un-trimmed waveform for all
+    21,000+ files (see src/vad.py's module docstring on why that fallback is
+    not a silent, cost-free substitute).
     """
     from src.console import progress
+
+    if config.VAD_ENABLED:
+        vad_module.warmup_silero_vad()
 
     filepaths = df["Filepath"].tolist()
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
