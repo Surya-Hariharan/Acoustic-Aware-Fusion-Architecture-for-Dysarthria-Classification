@@ -312,13 +312,14 @@ GRL_LAMBDA     = 1.0     # gradient-reversal strength inside the GRL layer itsel
 # ---------------------------------------------------------------------------
 
 # Hard wall-clock ceiling for the primary severity one-shot run on the
-# target machine (RTX 4060 laptop, 8GB) — not a second more. Enforced via
+# target machine — not a second more. Enforced via
 # src.training.budget.ExperimentBudgetManager.deadline_for(), threaded into
-# run_training(..., deadline=...) in notebooks/03_training.ipynb's MODE=
-# "FINAL" cell. A single named constant so every place that needs to know
-# the cap (the budget manager, any reporting that quotes it) reads the same
-# number rather than each hardcoding "10.0" independently.
-PRIMARY_SEVERITY_BUDGET_HOURS = 10.0
+# run_training(..., deadline=...) in notebooks/03_training.ipynb's real-run
+# cell. A single named constant so every place that needs to know the cap
+# (the budget manager, any reporting that quotes it) reads the same number
+# rather than each hardcoding it independently. Raised from 10h to 30h after
+# moving to a substantially faster GPU.
+PRIMARY_SEVERITY_BUDGET_HOURS = 30.0
 
 NUM_CLASSES = {"detection": 2, "severity": 4}
 
@@ -328,11 +329,11 @@ DETECTION_CLASS_NAMES = ["Healthy Control", "Dysarthric Patient"]
 SEVERITY_CLASS_NAMES  = ["Very Low", "Low", "Mid", "High"]
 
 # Epoch ceiling early stopping should trigger well before, not a target to
-# reach — set from the primary severity run's compute budget (RTX 4060
-# laptop, 8GB, hard 10h cap for the 15-fold LOSO run — see
-# src.training.budget.ExperimentBudgetManager and notebooks/03_training.ipynb's
-# COMPUTE BUDGET stage) together with DEFAULT_PATIENCE below, not
-# independently. 20 -> 15: still generous headroom over what early stopping
+# reach — set from the primary severity run's compute budget (hard 30h cap
+# for the 15-fold LOSO run — see src.training.budget.ExperimentBudgetManager
+# and notebooks/03_training.ipynb's COMPUTE BUDGET stage) together with
+# DEFAULT_PATIENCE below, not independently. 20 -> 15: still generous
+# headroom over what early stopping
 # on validation loss is expected to need on a 14-speaker training set per
 # fold; lower only trims the unused tail, it does not change what the model
 # learns before convergence.

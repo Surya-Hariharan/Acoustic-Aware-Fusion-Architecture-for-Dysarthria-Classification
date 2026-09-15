@@ -204,6 +204,13 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
                     continue
                 running_extras[key] = running_extras.get(key, 0.0) + value * batch_size
 
+            if description:
+                # Live running loss on the per-batch bar itself, not just
+                # percentage/rate — the only per-batch feedback previously
+                # available was the bar's %, with actual loss only printed
+                # once the whole epoch finished.
+                batches.set_postfix_str(f"loss={running_loss / num_samples:.4f}")
+
             probs = torch.softmax(logits.detach().float(), dim=1)
             preds = probs.argmax(dim=1)
             all_true.append(labels.detach().cpu().numpy())

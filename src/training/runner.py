@@ -24,7 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src import config
 from src.console import (V, print_architecture, print_banner, print_fold_progress,
-                        print_header, print_kv, print_metrics, print_note,
+                        print_header, print_kv, print_metrics, print_note, progress,
                         print_signal_chain, print_status, print_subheader, print_table)
 from src.praat import FEATURE_COLUMNS as PRAAT_FEATURE_COLUMNS
 from src.praat import load_praat_table
@@ -438,6 +438,12 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     fold_metrics = []
     pooled_true, pooled_pred, pooled_prob, pooled_speakers = [], [], [], []
     failed_folds = []
+    # Run-level bar: without it, the only cross-fold signal was one-shot text
+    # printed at each fold's start/end, with total silence in between on top
+    # of the per-batch bars nested inside run_fold — nothing showed overall
+    # elapsed/ETA across a run that can legitimately take many hours.
+    fold_bar = progress(range(n_folds), f"{run_name} -- fold progress",
+                        total=n_folds, unit="fold", leave=True)
     for i, (fold_id, train_df, test_df) in enumerate(fold_iter, start=1):
         # Held-out composition is known before training and is recorded whatever
         # the fold's outcome — so a fold that never ran still leaves a registry
@@ -461,6 +467,7 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
                 record_fold(**registry_base, fold_id=skipped_id, fold_index=j,
                             status=FOLD_SKIPPED_DEADLINE,
                             fold_description=describe_fold(skipped_test_df))
+            fold_bar.close()
             break
         if cached is not None:
             metrics_dict, y_true, y_pred, y_prob, speakers = cached
@@ -486,6 +493,8 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
                             status=FOLD_FAILED, fold_description=fold_description)
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
+                fold_bar.set_postfix_str(f"{fold_id} FAILED")
+                fold_bar.update(1)
                 continue
             record_fold(**registry_base, fold_id=fold_id, fold_index=i,
                         status=FOLD_COMPLETED, fold_description=fold_description,
@@ -509,6 +518,12 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         pooled_pred.append(y_pred)
         pooled_prob.append(y_prob)
         pooled_speakers.extend(speakers)
+
+        fold_accuracy = metrics_dict.get("accuracy")
+        postfix = f"{fold_id} acc={fold_accuracy:.3f}" if fold_accuracy is not None else fold_id
+        fold_bar.set_postfix_str(postfix)
+        fold_bar.update(1)
+    fold_bar.close()
 
     if failed_folds:
         print_note(f"{len(failed_folds)} fold(s) failed and were excluded from pooling: "
