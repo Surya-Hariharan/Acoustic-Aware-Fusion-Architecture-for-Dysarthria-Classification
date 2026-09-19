@@ -111,6 +111,15 @@ class TrainingConfig:
     # DEFAULT_BATCH_SIZE was tuned for.
     grad_accum_steps: int = 1
 
+    # False (default): no per-batch tqdm bar inside run_epoch, only the one
+    # epoch-summary line run_fold already prints. A per-batch bar refreshes
+    # every ~0.1s (src.console.progress's mininterval) via bare '\r' writes,
+    # which is harmless in a live terminal but balloons a saved Kaggle
+    # notebook's cell output into thousands of stored lines over a
+    # multi-hour, multi-epoch run. Set True to restore it for interactive,
+    # step-by-step debugging of a single batch/epoch.
+    show_batch_progress: bool = False
+
 
 def build_folds(df: pd.DataFrame, task: str, cfg: Optional["TrainingConfig"] = None):
     """Yield (fold_id, train_df, test_df) for the requested task's protocol."""
@@ -178,15 +187,32 @@ def _load_completed_fold(run_name: str, fold_id: str, task: str
     return metrics_dict, y_true, y_pred, y_prob, speakers
 
 
+def _format_hm(seconds: float) -> str:
+    """0 <= seconds -> 'XhYYm', for the elapsed/ETA lines below."""
+    seconds = max(0.0, seconds)
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes = remainder // 60
+    return f"{hours}h{minutes:02d}m"
+
+
 def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
             cfg: TrainingConfig, device: torch.device, run_name: str,
             praat_table: Optional[pd.DataFrame] = None,
             frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None,
-            fold_index: int = 1, n_folds: int = 1
+            fold_index: int = 1, n_folds: int = 1,
+            run_start_time: Optional[float] = None,
+            total_epochs_planned: Optional[int] = None,
+            epochs_completed_before: int = 0
             ) -> Tuple[Dict, EpochResult]:
     """Train, validate, checkpoint, and test-evaluate one fold. Returns
     (metrics_dict, test_result) — the caller pools test_result across
-    folds for the cross-fold metrics."""
+    folds for the cross-fold metrics.
+
+    `run_start_time`/`total_epochs_planned`/`epochs_completed_before` are
+    optional whole-run bookkeeping (set by run_training) used only to print
+    an "elapsed / estimated remaining" line after each epoch — a fold
+    trained standalone (e.g. from a notebook cell or the budget-benchmark
+    path) simply omits them and gets the per-epoch line without the ETA."""
     fold_start = time.monotonic()
     label_column = TASK_LABEL_COLUMN[cfg.task]
     num_classes = config.NUM_CLASSES[cfg.task]
@@ -245,6 +271,12 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     log_dir = config.LOG_DIR / run_name / fold_id
     writer = SummaryWriter(log_dir=str(log_dir))
     best_ckpt_path = config.CHECKPOINT_DIR / run_name / fold_id / "best.pt"
+    # Saved after EVERY epoch (unlike best.pt, which only updates on a
+    # val-loss improvement) so an interrupted session loses at most one
+    # in-progress epoch, not everything back to this fold's last improving
+    # epoch. best.pt remains what test evaluation reloads below — this file
+    # exists purely to let a fresh process resume mid-fold.
+    latest_ckpt_path = config.CHECKPOINT_DIR / run_name / fold_id / "latest.pt"
 
     print_fold_progress(fold_id, fold_index, n_folds,
                         len(train_df), len(val_df), len(test_df))
@@ -253,15 +285,35 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
         print()
 
     epochs_completed = 0
-    for epoch in range(cfg.epochs):
+    best_epoch, best_val_f1 = None, None
+    start_epoch = 0
+    if latest_ckpt_path.exists():
+        checkpoint = load_checkpoint(latest_ckpt_path, model, optimizer, scheduler, scaler,
+                                     map_location=str(device))
+        start_epoch = checkpoint["epoch"] + 1
+        es_state = checkpoint.get("early_stopping") or {}
+        early_stopping.best = es_state.get("best", early_stopping.best)
+        early_stopping.num_bad_epochs = es_state.get("num_bad_epochs", 0)
+        early_stopping.should_stop = es_state.get("should_stop", False)
+        best_epoch = checkpoint.get("best_epoch")
+        best_val_f1 = checkpoint.get("best_val_f1")
+        epochs_completed = start_epoch
+        print(f"    Resuming fold {fold_id} from {latest_ckpt_path.name} "
+             f"-- epoch {start_epoch}/{cfg.epochs} onward "
+             f"(model/optimizer/scheduler/scaler/early-stopping state restored)")
+
+    for epoch in range(start_epoch, cfg.epochs) if not early_stopping.should_stop else ():
+        epoch_start = time.monotonic()
+        train_desc = (f"epoch {epoch + 1}/{cfg.epochs} train" if cfg.show_batch_progress else "")
+        val_desc = (f"epoch {epoch + 1}/{cfg.epochs} val" if cfg.show_batch_progress else "")
         train_result = run_epoch(model, train_loader, criterion, optimizer, device,
                                  scaler, cfg.grad_clip, cfg.task, train=True,
-                                 description=f"epoch {epoch + 1}/{cfg.epochs} train",
+                                 description=train_desc,
                                  amp_dtype=amp_dtype, amp_enabled=use_amp,
                                  grad_accum_steps=cfg.grad_accum_steps)
         val_result = run_epoch(model, val_loader, criterion, None, device,
                                scaler, cfg.grad_clip, cfg.task, train=False,
-                               description=f"epoch {epoch + 1}/{cfg.epochs} val",
+                               description=val_desc,
                                amp_dtype=amp_dtype, amp_enabled=use_amp)
         scheduler.step(val_result.loss)
 
@@ -278,11 +330,34 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
         if is_best:
             save_checkpoint(best_ckpt_path, model, optimizer, scheduler, scaler,
                             epoch, val_result.loss)
+            best_epoch, best_val_f1 = epoch + 1, val_result.metrics["f1"]
 
-        print(f"    epoch {epoch + 1:>3}/{cfg.epochs}  {V}  "
-             f"train  loss {train_result.loss:.4f}  acc {train_result.metrics['accuracy']:.3f}  {V}  "
-             f"val  loss {val_result.loss:.4f}  acc {val_result.metrics['accuracy']:.3f}  "
-             f"f1 {val_result.metrics['f1']:.3f}" + ("   <-- best" if is_best else ""))
+        # Every epoch, improving or not -- see latest_ckpt_path's comment
+        # above. Written after best.pt so an interrupted save never leaves
+        # latest.pt claiming an epoch whose best.pt update didn't land.
+        save_checkpoint(latest_ckpt_path, model, optimizer, scheduler, scaler,
+                        epoch, val_result.loss,
+                        extra={"early_stopping": {"best": early_stopping.best,
+                                                  "num_bad_epochs": early_stopping.num_bad_epochs,
+                                                  "should_stop": early_stopping.should_stop},
+                              "best_epoch": best_epoch, "best_val_f1": best_val_f1,
+                              "fold_id": fold_id})
+
+        epoch_time_s = time.monotonic() - epoch_start
+        print(f"    Epoch {epoch + 1:02d}/{cfg.epochs} | "
+             f"Train Loss: {train_result.loss:.4f} | "
+             f"Val Loss: {val_result.loss:.4f} | "
+             f"Val F1: {val_result.metrics['f1']:.4f} | "
+             f"Time: {epoch_time_s / 60:.1f} min" + ("  <-- best" if is_best else ""))
+
+        if run_start_time is not None and total_epochs_planned:
+            epochs_done_total = epochs_completed_before + epochs_completed
+            elapsed_s = time.monotonic() - run_start_time
+            avg_per_epoch_s = elapsed_s / max(epochs_done_total, 1)
+            remaining_epochs = max(0, total_epochs_planned - epochs_done_total)
+            eta_s = avg_per_epoch_s * remaining_epochs
+            print(f"      Elapsed: {_format_hm(elapsed_s)}  |  "
+                 f"Estimated remaining: {_format_hm(eta_s)}")
 
         if early_stopping.should_stop:
             print(f"    early stopping at epoch {epoch + 1} "
@@ -296,7 +371,8 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     inference_start = time.monotonic()
     test_result = run_epoch(model, test_loader, criterion, None, device, scaler,
                             cfg.grad_clip, cfg.task, train=False, collect_embeddings=True,
-                            description=f"held-out test ({fold_id})",
+                            description=(f"held-out test ({fold_id})"
+                                        if cfg.show_batch_progress else ""),
                             amp_dtype=amp_dtype, amp_enabled=use_amp)
     inference_time_s = time.monotonic() - inference_start
     fold_time_s = time.monotonic() - fold_start
@@ -307,6 +383,7 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     save_metrics(config.METRICS_DIR / run_name / f"{fold_id}.json",
                 {"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
                  "epochs_completed": epochs_completed,
+                 "best_epoch": best_epoch, "best_val_f1": best_val_f1,
                  "fold_time_s": fold_time_s, "train_time_s": train_time_s,
                  "inference_time_s": inference_time_s,
                  **(test_result.extras or {})})
@@ -326,8 +403,18 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     print_kv(f"Fold {fold_id} held-out test", ", ".join(
         f"{k}={v:.3f}" for k, v in test_result.metrics.items()))
 
+    print()
+    print(f"  FOLD {fold_index}/{n_folds} ({fold_id}) COMPLETE")
+    print(f"  Best Val F1   : {best_val_f1:.4f}" if best_val_f1 is not None
+         else "  Best Val F1   : n/a (no improving epoch)")
+    print(f"  Best Epoch    : {best_epoch}/{cfg.epochs}" if best_epoch is not None
+         else f"  Best Epoch    : n/a/{cfg.epochs}")
+    print(f"  Fold Time     : {_format_hm(fold_time_s)}")
+    print(f"  Checkpoint    : {best_ckpt_path}")
+
     return ({"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
              "epochs_completed": epochs_completed,
+             "best_epoch": best_epoch, "best_val_f1": best_val_f1,
              "fold_time_s": fold_time_s, "train_time_s": train_time_s,
              "inference_time_s": inference_time_s}, test_result)
 
@@ -434,10 +521,22 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
             print_note("REDUCED SCALE — this is a pipeline check, not a reportable result "
                        "(max_folds / limit_samples are set).")
 
+    print()
+    print_kv("Selected folds", ", ".join(fold_id for fold_id, _, _ in fold_iter))
+    print_kv("Total folds", n_folds)
+    print_kv("Epochs per fold", cfg.epochs)
+
     registry_base = _registry_kwargs(cfg, run_name, n_folds)
     fold_metrics = []
     pooled_true, pooled_pred, pooled_prob, pooled_speakers = [], [], [], []
     failed_folds = []
+    # Whole-run bookkeeping for the per-epoch "Elapsed / Estimated remaining"
+    # line inside run_fold — epochs_completed_running is an actual measured
+    # count (not folds_done * cfg.epochs), since early stopping/resume mean
+    # folds rarely run the full cfg.epochs.
+    run_start_time = time.monotonic()
+    total_epochs_planned = n_folds * cfg.epochs
+    epochs_completed_running = 0
     # Run-level bar: without it, the only cross-fold signal was one-shot text
     # printed at each fold's start/end, with total silence in between on top
     # of the per-batch bars nested inside run_fold — nothing showed overall
@@ -481,7 +580,10 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
             try:
                 metrics_dict, test_result = run_fold(fold_id, train_df, test_df, cfg, device,
                                                      run_name, praat_table, frozen_embedding_table,
-                                                     fold_index=i, n_folds=n_folds)
+                                                     fold_index=i, n_folds=n_folds,
+                                                     run_start_time=run_start_time,
+                                                     total_epochs_planned=total_epochs_planned,
+                                                     epochs_completed_before=epochs_completed_running)
             except Exception:
                 # One fold's OOM/transient failure should not abort a run that
                 # may have already spent hours on earlier folds — log it, free
@@ -512,6 +614,8 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
             # cache-hit folds above since they never allocated anything.
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+
+        epochs_completed_running += metrics_dict.get("epochs_completed") or cfg.epochs
 
         fold_metrics.append(metrics_dict)
         pooled_true.append(y_true)

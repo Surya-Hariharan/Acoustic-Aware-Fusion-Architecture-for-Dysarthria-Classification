@@ -110,7 +110,7 @@ class ExperimentBudgetManager:
             cfg = TrainingConfig(task=task, model=name, epochs=1, max_folds=1,
                                  run_name=f"_budget_bench_{task}_{name}", **cfg_overrides)
             print_status(f"Benchmarking {name} -- 1 fold x 1 epoch, real wall-clock "
-                        "(this is not a silent step; per-batch progress prints below)...", ok=True)
+                        "(not a silent step; a per-epoch summary prints below)...", ok=True)
             start = time.monotonic()
             run_training(df, cfg)
             elapsed = time.monotonic() - start
@@ -365,8 +365,8 @@ def benchmark_batch_sizes(df: pd.DataFrame, task: str, model_name: str,
     rows = []
     for candidate_index, batch_size in enumerate(batch_sizes, start=1):
         print_status(f"[{candidate_index}/{len(batch_sizes)}] Starting batch_size={batch_size} "
-                    f"benchmark -- 1 fold x {epochs} epoch(s), real wall-clock (per-batch "
-                    "progress prints below)...", ok=True)
+                    f"benchmark -- 1 fold x {epochs} epoch(s), real wall-clock (a per-epoch "
+                    "summary prints below)...", ok=True)
         if device.type == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)

@@ -27,16 +27,22 @@ import torch
 
 def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
                     scheduler, scaler: torch.amp.GradScaler, epoch: int,
-                    monitored_value: float) -> None:
+                    monitored_value: float, extra: Optional[dict] = None) -> None:
+    """`extra` is merged into the saved dict as-is (e.g. early-stopping state,
+    fold id) -- used by the per-epoch "latest" resume checkpoint in
+    src.training.runner.run_fold; the best-checkpoint call site simply omits it."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    checkpoint = {
         "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "scaler_state": scaler.state_dict(),
         "monitored_value": monitored_value,
-    }, path)
+    }
+    if extra:
+        checkpoint.update(extra)
+    torch.save(checkpoint, path)
 
 
 def load_checkpoint(path: Path, model: torch.nn.Module,
