@@ -32,6 +32,7 @@ import torchaudio
 
 from src import config
 from src import vad as vad_module
+from src import vad_cache
 from src.console import print_kv, print_status, print_subheader, progress
 
 
@@ -43,8 +44,7 @@ def load_and_preprocess(filepath: str) -> Tuple[torch.Tensor, int]:
     than from the waveform's content, since a genuinely silent stretch of real
     speech must NOT be masked out the way padding must."""
     waveform, _ = _load_resampled(filepath)
-    waveform, _ = vad_module.apply_vad(waveform, config.TARGET_SR)
-    return _pad_or_truncate(waveform)
+    return _pad_or_truncate(_trim(waveform, filepath, supra=False))
 
 
 def load_and_preprocess_supra(filepath: str) -> Tuple[torch.Tensor, int]:
@@ -65,9 +65,7 @@ def load_and_preprocess_supra(filepath: str) -> Tuple[torch.Tensor, int]:
     src.praat.extract_suprasegmental_sequence, which reads this value).
     """
     waveform, _ = _load_resampled(filepath)
-    waveform, _ = vad_module.apply_vad(waveform, config.TARGET_SR,
-                                       speech_pad_ms=config.SUPRA_VAD_SPEECH_PAD_MS)
-    return _pad_or_truncate(waveform)
+    return _pad_or_truncate(_trim(waveform, filepath, supra=True))
 
 
 def load_and_preprocess_with_stats(filepath: str) -> Tuple[torch.Tensor, int, Dict]:
@@ -80,6 +78,35 @@ def load_and_preprocess_with_stats(filepath: str) -> Tuple[torch.Tensor, int, Di
     waveform, stats = vad_module.apply_vad(waveform, config.TARGET_SR)
     waveform, valid_length = _pad_or_truncate(waveform)
     return waveform, valid_length, stats
+
+
+def _trim(waveform: torch.Tensor, filepath: str, *, supra: bool) -> torch.Tensor:
+    """VAD-trim to the contiguous first..last speech span for one profile.
+
+    Reads the span from the precomputed table (src.vad_cache) when it is
+    present. A table hit is BIT-IDENTICAL to running Silero: apply_vad's only
+    effect on the signal is waveform[:, start:end], and each of its five
+    fallback branches returns the untrimmed waveform, which the cache stores as
+    the span (0, N). On a miss — no cache built, or one built under a different
+    VAD configuration — this falls through to the live Silero path unchanged,
+    so the cache is an optimization and never a correctness precondition.
+
+    The clamp is defensive rather than load-bearing: Silero already bounds its
+    timestamps, but speech_pad_ms arithmetic has moved across releases and two
+    comparisons cost nothing next to a neural forward pass.
+    """
+    span = vad_cache.vad_span(filepath, supra=supra)
+    if span is None:
+        speech_pad_ms = config.SUPRA_VAD_SPEECH_PAD_MS if supra else None
+        trimmed, _ = vad_module.apply_vad(waveform, config.TARGET_SR,
+                                          speech_pad_ms=speech_pad_ms)
+        return trimmed
+
+    num_samples = waveform.shape[-1]
+    start, end = span
+    start = max(0, min(int(start), num_samples))
+    end = max(start, min(int(end), num_samples))
+    return waveform[:, start:end]
 
 
 def _load_resampled(filepath: str) -> Tuple[torch.Tensor, int]:
@@ -270,12 +297,31 @@ def validate_mfcc_output(features: torch.Tensor, valid_length: int,
 # _disk_cache_path / precompute_framewise_feature_cache), which is what
 # actually gives cross-worker and cross-process-restart sharing for those.
 # ---------------------------------------------------------------------------
+def cache_key(filepath: str) -> str:
+    """Machine-independent disk-cache key for one utterance: its BASENAME.
+
+    NOT the absolute path. The manifest's Filepath column is rooted at
+    whichever checkout produced it — "C:/Users/.../data/extracted/..." on a
+    Windows laptop, "/kaggle/working/<repo>/data/extracted/..." on Kaggle — so
+    hashing it produces a cache that can never be shipped between machines:
+    every lookup on the other machine misses and the ~2,000-parselmouth-call
+    pass is paid again from scratch. That is precisely the cost the disk cache
+    exists to remove, so the key must not depend on where the corpus lives.
+
+    UA-Speech basenames are speaker-prefixed (<Speaker>_<Block>_<Word>_<Mic>.wav)
+    and therefore unique across the whole M6 manifest — asserted in
+    src.vad_cache.precompute_vad_span_cache — and Filename is already this
+    project's join key everywhere else (praat_features.csv, vad_stats.csv,
+    src/error_analysis.py).
+    """
+    return Path(filepath).name
+
+
 def _disk_cache_path(cache_dir: Path, filepath: str) -> Path:
     """Filesystem-safe cache location for `filepath` under `cache_dir`, keyed
-    the same way as the in-memory lru_caches above (filepath alone, fixed
-    config) — an md5 hash sidesteps Windows path-length limits and characters
-    that aren't valid in filenames."""
-    digest = hashlib.md5(filepath.encode("utf-8")).hexdigest()
+    by cache_key(filepath) — an md5 hash of it sidesteps Windows path-length
+    limits and characters that aren't valid in filenames."""
+    digest = hashlib.md5(cache_key(filepath).encode("utf-8")).hexdigest()
     return cache_dir / f"{digest}.npy"
 
 
@@ -286,7 +332,8 @@ def _precompute_one(filepath: str) -> None:
     extract_suprasegmental_features_cached(filepath)
 
 
-def precompute_framewise_feature_cache(df: pd.DataFrame, n_workers: int = 4) -> None:
+def precompute_framewise_feature_cache(df: pd.DataFrame, n_workers: int = 4,
+                                       build_spans: bool = True) -> None:
     """
     One-time, parallel build of the disk-backed framewise-feature cache for
     every file in `df["Filepath"]`.
@@ -321,6 +368,15 @@ def precompute_framewise_feature_cache(df: pd.DataFrame, n_workers: int = 4) -> 
 
     if config.VAD_ENABLED:
         vad_module.warmup_silero_vad()
+
+    # Build the VAD span table FIRST, so the Praat workers below read their
+    # trims from it instead of each running Silero twice per file — and so the
+    # table is on disk before training starts, which is where it does the real
+    # work (see src.vad_cache). build_spans=False skips this when the caller
+    # has already built or shipped the table.
+    if build_spans:
+        from src.vad_cache import precompute_vad_span_cache
+        precompute_vad_span_cache(df, n_workers=n_workers)
 
     filepaths = df["Filepath"].tolist()
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
@@ -509,7 +565,15 @@ def segmental_standardizer(filepaths) -> Tuple[np.ndarray, np.ndarray]:
     count = 0
     for filepath in filepaths:
         features = extract_segmental_features_cached(filepath).numpy()   # (43, T)
-        _, valid_length = load_and_preprocess_cached(filepath)
+        # valid_length ONLY — the waveform is discarded, so decoding the file
+        # and running Silero to obtain it was pure waste. build_loaders calls
+        # this once per fold over ~9,600 training filepaths, single-threaded in
+        # the main process, and that measured as ~1,250 s of dead time before
+        # every fold on a Kaggle T4. The table lookup is equal by construction:
+        # _pad_or_truncate defines valid_length as min(end - start, MAX_SAMPLES).
+        valid_length = vad_cache.vad_valid_length(filepath)
+        if valid_length is None:                              # cache miss
+            _, valid_length = load_and_preprocess_cached(filepath)
         valid_frames = min(mfcc_frame_count(valid_length), features.shape[-1])
         if valid_frames <= 0:
             continue
@@ -571,7 +635,9 @@ def suprasegmental_standardizer(filepaths) -> Tuple[np.ndarray, np.ndarray]:
     count = np.zeros(n, dtype=np.float64)
     for filepath in filepaths:
         features = extract_suprasegmental_features_cached(filepath).numpy()   # (3, T)
-        _, valid_length = load_and_preprocess_supra_cached(filepath)
+        valid_length = vad_cache.vad_valid_length(filepath, supra=True)
+        if valid_length is None:                              # cache miss
+            _, valid_length = load_and_preprocess_supra_cached(filepath)
         valid_frames = min(mfcc_frame_count(valid_length), features.shape[-1])
         if valid_frames <= 0:
             continue

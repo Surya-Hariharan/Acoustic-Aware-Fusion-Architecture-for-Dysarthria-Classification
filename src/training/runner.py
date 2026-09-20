@@ -111,12 +111,11 @@ class TrainingConfig:
     # DEFAULT_BATCH_SIZE was tuned for.
     grad_accum_steps: int = 1
 
-    # False (default): no per-batch tqdm bar inside run_epoch, only the one
-    # epoch-summary line run_fold already prints. A per-batch bar refreshes
-    # every ~0.1s (src.console.progress's mininterval) via bare '\r' writes,
-    # which is harmless in a live terminal but balloons a saved Kaggle
-    # notebook's cell output into thousands of stored lines over a
-    # multi-hour, multi-epoch run. Set True to restore it for interactive,
+    # False (default): no per-batch progress line inside run_epoch, only the one
+    # epoch-summary line run_fold already prints. src.console.progress now
+    # throttles to one line every PROGRESS_INTERVAL_S rather than animating a
+    # bar, so this is far cheaper than it was, but a per-batch report still
+    # says nothing an epoch summary does not. Set True for interactive,
     # step-by-step debugging of a single batch/epoch.
     show_batch_progress: bool = False
 
@@ -256,14 +255,23 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     use_amp = cfg.amp if cfg.amp is not None else (device.type == "cuda")
-    # bf16 over fp16 whenever the GPU supports it (Ampere/Ada and later,
-    # including the RTX 4060): bf16 keeps fp32's exponent range, so it can't
-    # underflow the way fp16 can mid LoRA fine-tuning, and needs no loss
-    # scaling — GradScaler is a no-op for gradient values in that range, so
-    # it's only left enabled for the fp16 fallback path where scaling is
-    # actually load-bearing.
-    amp_dtype = (torch.bfloat16 if use_amp and device.type == "cuda"
-                and torch.cuda.is_bf16_supported() else torch.float16)
+    # bf16 over fp16 whenever the GPU supports it NATIVELY (Ampere/Ada and
+    # later, i.e. compute capability >= 8.0 — including the RTX 4060): bf16
+    # keeps fp32's exponent range, so it can't underflow the way fp16 can mid
+    # LoRA fine-tuning, and needs no loss scaling — GradScaler is a no-op for
+    # gradient values in that range, so it's only left enabled for the fp16
+    # fallback path where scaling is actually load-bearing.
+    #
+    # The capability check is deliberate, and is NOT the same question as
+    # torch.cuda.is_bf16_supported(): recent PyTorch answers that one True on
+    # pre-Ampere cards where bf16 is EMULATED rather than run on the tensor
+    # cores. On a Kaggle T4 (Turing, sm_75) that silently trades the card's
+    # fast fp16 path for a slow software one — the opposite of what asking for
+    # AMP was meant to buy. Turing has no native bf16, so it gets fp16 plus a
+    # live GradScaler, which is the configuration fp16 needs anyway.
+    supports_bf16 = (device.type == "cuda"
+                     and torch.cuda.get_device_capability(device)[0] >= 8)
+    amp_dtype = torch.bfloat16 if (use_amp and supports_bf16) else torch.float16
     scaler = torch.amp.GradScaler(device=device.type,
                                   enabled=use_amp and amp_dtype == torch.float16)
     early_stopping = EarlyStopping(patience=cfg.patience, mode="min")

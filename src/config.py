@@ -38,6 +38,22 @@ FEATURE_CACHE_DIR = OUTPUT_DIR / "feature_cache"
 SEGMENTAL_EXTRA_CACHE_DIR = FEATURE_CACHE_DIR / "segmental_extra"
 SUPRASEGMENTAL_CACHE_DIR = FEATURE_CACHE_DIR / "suprasegmental"
 
+# Filename -> Silero VAD (start, end) sample spans, for BOTH preprocessing
+# profiles (speech-focused VAD_SPEECH_PAD_MS, temporal-preserving
+# SUPRA_VAD_SPEECH_PAD_MS). See src/vad_cache.py.
+#
+# apply_vad's only effect on the signal is waveform[:, start:end], so storing
+# those two integers and slicing from them is bit-identical to re-running the
+# model — with none of the cost. Without this, UASpeechDataset.__getitem__ ran
+# TWO Silero forward passes per utterance per epoch (~21,400 per epoch), which
+# measured as ~81% of per-item CPU time and left the GPU idle: a Kaggle T4 run
+# clocked a flat 8.5 samples/sec at batch sizes 16, 24 AND 32, using only
+# 4.2 GB of 15 GB.
+#
+# ~0.5 MB of parquet for the full 21,420-file M6 manifest — small enough to
+# commit and to ship inside a Kaggle dataset, which is the point.
+VAD_SPAN_CACHE_PATH = FEATURE_CACHE_DIR / "vad_spans.parquet"
+
 # Three-branch severity architecture's figure/table/diagnostic subdirectories
 # (architecture plan Work Package C) — kept as separate named constants
 # rather than folded into FIGURE_DIR/ERROR_FIGURE_DIR so each analysis
@@ -218,13 +234,17 @@ SUPRA_VAD_SPEECH_PAD_MS = 150
 # Per-(process, filepath) memoization cap for src.preprocessing's cached
 # loaders — see load_and_preprocess_cached / extract_mfcc_features_cached.
 # Every DataLoader worker process holds its own cache up to this many
-# utterances; ~256 KB/waveform + ~62 KB/MFCC at CLIP_SECONDS=4.0, so 4000
-# is roughly 1.3 GB per worker (x num_workers processes — see
-# TrainingConfig.num_workers). Lower this (or set to 0 to disable caching
-# entirely) if a Colab session is RAM-constrained; raise it only up to the
-# fold's utterance count (more than that is wasted headroom, since nothing
-# beyond it will ever be re-requested within one fold).
-PREPROCESS_CACHE_SIZE = 4000
+# utterances; ~256 KB/waveform + ~62 KB/MFCC at CLIP_SECONDS=4.0, so this is
+# roughly 160 MB per worker (x num_workers processes — see
+# TrainingConfig.num_workers). Set to 0 to disable caching entirely.
+#
+# 4000 -> 512: at 4000 the four workers reserved ~5 GB between them to
+# paper over a cache MISS that cost ~50 ms (two Silero VAD forward passes and
+# two file loads). Against a 9,639-utterance shuffled train split the LRU
+# thrashed anyway, so it bought little for that memory. With the VAD spans on
+# disk (VAD_SPAN_CACHE_PATH above) a miss costs ~10 ms, so the LRU stops being
+# load-bearing and the RAM is better spent on DataLoader prefetch depth.
+PREPROCESS_CACHE_SIZE = 512
 
 # ---------------------------------------------------------------------------
 # Label mappings

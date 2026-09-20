@@ -110,6 +110,23 @@ def build_speaker_label_map(train_df: pd.DataFrame) -> Dict[str, int]:
     return {speaker: i for i, speaker in enumerate(speakers)}
 
 
+def _init_worker(worker_id: int) -> None:
+    """Pin each DataLoader worker to a single intra-op thread.
+
+    torch defaults its intra-op pool to the machine's core count, and every
+    worker process gets its own pool — so num_workers=4 on Kaggle's 4-vCPU
+    box asks for 16 threads on 4 cores. The oversubscription costs more in
+    contention and context switching than the per-item ops (MFCC/STFT on a
+    4-second clip) could ever recover from parallelism, since each item is
+    already small and the parallelism that matters is across workers.
+
+    Numerically neutral: these reductions are deterministic at any thread
+    count for these sizes, and tests/test_vad_span_cache.py's equality gate
+    runs single-threaded against the pre-change outputs.
+    """
+    torch.set_num_threads(1)
+
+
 def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame,
                   batch_size: int, num_workers: int, pin_memory: bool,
                   praat_table: Optional[pd.DataFrame] = None,
@@ -187,7 +204,8 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     # prepare the next batch while the current one trains on the GPU.
     loader_kwargs = dict(num_workers=num_workers, pin_memory=pin_memory)
     if num_workers > 0:
-        loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=4,
+                             worker_init_fn=_init_worker)
 
     train_loader = DataLoader(
         dataset(train_df, with_speaker_labels=True), batch_size=batch_size, shuffle=True,

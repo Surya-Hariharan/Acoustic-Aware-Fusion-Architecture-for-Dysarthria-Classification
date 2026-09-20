@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src import config
+from src import vad_cache
 from src.praat import praat_vector
 from src.preprocessing import (extract_mfcc_features_cached,
                                extract_segmental_features_cached,
@@ -156,7 +157,16 @@ class UASpeechDataset(Dataset):
             # above (not a second source of truth — mirrors mfcc_valid_frames).
             segmental_valid_frames = min(mfcc_frame_count(waveform_length), segmental.shape[-1])
 
-            _, supra_valid_length = load_and_preprocess_supra_cached(row["Filepath"])
+            # valid_length ONLY — the waveform is discarded here, so the old
+            # load_and_preprocess_supra_cached(...) call opened the audio a
+            # SECOND time and ran a SECOND Silero forward pass per item, per
+            # epoch, purely to obtain this integer. The table lookup is equal
+            # by construction (src.vad_cache.vad_valid_length), and with the
+            # framewise .npy cache warm the temporal-preserving profile now
+            # never touches an audio file at all.
+            supra_valid_length = vad_cache.vad_valid_length(row["Filepath"], supra=True)
+            if supra_valid_length is None:                     # cache miss
+                _, supra_valid_length = load_and_preprocess_supra_cached(row["Filepath"])
             supra_valid_frames = min(mfcc_frame_count(supra_valid_length),
                                      supra.shape[-1])
 

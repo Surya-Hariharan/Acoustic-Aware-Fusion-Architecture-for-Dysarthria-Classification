@@ -6,7 +6,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.5.1-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Transformers](https://img.shields.io/badge/Transformers-5.5.4-FFD21E?logo=huggingface&logoColor=black)](https://huggingface.co/docs/transformers)
 [![PEFT](https://img.shields.io/badge/PEFT%20(LoRA)-0.19.1-6F42C1)](https://huggingface.co/docs/peft)
-[![Tests](https://img.shields.io/badge/tests-86%20passing-4c1)](tests/)
+[![Tests](https://img.shields.io/badge/tests-107%20passing-4c1)](tests/)
 [![Architecture](https://img.shields.io/badge/architecture-frozen-informational)](#current-status)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -181,6 +181,18 @@ Every utterance passes through one deterministic chain (`src/preprocessing.py`, 
 > [!NOTE]
 > **Framewise Praat feature cache.** The Segmental and Suprasegmental branches' per-frame formant/HNR/F0/voicing/intensity extraction runs on the order of 2,000 individual `parselmouth` (Praat) calls per utterance — CPU-bound and single-threaded, and by far the largest cost in the pipeline if left uncached (the GPU sits idle waiting on it). `src/preprocessing.py`'s in-memory `lru_cache` alone doesn't help across DataLoader-worker or kernel restarts, so results are additionally persisted to disk under `outputs/feature_cache/`. `precompute_framewise_feature_cache(df)` builds this cache once, in parallel, for the whole corpus (~40 minutes the first time, on the order of seconds thereafter) — run as the first real step in `notebooks/03_training.ipynb`, before any benchmarking or training begins.
 
+> [!NOTE]
+> **VAD span cache — the dataloader's dominant cost.** Both preprocessing profiles ran Silero VAD over the utterance, and both were memoized *in memory only*. Against a 9,639-utterance shuffled train split spread over four worker processes, that LRU thrashes, so `UASpeechDataset.__getitem__` ran **two neural forward passes per item, per epoch** — roughly 21,400 per epoch. Measured on the real corpus, VAD was **80.8%** of per-item CPU time (42.6 ms of 52.8 ms), and one line existed only to obtain a single integer: it opened the audio a second time and ran a second VAD pass to learn `supra_valid_length`.
+>
+> The symptom was a GPU that never worked. A Kaggle T4 run measured a **flat 8.5 samples/sec at batch sizes 16, 24 and 32**, peaking at 4.2 GB of the card's 15 GB — throughput that does not move with batch size is a starved GPU, not a busy one.
+>
+> `src/vad_cache.py` stores the `(start, end)` sample span per utterance per profile in `outputs/feature_cache/vad_spans.parquet` (239 KB for all 21,420 utterances, committed to the repo). This is **not an approximation**: `apply_vad`'s only effect on the signal is `waveform[:, start:end]`, and each of its five fallback branches returns the untrimmed waveform, stored as `(0, N)`. Slicing from stored integers is bit-identical to re-running the model — pinned by `tests/test_vad_span_cache.py`, which asserts `torch.equal` on waveforms, MFCC and the 43-channel segmental tensor, and array-equality on the fold-scoped standardizer statistics. `verify_vad_span_cache` additionally re-runs live Silero on a sample of real utterances; all 300 sampled spans matched exactly.
+>
+> A cache that is *wrong* is worse than one that is absent, because the framewise `.npy` caches are derived from these spans — so the VAD configuration signature is written into the parquet metadata and a mismatch is refused loudly. Every lookup returns `None` on a miss and falls through to live Silero, so deleting the file changes no result, only the speed.
+
+> [!NOTE]
+> **Disk caches are keyed by filename, not by path.** `_disk_cache_path` previously hashed the *absolute* filepath. The manifest's paths are rooted at whichever checkout produced them, so a cache built on a laptop could never be read on Kaggle — every lookup missed and the whole cost was paid again. `src.preprocessing.cache_key` now keys on the basename, which UA-Speech makes unique (speaker-prefixed) and which is already this project's join key in `praat_features.csv` and `vad_stats.csv`.
+
 ## Training strategy
 
 | Aspect | Setting | Source |
@@ -196,7 +208,7 @@ Every utterance passes through one deterministic chain (`src/preprocessing.py`, 
 | Batch / epochs | 32 / 15 max, gradient clipping 1.0, AMP on CUDA | `config.DEFAULT_BATCH_SIZE`, `DEFAULT_EPOCHS` |
 | Validation | 10% stratified, carved from each fold's train split | `config.DEFAULT_VAL_FRACTION` |
 | Seed | 42 | `config.DEFAULT_SEED` |
-| Compute budget | Hard 10h wall-clock cap for the 15-fold primary run (RTX 4060 laptop, 8GB) — enforced via a measured, not guessed, per-fold-epoch deadline | `config.PRIMARY_SEVERITY_BUDGET_HOURS`, `src.training.budget.ExperimentBudgetManager` |
+| Compute budget | 40,000 s wall-clock for the whole 15-fold primary run on one Kaggle T4 session — the run is *sized* to the budget from a measured throughput calibration, not started and hoped for | `src.training.session.calibrate_throughput`, `plan_session`; deadline wired into `run_training` |
 
 > [!NOTE]
 > **Patience 3 / epoch ceiling 15 is a compute-budget-driven tightening, not an
@@ -267,6 +279,7 @@ src/
   preprocessing.py           Resampling, VAD trimming, padding, MFCC, the two VAD profiles,
                               framewise segmental/suprasegmental extraction
   vad.py                     Silero VAD wrapper (trim, fallback, per-utterance stats)
+  vad_cache.py               Disk-persisted VAD spans — build, verify, lookup
   praat.py                   Utterance-level Praat features + framewise F0/voicing/intensity
                               and formant/HNR extraction + severity-group significance
   losses.py                  CORAL ordinal loss, cross-branch redundancy penalty, GRL
@@ -298,10 +311,13 @@ src/
     reporting.py             Artifact I/O, feature audit, frozen-config write/guard
     baseline.py              Frozen wav2vec + linear SVM per fold
     budget.py                ExperimentBudgetManager: wall-clock budget allocation
+    session.py               Throughput calibration + sizing the run to a wall-clock budget
     checkpoint.py  early_stopping.py  utils.py
-tests/                       10 modules, 86 tests — architecture shapes, CORAL/redundancy/GRL
+tests/                       11 modules, 107 tests — architecture shapes, CORAL/redundancy/GRL
                               numerics, LOSO fold construction, masking, frame alignment,
-                              frozen-config round-trip, experiment-validity guards
+                              frozen-config round-trip, experiment-validity guards, and the
+                              VAD-span-cache equality gate (bit-identical tensors with and
+                              without the cache)
 data/
   raw/                       Place the UA-Speech .tgz archives here
   extracted/                 Extracted .wav files (gitignored)
@@ -336,7 +352,7 @@ pip install -r requirements.txt
 Silero VAD loads via `torch.hub` and needs internet access on first run only (~2 MB, cached thereafter). An optional `HF_TOKEN` environment variable (see `.env.example`) lifts the unauthenticated Hugging Face rate limit; the checkpoint used here is public and loads without it.
 
 ```bash
-pytest                        # full suite — 86 tests
+pytest                        # full suite — 107 tests
 jupyter notebook notebooks/01_data_pipeline.ipynb
 ```
 

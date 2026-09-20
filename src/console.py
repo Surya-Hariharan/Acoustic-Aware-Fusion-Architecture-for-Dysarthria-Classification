@@ -15,22 +15,18 @@ correctly in a notebook and in a piped log.
 """
 
 import sys
+import time
 from typing import Dict, Iterable, Optional
 
 import pandas as pd
 
-# huggingface_hub/transformers report download and checkpoint-loading progress
-# via `tqdm.auto`, which resolves to the ipywidgets notebook bar in a Jupyter
-# kernel. That bar only animates in a *connected* kernel — the same
-# static-render problem documented on progress() below — so it forces the
-# same import here to make every library's bars (ours and HF's) plain ANSI
-# text that replays correctly from a saved/reopened notebook.
-import tqdm.std
-import tqdm.auto
-tqdm.auto.tqdm = tqdm.std.tqdm
-
 LINE_WIDTH = 78
 KEY_WIDTH = 40
+
+# How often progress() is allowed to emit a line. A multi-hour run over 21,420
+# files should leave a handful of readable checkpoints in the log, not one line
+# per file and not a carriage-return animation — see the note on progress().
+PROGRESS_INTERVAL_S = 30.0
 
 
 def _supports_unicode() -> bool:
@@ -257,27 +253,158 @@ def print_fold_progress(fold_id: str, index: int, total: int,
     print(f"{H_LIGHT * LINE_WIDTH}")
 
 
+def format_duration(seconds: float) -> str:
+    """Human-readable duration, scaled to its own magnitude: '42s', '7m13s',
+    '2h05m'. A cache build that takes 40 seconds and a fold that takes four
+    hours both get a figure worth reading, rather than everything short
+    collapsing to '0h00m'."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{secs:02d}s"
+
+
+class ProgressReporter:
+    """A throttled, line-oriented progress report. No bars, no carriage returns.
+
+    Replaces the tqdm bar this project used to wrap. tqdm renders by rewriting
+    one line with '\\r', which is unreadable in any context that does not replay
+    carriage returns — and a saved Kaggle notebook is exactly such a context:
+    the previous run's log came back 14,862 lines long, the large majority of it
+    frozen partial bars, several hundred of them from a single model load. A
+    multi-hour unattended run needs a log that can be read after the fact, so
+    this emits one complete line at most every PROGRESS_INTERVAL_S seconds:
+
+        Computing VAD spans                 4,800/21,420   22%  elapsed 0h02m  eta 0h07m
+
+    Supports the small slice of the tqdm API this codebase actually used —
+    iteration, update(), set_postfix_str(), close(), and the context-manager
+    protocol — so every existing call site is unchanged.
+
+    `leave=False` suppresses the completion line, for short inner loops (see
+    src.training.engine.run_epoch) whose enclosing stage reports its own summary.
+    """
+
+    def __init__(self, iterable=None, description: str = "", total: Optional[int] = None,
+                 leave: bool = True, unit: str = "it",
+                 interval_s: float = PROGRESS_INTERVAL_S):
+        self.iterable = iterable
+        self.description = description
+        self.total = total if total is not None else _length_or_none(iterable)
+        self.leave = leave
+        self.unit = unit
+        self.interval_s = interval_s
+        self.n = 0
+        self.postfix = ""
+        self._start = time.monotonic()
+        self._last_emit = self._start
+        self._closed = False
+
+    # -- tqdm-compatible surface --------------------------------------------
+    def update(self, n: int = 1) -> None:
+        self.n += n
+        self._maybe_emit()
+
+    def set_postfix_str(self, postfix: str) -> None:
+        self.postfix = postfix
+
+    def set_description(self, description: str) -> None:
+        self.description = description
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.leave:
+            self._emit(final=True)
+
+    def __iter__(self):
+        for item in self.iterable:
+            yield item
+            self.update(1)
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+    # -- rendering -----------------------------------------------------------
+    def _maybe_emit(self) -> None:
+        now = time.monotonic()
+        if now - self._last_emit >= self.interval_s:
+            self._emit()
+            self._last_emit = now
+
+    def _emit(self, final: bool = False) -> None:
+        elapsed = time.monotonic() - self._start
+        parts = [f"  {self.description:<36}"]
+
+        if self.total:
+            parts.append(f"{self.n:>7,}/{self.total:<7,}")
+            fraction = self.n / self.total
+            parts.append(f"{100 * fraction:3.0f}%")
+        else:
+            parts.append(f"{self.n:>7,} {self.unit}")
+
+        parts.append(f" elapsed {format_duration(elapsed)}")
+        if final:
+            # Below a second the elapsed time is mostly measurement noise, so a
+            # derived rate would be a made-up number rather than a slow one.
+            if elapsed >= 1.0:
+                parts.append(f" ({self.n / elapsed:,.1f} {self.unit}/s)")
+        elif self.total and self.n:
+            remaining = elapsed * (self.total - self.n) / self.n
+            parts.append(f" eta {format_duration(remaining)}")
+        if self.postfix:
+            parts.append(f"  {self.postfix}")
+
+        print("".join(parts), flush=True)
+
+
+def _length_or_none(iterable) -> Optional[int]:
+    """len(iterable) where it is cheap, else None — generators and
+    ProcessPoolExecutor.map results have no length, and asking is not an error."""
+    try:
+        return len(iterable)
+    except TypeError:
+        return None
+
+
 def progress(iterable, description: str, total: Optional[int] = None,
-             leave: bool = True, unit: str = "it"):
+             leave: bool = True, unit: str = "it") -> ProgressReporter:
+    """Wrap a long-running loop in a ProgressReporter.
+
+    One entry point so every stage (feature extraction, epochs, embedding
+    passes, fold loops) reports identically. Signature is unchanged from the
+    tqdm-backed version it replaces.
     """
-    A tqdm progress bar with the project's house style.
+    return ProgressReporter(iterable, description=description, total=total,
+                            leave=leave, unit=unit)
 
-    Wrapped in one place so every long-running loop (feature extraction, epochs,
-    embedding passes) reports identically, and so tqdm stays a single import to
-    swap if it is ever unavailable.
 
-    Deliberately `tqdm.std.tqdm` (plain ANSI text), not `tqdm.auto` /
-    `tqdm.notebook`. The ipywidgets-backed notebook bar only updates live in a
-    *connected* kernel — once a notebook is saved, reopened, or viewed statically
-    (VS Code preview, GitHub, this repo's committed execution outputs), only the
-    frozen 0% snapshot from bar-creation is shown. Plain-text `\r` updates are
-    written straight into the cell's stream output, so both Jupyter/VS Code (which
-    replay `\r` correctly) and static renderers show the true final bar.
+def silence_library_progress() -> None:
+    """Turn off third-party progress bars and demote Transformers to errors.
+
+    Transformers 5.x prints a per-parameter "Loading weights" bar on every
+    from_pretrained call. The three-branch model is rebuilt once per fold, so a
+    15-fold run emitted several thousand log lines of it — and the accompanying
+    'lm_head.* UNEXPECTED' report is expected here anyway (the checkpoint's
+    discarded CTC head, see src/models/deep_pathway.py). Safe to call before the
+    libraries are installed or importable: each block degrades to a no-op.
     """
-    from tqdm import tqdm
-
-    return tqdm(iterable, desc=f"  {description}", total=total, leave=leave,
-                unit=unit, ncols=100, mininterval=0.1, file=sys.stdout,
-                bar_format=(
-                    "{desc:<34} {percentage:3.0f}%|{bar}| "
-                    "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"))
+    try:
+        from huggingface_hub.utils import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+    try:
+        from transformers.utils import logging as hf_logging
+        hf_logging.set_verbosity_error()
+        hf_logging.disable_progress_bar()
+    except Exception:
+        pass

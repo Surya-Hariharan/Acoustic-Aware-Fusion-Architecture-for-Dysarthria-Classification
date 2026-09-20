@@ -11,6 +11,17 @@ data/
 # Generated outputs
 outputs/
 
+# ...except the VAD span table (src/vad_cache.py). It is 239 KB of integers,
+# it is what keeps the dataloader from re-running Silero twice per utterance
+# per epoch, and rebuilding it costs ~25 minutes of a 40,000 s Kaggle budget.
+# Committing it means a fresh clone — or a Kaggle session — starts with it
+# already in place. Git needs the parent directories un-ignored to reach it.
+!outputs/
+outputs/*
+!outputs/feature_cache/
+outputs/feature_cache/*
+!outputs/feature_cache/vad_spans.parquet
+
 # Python
 __pycache__/
 *.pyc

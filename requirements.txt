@@ -27,7 +27,10 @@ seaborn==0.13.2
 scikit-learn==1.7.2
 tensorboard==2.21.0
 praat-parselmouth==0.4.7
-tqdm==4.67.3
+# tqdm is no longer a direct dependency — src/console.py's progress()
+# reports in plain lines instead of carriage-return bars (see its
+# ProgressReporter docstring). It remains installed transitively via
+# huggingface_hub/transformers; nothing in src/ imports it.
 python-dotenv==1.1.1
 umap-learn==0.5.7
 shap==0.48.0
