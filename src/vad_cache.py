@@ -57,7 +57,6 @@ refused loudly and the cache ignored.
 
 import json
 import os
-from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -71,6 +70,7 @@ from src import config
 from src import vad as vad_module
 from src.console import (print_kv, print_note, print_status, print_subheader,
                          progress)
+from src.parallel import resilient_process_map
 
 # Bump when the stored COLUMN LAYOUT changes (not when a VAD tunable changes —
 # those travel in the signature below and are compared value-by-value).
@@ -269,23 +269,30 @@ def precompute_vad_span_cache(df: pd.DataFrame, n_workers: int = 4,
         description = "Computing VAD spans (both profiles)"
 
     filepaths = df["Filepath"].tolist()
-    records: List[Dict[str, object]] = []
-    with ProcessPoolExecutor(
-        max_workers=n_workers,
+    records, skipped = resilient_process_map(
+        worker_fn, filepaths, n_workers=n_workers,
         max_tasks_per_child=config.PRECOMPUTE_MAX_TASKS_PER_CHILD,
-    ) as executor:
-        for record in progress(executor.map(worker_fn, filepaths, chunksize=8),
-                               description, total=len(filepaths), unit="file"):
-            records.append(record)
+        description=description, unit="file",
+    )
+    if skipped:
+        print_note(
+            f"{len(skipped)} of {len(filepaths):,} file(s) were skipped after "
+            f"stalling or failing (see above for which) — they are simply "
+            f"absent from the span cache and fall back to live VAD at read "
+            f"time. Re-run precompute_vad_span_cache(df, force=True) later to "
+            f"fill them in, ideally after checking those specific files play "
+            f"back correctly."
+        )
 
     table = pd.DataFrame.from_records(records)
     if seeded is not None:
         table = table.drop(columns=["num_samples"]).merge(seeded, on="Filename", how="inner")
-        if len(table) != len(df):
+        expected_len = len(df) - len(skipped)
+        if len(table) != expected_len:
             raise RuntimeError(
-                f"Seeded merge lost rows ({len(table):,} of {len(df):,}) — "
-                f"{config.VAD_STATS_PATH} and the manifest disagree on Filename. "
-                f"Re-run with seed_from_vad_stats=False."
+                f"Seeded merge lost rows ({len(table):,} of {expected_len:,} "
+                f"expected) — {config.VAD_STATS_PATH} and the manifest "
+                f"disagree on Filename. Re-run with seed_from_vad_stats=False."
             )
     table = table[SPAN_COLUMNS]
 

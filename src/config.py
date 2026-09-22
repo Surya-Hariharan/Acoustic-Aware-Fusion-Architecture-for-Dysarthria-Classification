@@ -260,6 +260,16 @@ PREPROCESS_CACHE_SIZE = 512
 # max_tasks_per_child there), which every supported runtime here satisfies.
 PRECOMPUTE_MAX_TASKS_PER_CHILD = 200
 
+# If no task in a precompute pass (src.vad_cache, src.preprocessing) completes
+# within this many seconds while work remains, the pass assumes the
+# outstanding task(s) are permanently stuck (a corrupt file, a decode hang —
+# see src.parallel.resilient_process_map) rather than merely slow, kills the
+# stalled worker process(es), logs which file(s) were skipped, and continues
+# with the rest instead of hanging silently forever. 900s is generous next to
+# the ~30-80 ms a single file normally costs, so it only fires on a genuine
+# stall, not a slow batch.
+PRECOMPUTE_STALL_TIMEOUT_S = 900
+
 # ---------------------------------------------------------------------------
 # Label mappings
 # ---------------------------------------------------------------------------

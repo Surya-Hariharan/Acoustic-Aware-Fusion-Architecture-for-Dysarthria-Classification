@@ -21,7 +21,6 @@ Acoustic Pathway (matching the base paper's baseline features).
 
 import gc
 import hashlib
-from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -34,7 +33,8 @@ import torchaudio
 from src import config
 from src import vad as vad_module
 from src import vad_cache
-from src.console import print_kv, print_status, print_subheader, progress
+from src.console import print_kv, print_note, print_status, print_subheader, progress
+from src.parallel import resilient_process_map
 
 
 def load_and_preprocess(filepath: str) -> Tuple[torch.Tensor, int]:
@@ -395,14 +395,19 @@ def precompute_framewise_feature_cache(df: pd.DataFrame, n_workers: int = 4,
         precompute_vad_span_cache(df, n_workers=n_workers)
 
     filepaths = df["Filepath"].tolist()
-    with ProcessPoolExecutor(
-        max_workers=n_workers,
+    _, skipped = resilient_process_map(
+        _precompute_one, filepaths, n_workers=n_workers,
         max_tasks_per_child=config.PRECOMPUTE_MAX_TASKS_PER_CHILD,
-    ) as executor:
-        for _ in progress(executor.map(_precompute_one, filepaths, chunksize=4),
-                          "Pre-warming framewise Praat feature cache",
-                          total=len(filepaths), unit="file"):
-            pass
+        description="Pre-warming framewise Praat feature cache", unit="file",
+    )
+    if skipped:
+        print_note(
+            f"{len(skipped)} of {len(filepaths):,} file(s) were skipped after "
+            f"stalling or failing during the Praat precompute pass (see above "
+            f"for which) — they simply stay uncached and are computed live the "
+            f"first time each is used. Investigate those specific files "
+            f"(likely corrupt/unusual audio) and re-run to fill them in."
+        )
 
 
 _CACHED_MFCC_TRANSFORM = None
