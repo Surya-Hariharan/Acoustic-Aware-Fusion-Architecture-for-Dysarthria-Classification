@@ -19,6 +19,7 @@ giving the 39-dimensional per-frame representation used by the
 Acoustic Pathway (matching the base paper's baseline features).
 """
 
+import gc
 import hashlib
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
@@ -325,11 +326,26 @@ def _disk_cache_path(cache_dir: Path, filepath: str) -> Path:
     return cache_dir / f"{digest}.npy"
 
 
+_PRECOMPUTE_CALLS_IN_PROCESS = 0
+_PRECOMPUTE_GC_EVERY = 100
+
+
 def _precompute_one(filepath: str) -> None:
     """Populate the disk cache for one file — module-level (not a closure) so
-    it is picklable and safe to hand to ProcessPoolExecutor on Windows."""
+    it is picklable and safe to hand to ProcessPoolExecutor on Windows.
+
+    Praat/parselmouth's Sound/Pitch/Formant objects are reference-counted C++
+    state that Python's own generational GC has to run to fully release (cyclic
+    references aren't freed by refcounting alone); calling gc.collect() every
+    _PRECOMPUTE_GC_EVERY files bounds a long-lived worker's RSS growth as a
+    second line of defense alongside ProcessPoolExecutor's max_tasks_per_child
+    (see precompute_framewise_feature_cache and config.PRECOMPUTE_MAX_TASKS_PER_CHILD)."""
+    global _PRECOMPUTE_CALLS_IN_PROCESS
     extract_segmental_extra_features_cached(filepath)
     extract_suprasegmental_features_cached(filepath)
+    _PRECOMPUTE_CALLS_IN_PROCESS += 1
+    if _PRECOMPUTE_CALLS_IN_PROCESS % _PRECOMPUTE_GC_EVERY == 0:
+        gc.collect()
 
 
 def precompute_framewise_feature_cache(df: pd.DataFrame, n_workers: int = 4,
@@ -379,8 +395,11 @@ def precompute_framewise_feature_cache(df: pd.DataFrame, n_workers: int = 4,
         precompute_vad_span_cache(df, n_workers=n_workers)
 
     filepaths = df["Filepath"].tolist()
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        for _ in progress(executor.map(_precompute_one, filepaths, chunksize=8),
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        max_tasks_per_child=config.PRECOMPUTE_MAX_TASKS_PER_CHILD,
+    ) as executor:
+        for _ in progress(executor.map(_precompute_one, filepaths, chunksize=4),
                           "Pre-warming framewise Praat feature cache",
                           total=len(filepaths), unit="file"):
             pass

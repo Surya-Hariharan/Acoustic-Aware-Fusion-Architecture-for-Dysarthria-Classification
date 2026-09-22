@@ -270,8 +270,11 @@ def precompute_vad_span_cache(df: pd.DataFrame, n_workers: int = 4,
 
     filepaths = df["Filepath"].tolist()
     records: List[Dict[str, object]] = []
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        for record in progress(executor.map(worker_fn, filepaths, chunksize=32),
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        max_tasks_per_child=config.PRECOMPUTE_MAX_TASKS_PER_CHILD,
+    ) as executor:
+        for record in progress(executor.map(worker_fn, filepaths, chunksize=8),
                                description, total=len(filepaths), unit="file"):
             records.append(record)
 

@@ -246,6 +246,20 @@ SUPRA_VAD_SPEECH_PAD_MS = 150
 # load-bearing and the RAM is better spent on DataLoader prefetch depth.
 PREPROCESS_CACHE_SIZE = 512
 
+# Recycle each ProcessPoolExecutor worker after this many tasks, in the
+# one-time VAD-span and Praat-feature precompute passes (src.vad_cache,
+# src.preprocessing) only — never in the DataLoader hot path. praat-parselmouth
+# and torch.hub's Silero both hold C-level state (Sound/Pitch/Formant objects,
+# CUDA/CPU tensors) that does not fully release back to the OS across tens of
+# thousands of calls in one long-lived process; a Kaggle run over the full
+# 21,420-utterance M6 manifest was observed slowing from ~22 files/s to
+# <1 file/s over the first 10 minutes of the Praat pass, then going silent —
+# textbook gradual worker RSS growth ending in an OOM kill with no Python
+# traceback. Restarting each worker after PRECOMPUTE_MAX_TASKS_PER_CHILD tasks
+# bounds that growth; requires Python >= 3.11 (concurrent.futures added
+# max_tasks_per_child there), which every supported runtime here satisfies.
+PRECOMPUTE_MAX_TASKS_PER_CHILD = 200
+
 # ---------------------------------------------------------------------------
 # Label mappings
 # ---------------------------------------------------------------------------
