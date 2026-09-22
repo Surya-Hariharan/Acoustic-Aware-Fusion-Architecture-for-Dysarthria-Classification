@@ -27,6 +27,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 notebooks/Kaggle_Training_Pipeline.ipynb
+notebooks/speech-processing.ipynb
 .pytest_cache/
 venv/
 .venv/
