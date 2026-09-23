@@ -61,6 +61,13 @@ _UTILS = None
 # broken/unreachable torch.hub cache is retried once, not once per file (see
 # _ensure_loaded_or_disabled).
 _INIT_ERROR: Optional[str] = None
+# Set once warmup_silero_vad() has verified the model in this process. The
+# notebook's main process calls it from three separate call sites in one run
+# (precompute_vad_span_cache, verify_vad_span_cache,
+# precompute_framewise_feature_cache) — without this flag each one re-runs the
+# dummy-inference smoke test and reprints "initialized and verified", which is
+# redundant noise once the first call already proved the model works.
+_WARMED_UP = False
 
 
 def load_silero_vad(force_reload: bool = False):
@@ -112,8 +119,13 @@ def warmup_silero_vad() -> None:
     clearing any stale/partial cache entries for this repo; if that also
     fails, raises RuntimeError with a diagnostic instead of leaving 21,000+
     per-file calls to each silently retry the same broken load.
+
+    A no-op (no re-verify, no reprint) if already verified in this process —
+    see _WARMED_UP above.
     """
-    global _INIT_ERROR
+    global _INIT_ERROR, _WARMED_UP
+    if _WARMED_UP and _MODEL is not None:
+        return
     _INIT_ERROR = None
     try:
         load_silero_vad()
@@ -141,6 +153,7 @@ def warmup_silero_vad() -> None:
     with torch.no_grad():
         get_ts(dummy, model, sampling_rate=config.VAD_SAMPLE_RATE)
     print_status(f"Silero VAD initialized and verified ({VAD_REPO})", ok=True)
+    _WARMED_UP = True
 
 
 def _ensure_loaded_or_disabled() -> bool:

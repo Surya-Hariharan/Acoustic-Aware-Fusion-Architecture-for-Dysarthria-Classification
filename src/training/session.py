@@ -372,3 +372,50 @@ def print_session_plan(plan: SessionPlan, measurement: ThroughputMeasurement) ->
                      f"(minimum required: {plan.min_headroom:.2f}x)", ok=True)
     else:
         print_status("Does NOT fit — this session will be partial and resumable", ok=False)
+    print_data_coverage_statement(plan)
+
+
+def print_data_coverage_statement(plan: SessionPlan) -> None:
+    """State, in one place, exactly what a block-limited run does and does not
+    cut — the citable answer to "is training on fewer blocks defensible?".
+
+    What is NEVER cut, at any rung of BLOCK_LADDER: every one of
+    config.DYSARTHRIC_IDS (all 15 dysarthric speakers, all 4 severity classes)
+    is both trained on and held out as the LOSO test speaker in some fold —
+    see src.splits.iter_severity_loso_folds and plan_session's own docstring
+    ("dropping folds would not shrink the experiment, it would invalidate
+    it"). A Kaggle time budget can only shrink UTTERANCES PER SPEAKER, via
+    which blocks are included.
+
+    Why that specific cut is principled rather than an arbitrary truncation:
+    UA-Speech's three blocks each carry the SAME common words, digits,
+    radio-alphabet letters and computer commands (see BLOCK_LADDER's own
+    comment) — only each block's uncommon words are unique to it. So "trained
+    on block B1" means "trained on one full, balanced pass over every word
+    CATEGORY in the corpus, at one third of the utterances-per-speaker" — not
+    a random subsample that could have over- or under-represented any
+    category by chance.
+    """
+    words_per_speaker = len(plan.blocks) * (config.WORDS_PER_SPEAKER // 3)
+    coverage_pct = 100 * words_per_speaker / config.WORDS_PER_SPEAKER
+    severity_counts: Dict[str, int] = {}
+    for speaker in config.DYSARTHRIC_IDS:
+        severity_counts[config.SEVERITY_MAP[speaker]] = (
+            severity_counts.get(config.SEVERITY_MAP[speaker], 0) + 1)
+
+    print()
+    print_subheader("Data coverage — what this run's block subset does and does not cut")
+    print_kv("Dysarthric speakers", f"{len(config.DYSARTHRIC_IDS)} of "
+             f"{len(config.DYSARTHRIC_IDS)} (100% — every LOSO protocol always "
+             f"trains on, and separately holds out, every speaker)")
+    print_kv("Severity classes covered", ", ".join(
+        f"{sev} x{n}" for sev, n in sorted(severity_counts.items())))
+    print_kv("Utterances per speaker used", f"{words_per_speaker} of "
+             f"{config.WORDS_PER_SPEAKER} ({coverage_pct:.0f}%, block(s) "
+             f"{'+'.join(plan.blocks)})")
+    print_note(
+        "Every UA-Speech block carries the same common-word/digit/letter/"
+        "command categories — only its uncommon words are block-specific — so "
+        "this is a balanced reduction in utterances per speaker at full "
+        "speaker and severity-class coverage, not a random or biased subsample."
+    )

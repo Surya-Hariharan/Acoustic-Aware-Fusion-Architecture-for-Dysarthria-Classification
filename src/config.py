@@ -265,10 +265,18 @@ PRECOMPUTE_MAX_TASKS_PER_CHILD = 200
 # outstanding task(s) are permanently stuck (a corrupt file, a decode hang —
 # see src.parallel.resilient_process_map) rather than merely slow, kills the
 # stalled worker process(es), logs which file(s) were skipped, and continues
-# with the rest instead of hanging silently forever. 900s is generous next to
-# the ~30-80 ms a single file normally costs, so it only fires on a genuine
-# stall, not a slow batch.
-PRECOMPUTE_STALL_TIMEOUT_S = 900
+# with the rest instead of hanging silently forever.
+#
+# 900 -> 180: the 900s default was chosen before the real cause of the one
+# stall observed in practice was known. It turned out to be CPU thread
+# oversubscription (every worker defaulting to a full-core-count torch thread
+# pool — see src.parallel's module docstring), now fixed at the source via
+# resilient_process_map's pool initializer, not a genuinely slow file. With
+# that fixed, normal throughput is ~20+ files/s, so 180s is still >100x the
+# ~30-80 ms a single file normally costs — generous enough to absorb a slow
+# patch (worker recycling, a large file) without waiting 15 minutes to react
+# to an actually-poisoned file.
+PRECOMPUTE_STALL_TIMEOUT_S = 180
 
 # ---------------------------------------------------------------------------
 # Label mappings

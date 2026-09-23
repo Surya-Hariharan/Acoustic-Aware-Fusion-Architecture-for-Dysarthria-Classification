@@ -25,6 +25,27 @@ returned as `skipped`, and the pass continues with whatever did complete.
 This is safe for both call sites because both build an optimization-only
 disk cache (see src.vad_cache's and src.preprocessing's module docstrings):
 a missing row is just a cache miss, never a correctness problem.
+
+THE STALL ITSELF: CPU THREAD OVERSUBSCRIPTION, NOT A HUNG FILE
+----------------------------------------------------------------
+Turning on the watchdog above (first deployed after a run went silent) caught
+the real mechanism red-handed: 706/21,420 files done in the first ~30s
+(~23 files/s), then LITERALLY ZERO further completions for the next 900s
+across all n_workers processes simultaneously. A single poisoned file cannot
+explain that — it would stall exactly one worker while the other n_workers-1
+kept completing files at their usual rate. Every worker stalling at once,
+right as the queue got deep enough for all of them to be mid-task
+concurrently, is the signature of catastrophic contention, not a hang.
+
+The cause: torch defaults its intra-op thread pool to the machine's full core
+count, and every process gets its OWN pool — unset, n_workers processes each
+spin up os.cpu_count() threads, so n_workers=4 on a 4-vCPU Kaggle box asks for
+16 compute threads on 4 physical cores. src.training.data._init_worker
+already documents and fixes this exact mechanism for the DataLoader workers
+(torch.set_num_threads(1) there), but that fix was never applied to the
+ProcessPoolExecutor pools in the precompute passes that run BEFORE training —
+so the first parallel pass in every fresh run hit it. _worker_thread_init
+below applies the identical fix here.
 """
 
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
@@ -35,6 +56,16 @@ from src.console import ProgressReporter, print_note
 
 T = TypeVar("T")
 R = TypeVar("R")
+
+
+def _worker_thread_init() -> None:
+    """ProcessPoolExecutor initializer: pin this worker to a single intra-op
+    thread. See the module docstring — without this, n_workers processes each
+    default to a full-core-count thread pool, oversubscribing the machine
+    n_workers-fold and collapsing throughput to near zero under load, which
+    reads as a stall rather than as the contention it actually is."""
+    import torch
+    torch.set_num_threads(1)
 
 
 def resilient_process_map(
@@ -64,7 +95,8 @@ def resilient_process_map(
     skipped: List[T] = []
 
     executor = ProcessPoolExecutor(
-        max_workers=n_workers, max_tasks_per_child=max_tasks_per_child)
+        max_workers=n_workers, max_tasks_per_child=max_tasks_per_child,
+        initializer=_worker_thread_init)
     bar = ProgressReporter(None, description=description, total=len(items), unit=unit)
     try:
         future_to_item = {executor.submit(worker_fn, item): item for item in items}

@@ -454,8 +454,8 @@ def vad_valid_length(filepath: str, *, supra: bool = False) -> Optional[int]:
 # Verification
 # ---------------------------------------------------------------------------
 def verify_vad_span_cache(df: pd.DataFrame, n: int = 200, seed: int = 0) -> None:
-    """Re-run live Silero on `n` randomly chosen utterances and assert the
-    cached spans match exactly.
+    """Re-run live Silero on `n` randomly chosen CACHED utterances and assert
+    the cached spans match exactly.
 
     Not optional polish. The framewise .npy caches were built by slicing with
     these spans, so a span table that is wrong rather than absent would leave
@@ -463,6 +463,15 @@ def verify_vad_span_cache(df: pd.DataFrame, n: int = 200, seed: int = 0) -> None
     channels they are concatenated to in extract_segmental_features_cached —
     a corruption no shape check and no unit test would catch. Run after every
     build, and after any change to Silero or to a VAD tunable.
+
+    Coverage gaps (a row of `df` with no cache entry — e.g. skipped by
+    resilient_process_map after a stall, see src.parallel) are reported but
+    NOT raised as failures: an absent row is a plain cache miss, handled by
+    every read-path caller falling back to live VAD (see this module's
+    docstring's CONTRACT section) — it is strictly less risky than a PRESENT
+    but wrong row, which is the one thing this function exists to catch. The
+    sample is drawn only from rows that ARE cached, so `n` verifies `n` real
+    cache entries even when the table is incomplete.
     """
     from src.preprocessing import _load_resampled, cache_key
 
@@ -473,18 +482,29 @@ def verify_vad_span_cache(df: pd.DataFrame, n: int = 200, seed: int = 0) -> None
             f"it with precompute_vad_span_cache(df) first."
         )
 
+    cached_mask = df["Filename"].map(lambda name: name in table)
+    n_missing = int((~cached_mask).sum())
+    if n_missing:
+        print_note(
+            f"{n_missing:,} of {len(df):,} utterances have no cached VAD span "
+            f"(a coverage gap, not a correctness problem — they fall back to "
+            f"live VAD at read time, just slower). Re-run "
+            f"precompute_vad_span_cache(df, force=True) to fill them in."
+        )
+    df_cached = df[cached_mask]
+    if df_cached.empty:
+        print_note("Nothing to verify — the span cache covers none of df.")
+        return
+
     if config.VAD_ENABLED:
         vad_module.warmup_silero_vad()
 
-    rows = df.sample(n=min(n, len(df)), random_state=seed)
+    rows = df_cached.sample(n=min(n, len(df_cached)), random_state=seed)
     mismatches = []
     for filepath in progress(rows["Filepath"].tolist(),
                              f"Verifying {len(rows):,} cached VAD spans",
                              total=len(rows), unit="file"):
-        entry = table.get(cache_key(filepath))
-        if entry is None:
-            mismatches.append((filepath, "absent from cache", ""))
-            continue
+        entry = table[cache_key(filepath)]
         num_samples, speech_start, speech_end, supra_start, supra_end = entry
 
         waveform, _ = _load_resampled(filepath)
