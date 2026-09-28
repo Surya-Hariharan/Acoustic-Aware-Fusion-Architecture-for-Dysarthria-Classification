@@ -7,14 +7,11 @@ WHY THIS EXISTS
 Both precompute passes used to drive their ProcessPoolExecutor with
 `executor.map(worker_fn, items, chunksize=N)`. map() yields results in
 SUBMISSION order, not completion order. If a single item makes one worker
-hang forever (a corrupt WAV, a decode stall — anything that blocks without
-raising), the other n_workers-1 processes keep finishing their own chunks in
-the background, but map()'s iterator cannot yield any of those results until
-the stuck one resolves, because it must preserve order. The progress bar
-(src.console.progress), which only prints when a result comes back, then goes
-silent forever with no traceback and no further log output — exactly the
-failure observed on a real Kaggle run of the VAD-span pass: steady ~30s
-progress ticks, then nothing, indefinitely, with the process still alive.
+hang forever, the other n_workers-1 processes keep finishing their own chunks
+in the background, but map()'s iterator cannot yield any of those results
+until the stuck one resolves, because it must preserve order. The progress
+bar, which only prints when a result comes back, then goes silent forever
+with no traceback and no further log output.
 
 resilient_process_map replaces that with completion-order collection
 (concurrent.futures.wait(..., return_when=FIRST_COMPLETED)), so one stuck
@@ -23,33 +20,45 @@ within config.PRECOMPUTE_STALL_TIMEOUT_S while work remains, the outstanding
 worker process(es) are force-killed, the still-pending items are logged and
 returned as `skipped`, and the pass continues with whatever did complete.
 This is safe for both call sites because both build an optimization-only
-disk cache (see src.vad_cache's and src.preprocessing's module docstrings):
-a missing row is just a cache miss, never a correctness problem.
+disk cache: a missing row is just a cache miss, never a correctness problem.
 
-THE STALL ITSELF: CPU THREAD OVERSUBSCRIPTION, NOT A HUNG FILE
-----------------------------------------------------------------
-Turning on the watchdog above (first deployed after a run went silent) caught
-the real mechanism red-handed: 706/21,420 files done in the first ~30s
-(~23 files/s), then LITERALLY ZERO further completions for the next 900s
-across all n_workers processes simultaneously. A single poisoned file cannot
-explain that — it would stall exactly one worker while the other n_workers-1
-kept completing files at their usual rate. Every worker stalling at once,
-right as the queue got deep enough for all of them to be mid-task
-concurrently, is the signature of catastrophic contention, not a hang.
+THE ACTUAL STALL MECHANISM: ProcessPoolExecutor's max_tasks_per_child RESPAWN,
+NOT A HUNG FILE, AND NOT (SOLELY) THREAD OVERSUBSCRIPTION
+--------------------------------------------------------------------------------
+Two independent theories were tried and ruled out by direct evidence before
+this one:
 
-The cause: torch defaults its intra-op thread pool to the machine's full core
-count, and every process gets its OWN pool — unset, n_workers processes each
-spin up os.cpu_count() threads, so n_workers=4 on a 4-vCPU Kaggle box asks for
-16 compute threads on 4 physical cores. src.training.data._init_worker
-already documents and fixes this exact mechanism for the DataLoader workers
-(torch.set_num_threads(1) there), but that fix was never applied to the
-ProcessPoolExecutor pools in the precompute passes that run BEFORE training —
-so the first parallel pass in every fresh run hit it. _worker_thread_init
-below applies the identical fix here.
+1. A single poisoned file hanging one worker. Ruled out: the stall watchdog
+   (added specifically to catch this) instead showed ALL n_workers processes
+   going silent simultaneously, which a lone stuck file cannot cause.
+
+2. CPU thread oversubscription (torch defaulting every process's intra-op
+   pool to the full core count, n_workers-fold oversubscribed). This is a
+   real inefficiency and _worker_thread_init below still fixes it, but THREE
+   independent Kaggle runs — one before that fix, two after — all stalled at
+   EXACTLY 800 completed tasks: 4 workers x PRECOMPUTE_MAX_TASKS_PER_CHILD
+   (200). That precise, repeated boundary is the signature of
+   ProcessPoolExecutor's own internal worker-recycling (which replaces a
+   worker in place once it hits max_tasks_per_child), not of thread
+   contention, which would not care about a task-count boundary at all.
+
+In this environment — a Kaggle kernel whose main process has already
+initialized a CUDA context (cell 1.2's torch.cuda calls, well before any pool
+is created) — the DEFAULT start method spawns initial workers fine, but
+ProcessPoolExecutor's in-place respawn of a worker mid-run appears to hang
+deterministically. The fix here does not depend on knowing the exact reason:
+it simply avoids that code path. Instead of asking ProcessPoolExecutor to
+recycle a worker in place, resilient_process_map processes `items` in
+batches of max_tasks_per_child * n_workers, fully shutting down (wait=True)
+and recreating the pool between batches. This bounds per-worker task count
+identically to max_tasks_per_child (so the RSS-growth concern
+PRECOMPUTE_MAX_TASKS_PER_CHILD's own docstring describes is still addressed),
+but via a full, ordinary pool teardown/recreate — a far more common and
+better-tested code path than an in-place mid-run respawn.
 """
 
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from typing import Callable, Iterable, List, Tuple, TypeVar
+from typing import Callable, List, Tuple, TypeVar
 
 from src import config
 from src.console import ProgressReporter, print_note
@@ -60,10 +69,10 @@ R = TypeVar("R")
 
 def _worker_thread_init() -> None:
     """ProcessPoolExecutor initializer: pin this worker to a single intra-op
-    thread. See the module docstring — without this, n_workers processes each
-    default to a full-core-count thread pool, oversubscribing the machine
-    n_workers-fold and collapsing throughput to near zero under load, which
-    reads as a stall rather than as the contention it actually is."""
+    thread. Without this, n_workers processes each default to a full-core-count
+    thread pool, oversubscribing the machine n_workers-fold — a real
+    throughput cost even though it was not, on its own, the cause of the
+    exactly-800-tasks stall this module's docstring documents."""
     import torch
     torch.set_num_threads(1)
 
@@ -78,28 +87,65 @@ def resilient_process_map(
     unit: str = "file",
     stall_timeout_s: float = config.PRECOMPUTE_STALL_TIMEOUT_S,
 ) -> Tuple[List[R], List[T]]:
-    """Run worker_fn over items in a process pool, resilient to one stuck task.
+    """Run worker_fn over items in a process pool, resilient to one stuck task
+    AND to ProcessPoolExecutor's own max_tasks_per_child respawn hanging (see
+    module docstring).
 
     Returns (results, skipped) — results in COMPLETION order (not the order of
     `items`; callers that need to re-associate a result with its input must do
     so from the result itself, as every worker_fn in this codebase already
     does by returning the item's own key). `skipped` lists the items that
-    never completed — because their task stalled past stall_timeout_s, or
-    because worker_fn raised for them — logged with a diagnostic so the
-    specific offending file(s) are identifiable rather than a silent freeze.
+    never completed — their task stalled past stall_timeout_s, or worker_fn
+    raised for them — logged with a diagnostic so the specific offending
+    file(s) are identifiable rather than a silent freeze.
+
+    Processes `items` in batches of max_tasks_per_child * n_workers, with a
+    FRESH ProcessPoolExecutor per batch (fully joined via shutdown(wait=True)
+    before the next batch's pool is created) — see the module docstring for
+    why this replaces passing max_tasks_per_child directly to
+    ProcessPoolExecutor.
     """
     if not items:
         return [], []
 
     results: List[R] = []
     skipped: List[T] = []
+    batch_size = max(1, max_tasks_per_child * n_workers)
 
-    executor = ProcessPoolExecutor(
-        max_workers=n_workers, max_tasks_per_child=max_tasks_per_child,
-        initializer=_worker_thread_init)
     bar = ProgressReporter(None, description=description, total=len(items), unit=unit)
     try:
-        future_to_item = {executor.submit(worker_fn, item): item for item in items}
+        for batch_start in range(0, len(items), batch_size):
+            batch = items[batch_start:batch_start + batch_size]
+            batch_results, batch_skipped = _run_one_batch(
+                worker_fn, batch, n_workers=n_workers,
+                description=description, stall_timeout_s=stall_timeout_s, bar=bar)
+            results.extend(batch_results)
+            skipped.extend(batch_skipped)
+    finally:
+        bar.close()
+
+    return results, skipped
+
+
+def _run_one_batch(
+    worker_fn: Callable[[T], R],
+    batch: List[T],
+    *,
+    n_workers: int,
+    description: str,
+    stall_timeout_s: float,
+    bar: ProgressReporter,
+) -> Tuple[List[R], List[T]]:
+    """One batch's worth of work through a FRESH, short-lived pool — no
+    max_tasks_per_child passed to it, since bounding per-worker task count is
+    now this function's caller's job (via batch sizing), not
+    ProcessPoolExecutor's internal respawn (see module docstring)."""
+    results: List[R] = []
+    skipped: List[T] = []
+
+    executor = ProcessPoolExecutor(max_workers=n_workers, initializer=_worker_thread_init)
+    try:
+        future_to_item = {executor.submit(worker_fn, item): item for item in batch}
         pending = set(future_to_item)
 
         while pending:
@@ -130,7 +176,10 @@ def resilient_process_map(
                     skipped.append(item)
                 bar.update(1)
     finally:
-        bar.close()
-        executor.shutdown(wait=False, cancel_futures=True)
+        # wait=True (unlike the old single-pool version's wait=False): this is
+        # exactly the full join that a mid-run max_tasks_per_child respawn was
+        # NOT doing cleanly. Any process already .kill()-ed above joins
+        # immediately; anything still legitimately finishing gets to.
+        executor.shutdown(wait=True, cancel_futures=True)
 
     return results, skipped

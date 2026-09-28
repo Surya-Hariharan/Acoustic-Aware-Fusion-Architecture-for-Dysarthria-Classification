@@ -153,6 +153,38 @@ SEVERITY_MAP = {
     "M08": "High",     "F05": "High",
 }
 
+
+def _interleave_by_severity(dysarthric_ids, severity_map):
+    """Round-robin the 15 dysarthric speakers across their four severity
+    classes (Very Low, Low, Mid, High), one speaker per class per round, so
+    that EVERY PREFIX of the result is as class-balanced as the remaining
+    pool allows — the same idea as _interleave_by_class above, applied to
+    four groups instead of two.
+
+    A COMPLETE 15-fold severity LOSO sweep is order-independent (see
+    src.splits.iter_severity_loso_folds's docstring: it pools all 15
+    speakers' predictions regardless of sequence), so this changes nothing
+    about the primary result. What it buys is that a budget-truncated run
+    (TrainingConfig.max_folds < 15, used when a Kaggle session cannot afford
+    all 15 folds) evaluates a representative slice of severity classes
+    instead of whichever speakers happen to sort first in DYSARTHRIC_IDS —
+    e.g. the current DYSARTHRIC_IDS order happens to front-load Very Low/Low
+    speakers, which is not a property anyone chose on purpose.
+    """
+    class_order = ("Very Low", "Low", "Mid", "High")
+    groups = [[s for s in dysarthric_ids if severity_map[s] == cls] for cls in class_order]
+    interleaved = []
+    for round_ in zip_longest(*groups):
+        interleaved.extend(speaker for speaker in round_ if speaker is not None)
+    return interleaved
+
+
+# Traversal order for src.splits.iter_severity_loso_folds — a permutation of
+# DYSARTHRIC_IDS (same 15 speakers, same full-run result), reordered so a
+# TrainingConfig(max_folds=N) truncation stays class-representative. See
+# _interleave_by_severity's docstring.
+SEVERITY_LOSO_ORDER = _interleave_by_severity(DYSARTHRIC_IDS, SEVERITY_MAP)
+
 # SECONDARY-ANALYSIS ONLY. The three-branch severity architecture's PRIMARY
 # protocol (src.splits.iter_severity_loso_folds) is full-population Leave-
 # One-Speaker-Out across all 15 dysarthric speakers — it does NOT drop any
@@ -246,8 +278,8 @@ SUPRA_VAD_SPEECH_PAD_MS = 150
 # load-bearing and the RAM is better spent on DataLoader prefetch depth.
 PREPROCESS_CACHE_SIZE = 512
 
-# Recycle each ProcessPoolExecutor worker after this many tasks, in the
-# one-time VAD-span and Praat-feature precompute passes (src.vad_cache,
+# Recycle each precompute worker after this many tasks, in the one-time
+# VAD-span and Praat-feature precompute passes (src.vad_cache,
 # src.preprocessing) only — never in the DataLoader hot path. praat-parselmouth
 # and torch.hub's Silero both hold C-level state (Sound/Pitch/Formant objects,
 # CUDA/CPU tensors) that does not fully release back to the OS across tens of
@@ -255,9 +287,17 @@ PREPROCESS_CACHE_SIZE = 512
 # 21,420-utterance M6 manifest was observed slowing from ~22 files/s to
 # <1 file/s over the first 10 minutes of the Praat pass, then going silent —
 # textbook gradual worker RSS growth ending in an OOM kill with no Python
-# traceback. Restarting each worker after PRECOMPUTE_MAX_TASKS_PER_CHILD tasks
-# bounds that growth; requires Python >= 3.11 (concurrent.futures added
-# max_tasks_per_child there), which every supported runtime here satisfies.
+# traceback.
+#
+# NOT passed to ProcessPoolExecutor's own max_tasks_per_child anymore. Three
+# independent Kaggle runs all stalled at EXACTLY n_workers * this value —
+# 4 * 200 = 800 completed tasks — which is ProcessPoolExecutor's own in-place
+# worker-respawn hanging in this environment (a CUDA-initialized main
+# process), not a slow file. src.parallel.resilient_process_map now bounds
+# per-worker task count itself, by processing items in batches of
+# n_workers * PRECOMPUTE_MAX_TASKS_PER_CHILD and fully tearing down and
+# recreating the pool between batches — see that module's docstring for the
+# full evidence trail.
 PRECOMPUTE_MAX_TASKS_PER_CHILD = 200
 
 # If no task in a precompute pass (src.vad_cache, src.preprocessing) completes
@@ -267,15 +307,11 @@ PRECOMPUTE_MAX_TASKS_PER_CHILD = 200
 # stalled worker process(es), logs which file(s) were skipped, and continues
 # with the rest instead of hanging silently forever.
 #
-# 900 -> 180: the 900s default was chosen before the real cause of the one
-# stall observed in practice was known. It turned out to be CPU thread
-# oversubscription (every worker defaulting to a full-core-count torch thread
-# pool — see src.parallel's module docstring), now fixed at the source via
-# resilient_process_map's pool initializer, not a genuinely slow file. With
-# that fixed, normal throughput is ~20+ files/s, so 180s is still >100x the
-# ~30-80 ms a single file normally costs — generous enough to absorb a slow
-# patch (worker recycling, a large file) without waiting 15 minutes to react
-# to an actually-poisoned file.
+# Now that the pool-recycling hang (see PRECOMPUTE_MAX_TASKS_PER_CHILD above)
+# is fixed at its actual source — batch teardown/recreate instead of
+# ProcessPoolExecutor's internal respawn — this watchdog reverts to guarding
+# against what it was originally meant for: a genuinely poisoned single file.
+# 180s is still >1000x the ~30-80 ms a single file normally costs.
 PRECOMPUTE_STALL_TIMEOUT_S = 180
 
 # ---------------------------------------------------------------------------

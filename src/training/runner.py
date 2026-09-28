@@ -517,14 +517,27 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         fold_iter = fold_iter[:cfg.max_folds]
 
     n_folds = len(fold_iter)
+    # 28 for detection (config.ALL_SPEAKERS), 15 for severity
+    # (config.DYSARTHRIC_IDS) — was hardcoded to 28 for both tasks, which
+    # meant a severity run truncated to, say, max_folds=14 (< 15 but not <
+    # 28) would silently NOT be flagged as reduced scale.
+    full_fold_count = (len(config.ALL_SPEAKERS) if cfg.task == "detection"
+                       else len(config.DYSARTHRIC_IDS))
     is_reduced_scale = (cfg.limit_samples is not None
-                        or (cfg.max_folds is not None and cfg.max_folds < 28)
+                        or (cfg.max_folds is not None and cfg.max_folds < full_fold_count)
                         or cfg.cv_protocol == "screening")
     if is_reduced_scale:
         print()
         if cfg.cv_protocol == "screening":
             print_note("SCREENING PROTOCOL — cheap speaker-grouped k-fold for ranking "
                        "ablation variants, not the base-paper's full LOSO result.")
+        elif cfg.max_folds is not None and cfg.max_folds < full_fold_count:
+            print_note(
+                f"BUDGET-REDUCED FOLD COUNT — running {n_folds} of {full_fold_count} "
+                f"{'speakers' if cfg.task == 'detection' else 'dysarthric speakers'}, "
+                "a deliberate compute-budget concession. This is NOT the full-"
+                "population primary protocol result and carries less statistical "
+                "power than the complete sweep.")
         else:
             print_note("REDUCED SCALE — this is a pipeline check, not a reportable result "
                        "(max_folds / limit_samples are set).")
@@ -671,6 +684,15 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
                    "per-fold precision / recall / specificity / AUROC are undefined")
         print_note("(reported as NaN, not 0 — see src.training.metrics). Only 'accuracy' "
                    "is meaningful per fold; the pooled numbers below are the reportable ones.")
+    if cfg.task == "severity" and cfg.severity_protocol == "full_loso":
+        print()
+        print_note("Every severity LOSO fold holds out ONE speaker, and severity labels are "
+                   "assigned at the SPEAKER level, so every held-out fold is entirely one "
+                   "severity class too — per-fold balanced accuracy / precision / recall / "
+                   "F1 / AUROC are undefined (NaN) for the same reason as detection above.")
+        print_note("Only per-fold 'accuracy' and 'ordinal_mae' are meaningful per fold; the "
+                   "pooled numbers below (predictions concatenated across all folds first) "
+                   "are the reportable multi-class result.")
 
     # Coverage before metrics, deliberately: a pooled number from 2 of 28 folds
     # looks identical to one from 28 of 28, and the reader needs to know which

@@ -175,8 +175,13 @@ def iter_severity_loso_folds(df: pd.DataFrame
                              ) -> Iterator[Tuple[str, pd.DataFrame, pd.DataFrame]]:
     """Yield (held_out_speaker, train_df, test_df) for every one of the 15
     dysarthric speakers — the primary severity protocol
-    (config.SEVERITY_PRIMARY_PROTOCOL == "full_loso")."""
-    for speaker_id in config.DYSARTHRIC_IDS:
+    (config.SEVERITY_PRIMARY_PROTOCOL == "full_loso").
+
+    Walks config.SEVERITY_LOSO_ORDER rather than config.DYSARTHRIC_IDS
+    directly — the same 15 speakers, reordered so that a class-stratified
+    prefix is available to a budget-truncated run (TrainingConfig.max_folds).
+    A complete sweep pools all 15 regardless of order and is unaffected."""
+    for speaker_id in config.SEVERITY_LOSO_ORDER:
         train_df, test_df = get_severity_loso_split(df, speaker_id)
         yield speaker_id, train_df, test_df
 

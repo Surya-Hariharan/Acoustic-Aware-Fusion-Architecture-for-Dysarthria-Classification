@@ -225,6 +225,12 @@ class SessionPlan:
     projection: pd.DataFrame = field(repr=False)
     fits: bool = True
     min_headroom: float = 1.25
+    # The speakers this plan actually evaluates, in evaluation order — the
+    # full config.SEVERITY_LOSO_ORDER unless max_folds truncated it. Kept
+    # here (not re-derived from n_folds) so print_session_plan and
+    # print_data_coverage_statement can report real coverage instead of
+    # assuming "all 15" whenever n_folds happens to look plausible.
+    fold_speakers: Tuple[str, ...] = ()
 
     @property
     def headroom(self) -> float:
@@ -243,7 +249,8 @@ def project_runtime(df: pd.DataFrame, measurement: ThroughputMeasurement,
                     n_folds: Optional[int] = None, epochs: int = config.DEFAULT_EPOCHS,
                     fold_setup_seconds: float = 30.0,
                     fold_overhead_seconds: float = 60.0,
-                    seed: int = config.DEFAULT_SEED) -> Dict[str, float]:
+                    seed: int = config.DEFAULT_SEED,
+                    max_folds: Optional[int] = None) -> Dict[str, float]:
     """Projected wall-clock for a full run over `df`, at the measured rate.
 
     Fold sizes are taken from the ACTUAL first fold of `df` rather than from
@@ -254,6 +261,13 @@ def project_runtime(df: pd.DataFrame, measurement: ThroughputMeasurement,
     which the span cache reduced from ~1,250 s to a table lookup;
     fold_overhead_seconds covers the test pass, embedding collection and
     artifact writes that run_fold does once per fold (measured at ~80 s).
+
+    `max_folds`, if given, truncates the materialized fold list exactly as
+    src.training.runner.run_training does (fold_iter[:cfg.max_folds]) — so a
+    budget-reduced session's projection reflects the folds that will
+    actually run, not the full protocol size. build_folds() itself ignores
+    TrainingConfig.max_folds (that truncation is run_training's job), which
+    is why it is applied here explicitly rather than via `cfg`.
     """
     from src.training.data import stratified_train_val_split
     from src.training.runner import TrainingConfig, build_folds
@@ -262,6 +276,8 @@ def project_runtime(df: pd.DataFrame, measurement: ThroughputMeasurement,
     # build_folds yields lazily for the larger protocols, so materialize it —
     # the count is the whole point here.
     folds = list(build_folds(df, task, cfg))
+    if max_folds is not None:
+        folds = folds[:max_folds]
     n_folds = n_folds if n_folds is not None else len(folds)
 
     label_column = "Group" if task == "detection" else "Severity"
@@ -276,6 +292,7 @@ def project_runtime(df: pd.DataFrame, measurement: ThroughputMeasurement,
         "n_folds": n_folds, "epochs": epochs,
         "epoch_seconds": epoch_s, "fold_seconds": fold_s,
         "total_seconds": n_folds * fold_s,
+        "fold_speakers": tuple(fold_id for fold_id, _, _ in folds),
     }
 
 
@@ -286,12 +303,20 @@ def plan_session(df: pd.DataFrame, measurement: ThroughputMeasurement,
                  ladder: Sequence[Sequence[str]] = BLOCK_LADDER,
                  reserve_seconds: float = 0.0,
                  min_headroom: float = 1.25,
-                 seed: int = config.DEFAULT_SEED) -> SessionPlan:
+                 seed: int = config.DEFAULT_SEED,
+                 max_folds: Optional[int] = None) -> SessionPlan:
     """Choose the largest data size on `ladder` that fits the remaining budget.
 
-    All folds are always kept. The severity protocol's claim is at n = 15
+    By default, all folds are kept: the severity protocol's claim is at n = 15
     speakers, so dropping folds would not shrink the experiment, it would
     invalidate it; utterances per speaker is the dimension that can give.
+
+    `max_folds`, if given, is a DELIBERATE, EXPLICIT override of that default
+    — e.g. a session whose budget cannot fit even one block at 15 folds.
+    It is threaded into every rung's projection so the table and the chosen
+    plan both reflect the reduced fold count, and into the returned
+    SessionPlan.fold_speakers so callers can report exactly which speakers
+    were (and were not) evaluated, rather than assuming full coverage.
 
     min_headroom is the margin the projection must clear, not merely meet. The
     measurement behind it is a one-minute sample of a ten-hour run, and the run
@@ -312,7 +337,8 @@ def plan_session(df: pd.DataFrame, measurement: ThroughputMeasurement,
     for blocks in ladder:
         subset = subset_blocks(df, blocks)
         projection = project_runtime(subset, measurement, task=task,
-                                     model_name=model_name, epochs=epochs, seed=seed)
+                                     model_name=model_name, epochs=epochs, seed=seed,
+                                     max_folds=max_folds)
         fits = projection["total_seconds"] * min_headroom <= available
         rows.append({
             "blocks": "+".join(blocks),
@@ -332,7 +358,7 @@ def plan_session(df: pd.DataFrame, measurement: ThroughputMeasurement,
         smallest = ladder[0]
         projection = project_runtime(subset_blocks(df, smallest), measurement,
                                      task=task, model_name=model_name,
-                                     epochs=epochs, seed=seed)
+                                     epochs=epochs, seed=seed, max_folds=max_folds)
         print_note(
             f"Even {'+'.join(smallest)} projects "
             f"{format_duration(projection['total_seconds'])}, over the "
@@ -344,13 +370,13 @@ def plan_session(df: pd.DataFrame, measurement: ThroughputMeasurement,
         return SessionPlan(blocks=tuple(smallest), n_folds=projection["n_folds"],
                            epochs=epochs, projected_seconds=projection["total_seconds"],
                            budget_seconds=available, projection=table, fits=False,
-                           min_headroom=min_headroom)
+                           min_headroom=min_headroom, fold_speakers=projection["fold_speakers"])
 
     blocks, projection = chosen
     return SessionPlan(blocks=tuple(blocks), n_folds=projection["n_folds"],
                        epochs=epochs, projected_seconds=projection["total_seconds"],
                        budget_seconds=available, projection=table, fits=True,
-                       min_headroom=min_headroom)
+                       min_headroom=min_headroom, fold_speakers=projection["fold_speakers"])
 
 
 def print_session_plan(plan: SessionPlan, measurement: ThroughputMeasurement) -> None:
@@ -361,8 +387,13 @@ def print_session_plan(plan: SessionPlan, measurement: ThroughputMeasurement) ->
     print()
     print_table(plan.projection)
     print()
+    total_dysarthric = len(config.DYSARTHRIC_IDS)
+    is_full_coverage = len(plan.fold_speakers) >= total_dysarthric
     print_kv("Blocks selected", "+".join(plan.blocks))
-    print_kv("Folds", f"{plan.n_folds} (all dysarthric speakers — never reduced)")
+    print_kv("Folds", f"{plan.n_folds} (all dysarthric speakers — never reduced)"
+             if is_full_coverage
+             else f"{plan.n_folds} of {total_dysarthric} dysarthric speakers "
+                  "(BUDGET-REDUCED, see note below)")
     print_kv("Epochs per fold (max)", plan.epochs)
     print_kv("Projected total", format_duration(plan.projected_seconds))
     print_kv("Budget", format_duration(plan.budget_seconds))
@@ -372,20 +403,30 @@ def print_session_plan(plan: SessionPlan, measurement: ThroughputMeasurement) ->
                      f"(minimum required: {plan.min_headroom:.2f}x)", ok=True)
     else:
         print_status("Does NOT fit — this session will be partial and resumable", ok=False)
+    if not is_full_coverage:
+        missing = sorted(set(config.DYSARTHRIC_IDS) - set(plan.fold_speakers))
+        print_note(
+            f"This session evaluates only {len(plan.fold_speakers)} of "
+            f"{total_dysarthric} dysarthric speakers — a deliberate compute-budget "
+            f"concession (max_folds), NOT the full-population primary protocol. "
+            f"Speakers never held out this session: {missing}. Report any result "
+            f"from this run as a reduced-population check, not the primary "
+            f"15-speaker severity result."
+        )
     print_data_coverage_statement(plan)
 
 
 def print_data_coverage_statement(plan: SessionPlan) -> None:
-    """State, in one place, exactly what a block-limited run does and does not
-    cut — the citable answer to "is training on fewer blocks defensible?".
+    """State, in one place, exactly what a block-limited (and, if max_folds
+    was set, fold-limited) run does and does not cut.
 
-    What is NEVER cut, at any rung of BLOCK_LADDER: every one of
-    config.DYSARTHRIC_IDS (all 15 dysarthric speakers, all 4 severity classes)
-    is both trained on and held out as the LOSO test speaker in some fold —
-    see src.splits.iter_severity_loso_folds and plan_session's own docstring
-    ("dropping folds would not shrink the experiment, it would invalidate
-    it"). A Kaggle time budget can only shrink UTTERANCES PER SPEAKER, via
-    which blocks are included.
+    At the DEFAULT (max_folds=None), nothing is ever cut at the speaker/fold
+    level: every one of config.DYSARTHRIC_IDS (all 15 dysarthric speakers,
+    all 4 severity classes) is both trained on and held out as the LOSO test
+    speaker in some fold — see src.splits.iter_severity_loso_folds and
+    plan_session's own docstring ("dropping folds would not shrink the
+    experiment, it would invalidate it"). A Kaggle time budget then can only
+    shrink UTTERANCES PER SPEAKER, via which blocks are included.
 
     Why that specific cut is principled rather than an arbitrary truncation:
     UA-Speech's three blocks each carry the SAME common words, digits,
@@ -395,19 +436,32 @@ def print_data_coverage_statement(plan: SessionPlan) -> None:
     CATEGORY in the corpus, at one third of the utterances-per-speaker" — not
     a random subsample that could have over- or under-represented any
     category by chance.
+
+    If plan.fold_speakers is a PROPER subset of config.DYSARTHRIC_IDS (i.e.
+    plan_session was called with an explicit max_folds), this instead reports
+    the reduced speaker/severity-class coverage honestly, rather than
+    asserting the never-reduced claim above.
     """
     words_per_speaker = len(plan.blocks) * (config.WORDS_PER_SPEAKER // 3)
     coverage_pct = 100 * words_per_speaker / config.WORDS_PER_SPEAKER
+    fold_speakers = plan.fold_speakers or tuple(config.DYSARTHRIC_IDS)
+    total_dysarthric = len(config.DYSARTHRIC_IDS)
+    is_full_coverage = len(fold_speakers) >= total_dysarthric
+
     severity_counts: Dict[str, int] = {}
-    for speaker in config.DYSARTHRIC_IDS:
+    for speaker in fold_speakers:
         severity_counts[config.SEVERITY_MAP[speaker]] = (
             severity_counts.get(config.SEVERITY_MAP[speaker], 0) + 1)
 
     print()
     print_subheader("Data coverage — what this run's block subset does and does not cut")
-    print_kv("Dysarthric speakers", f"{len(config.DYSARTHRIC_IDS)} of "
-             f"{len(config.DYSARTHRIC_IDS)} (100% — every LOSO protocol always "
-             f"trains on, and separately holds out, every speaker)")
+    if is_full_coverage:
+        print_kv("Dysarthric speakers", f"{total_dysarthric} of {total_dysarthric} "
+                 f"(100% — every LOSO protocol always trains on, and separately "
+                 f"holds out, every speaker)")
+    else:
+        print_kv("Dysarthric speakers", f"{len(fold_speakers)} of {total_dysarthric} "
+                 f"(BUDGET-REDUCED via max_folds — NOT full LOSO coverage)")
     print_kv("Severity classes covered", ", ".join(
         f"{sev} x{n}" for sev, n in sorted(severity_counts.items())))
     print_kv("Utterances per speaker used", f"{words_per_speaker} of "
@@ -416,6 +470,8 @@ def print_data_coverage_statement(plan: SessionPlan) -> None:
     print_note(
         "Every UA-Speech block carries the same common-word/digit/letter/"
         "command categories — only its uncommon words are block-specific — so "
-        "this is a balanced reduction in utterances per speaker at full "
-        "speaker and severity-class coverage, not a random or biased subsample."
+        "this is a balanced reduction in utterances per speaker" +
+        (" at full speaker and severity-class coverage, not a random or "
+         "biased subsample." if is_full_coverage else
+         ", independent of the max_folds speaker reduction noted above.")
     )

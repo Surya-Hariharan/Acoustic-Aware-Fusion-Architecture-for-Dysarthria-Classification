@@ -634,8 +634,13 @@ def build_final_run_configuration(cfg, df: pd.DataFrame, num_speakers_total: int
     from src import splits as splits_module
 
     audit = feature_audit(num_classes=config.NUM_CLASSES[cfg.task])
-    fold_speakers = (config.DYSARTHRIC_IDS if cfg.severity_protocol == "full_loso"
+    fold_speakers = (config.SEVERITY_LOSO_ORDER if cfg.severity_protocol == "full_loso"
                      else sorted(set(config.DYSARTHRIC_IDS) - set(config.DROPPED_FOR_BALANCE)))
+    # cfg.max_folds truncates full_loso the same way src.training.runner.run_training
+    # does (fold_iter[:cfg.max_folds]) — reflected here too so a budget-reduced run's
+    # frozen config records which speakers it ACTUALLY evaluated, not the full 15.
+    if cfg.severity_protocol == "full_loso" and cfg.max_folds is not None:
+        fold_speakers = fold_speakers[:cfg.max_folds]
 
     return {
         "dataset": {
@@ -643,7 +648,7 @@ def build_final_run_configuration(cfg, df: pd.DataFrame, num_speakers_total: int
             "severity_classes": config.SEVERITY_CLASS_NAMES,
             "severity_protocol": cfg.severity_protocol,
             "fold_speakers": fold_speakers,
-            "num_folds": len(fold_speakers) if cfg.severity_protocol == "full_loso" else 81,
+            "num_folds": (len(fold_speakers) if cfg.severity_protocol == "full_loso" else 81),
         },
         "audio": {
             "sampling_rate": config.TARGET_SR,
