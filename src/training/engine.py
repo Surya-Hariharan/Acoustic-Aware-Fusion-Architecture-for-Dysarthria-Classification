@@ -43,6 +43,9 @@ class EpochResult:
     # as `embeddings` above).
     branch_embeddings: Optional[Dict[str, np.ndarray]] = None
     gate_weights: Optional[np.ndarray] = None
+    # argmax(class probabilities), kept even when y_pred comes from a
+    # model's own ordinal decoder (see run_epoch), for decode audits.
+    y_pred_argmax: Optional[np.ndarray] = None
 
 
 def run_epoch(model: nn.Module, loader, criterion: nn.Module,
@@ -81,6 +84,7 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
 
     running_loss, num_samples = 0.0, 0
     all_true, all_pred, all_prob, all_embeddings = [], [], [], []
+    all_pred_argmax = []
     all_speakers, all_filenames = [], []
     running_extras: Dict[str, float] = {}
     all_branch_embeddings: Dict[str, List[np.ndarray]] = {"learned": [], "segmental": [], "supra": []}
@@ -168,8 +172,11 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
                             z_learned, z_segmental, z_supra = model.encode_branches(
                                 waveform, segmental_pathway_input, supra, attention_mask, supra_valid_frames)
                             features, gates_batch = model.fuse(z_learned, z_segmental, z_supra)
+                            # None for a branch an ablation was built without.
                             branch_embeddings_batch = {
-                                "learned": z_learned, "segmental": z_segmental, "supra": z_supra}
+                                name: z for name, z in (("learned", z_learned),
+                                                        ("segmental", z_segmental),
+                                                        ("supra", z_supra)) if z is not None}
                         else:
                             features = model.forward_features(
                                 waveform, mfcc, praat, attention_mask=attention_mask,
@@ -212,9 +219,15 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
                 batches.set_postfix_str(f"loss={running_loss / num_samples:.4f}")
 
             probs = torch.softmax(logits.detach().float(), dim=1)
-            preds = probs.argmax(dim=1)
+            argmax_preds = probs.argmax(dim=1)
+            # Ordinal models decode their own way (GatedFusionModel: median
+            # of the CORAL distribution — see its predict_labels); argmax is
+            # still kept alongside, so the decode choice stays auditable.
+            preds = (model.predict_labels(logits) if hasattr(model, "predict_labels")
+                     else argmax_preds)
             all_true.append(labels.detach().cpu().numpy())
             all_pred.append(preds.cpu().numpy())
+            all_pred_argmax.append(argmax_preds.cpu().numpy())
             all_prob.append((probs[:, 1] if task == "detection" else probs).cpu().numpy())
             all_speakers.extend(batch["speaker_id"])
             all_filenames.extend(batch["filename"])
@@ -234,14 +247,16 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
     embeddings = np.concatenate(all_embeddings) if (collect_embeddings and all_embeddings) else None
     extras = ({k: v / max(num_samples, 1) for k, v in running_extras.items()}
              if running_extras else None)
-    branch_embeddings = ({name: np.concatenate(arrays) for name, arrays in all_branch_embeddings.items()}
-                         if all(all_branch_embeddings.values()) else None)
+    branch_embeddings = ({name: np.concatenate(arrays)
+                          for name, arrays in all_branch_embeddings.items() if arrays}
+                         or None)
     gate_weights = np.concatenate(all_gates) if all_gates else None
 
     return EpochResult(loss=avg_loss, metrics=metrics, y_true=y_true, y_pred=y_pred,
                        y_prob=y_prob, speaker_ids=all_speakers,
                        filenames=all_filenames, embeddings=embeddings, extras=extras,
-                       branch_embeddings=branch_embeddings, gate_weights=gate_weights)
+                       branch_embeddings=branch_embeddings, gate_weights=gate_weights,
+                       y_pred_argmax=np.concatenate(all_pred_argmax))
 
 
 def build_optimizer(model: nn.Module, lr_head: float, lr_backbone: float,

@@ -201,14 +201,15 @@ Every utterance passes through one deterministic chain (`src/preprocessing.py`, 
 | Adaptation | LoRA — `q_proj`, `k_proj`, `v_proj` across all 12 encoder layers | `config.LORA_TARGET_MODULES` |
 | LoRA hyperparameters | r = 8, α = 16, dropout = 0.1, bias = none | `config.LORA_RANK`, `LORA_ALPHA`, `LORA_DROPOUT` |
 | Severity loss | Class-weighted CORAL ordinal loss | `src/losses.py` |
+| Severity decoding | Median of the CORAL distribution (threshold count) — not argmax, which starves Low/Mid when thresholds are close | `losses.coral_rank_from_class_probs` |
 | Redundancy penalty | λ_comp = 0.05 | `config.LAMBDA_COMP` |
 | Speaker adversarial | λ_speaker = 0.1, GRL strength 1.0 | `config.LAMBDA_SPEAKER`, `config.GRL_LAMBDA` |
 | Optimizer | AdamW — lr 1e-3 (head/branches/LoRA), 1e-4 (backbone), weight decay 1e-2 | `config.DEFAULT_LR_HEAD`, `DEFAULT_LR_BACKBONE` |
-| Schedule | `ReduceLROnPlateau`, early stopping patience 3 on val loss | `config.DEFAULT_PATIENCE` |
-| Batch / epochs | 32 / 15 max, gradient clipping 1.0, AMP on CUDA | `config.DEFAULT_BATCH_SIZE`, `DEFAULT_EPOCHS` |
-| Validation | 10% stratified, carved from each fold's train split | `config.DEFAULT_VAL_FRACTION` |
+| Schedule | `ReduceLROnPlateau`, early stopping patience 3 on validation ordinal loss | `config.DEFAULT_PATIENCE` |
+| Batch / epochs | Batch chosen per machine by `session.benchmark_batch_sizes` (32 default) / 12 max, gradient clipping 1.0, AMP on CUDA | `config.DEFAULT_BATCH_SIZE`, `DEFAULT_EPOCHS` |
+| Validation | Speaker-disjoint: one speaker per severity class that keeps ≥ 2 training speakers (3–4 speakers per fold), seeded per fold | `data.speaker_disjoint_train_val_split` |
 | Seed | 42 | `config.DEFAULT_SEED` |
-| Compute budget | 40,000 s wall-clock for the whole 15-fold primary run on one Kaggle T4 session — the run is *sized* to the budget from a measured throughput calibration, not started and hoped for | `src.training.session.calibrate_throughput`, `plan_session`; deadline wired into `run_training` |
+| Compute budget | Whole Kaggle session ≤ 9 h (hard limit ~10 h). A fold starts only if its projected end fits the safe deadline; epochs stop at a hard deadline and resume from `latest.pt` | `run_training(deadline=, hard_deadline=)`, `session.benchmark_batch_sizes`, `project_runtime` |
 
 > [!NOTE]
 > **Patience 3 / epoch ceiling 15 is a compute-budget-driven tightening, not an
@@ -245,7 +246,7 @@ All protocols are **speaker-disjoint**: no speaker ever appears in both the trai
 **Secondary severity — legacy balanced protocol.** `config.DROPPED_FOR_BALANCE` excludes M12, M08, and M09 to reach three speakers per class, giving 3⁴ = 81 leave-one-per-class-out iterations. This particular set of three speakers is a design choice made to reach class balance, not a canonical selection. It is retained only as an explicitly labelled secondary check and is **not** the reported number.
 
 > [!NOTE]
-> The 10% validation split is carved from each fold's *training* portion at the utterance level, so validation speakers are a subset of training speakers. This is sound for model selection and early stopping, but validation metrics are optimistically biased and must never be reported as generalization performance.
+> Validation is **speaker-disjoint** — train speakers → training, validation speakers → model selection / early stopping, the held-out speaker → the LOSO test. The earlier utterance-level 10% split (validation speakers were also training speakers) made validation a within-speaker check that could not see cross-speaker failure; it remains available as `TrainingConfig(val_protocol="utterance")` for comparison only. Validation metrics are still never reported as generalization performance.
 
 ## Repository structure
 

@@ -8,6 +8,7 @@ train portion (carving out a validation slice) and turning DataFrames into
 PyTorch DataLoaders.
 """
 
+import zlib
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -22,6 +23,7 @@ from src.preprocessing import segmental_standardizer, suprasegmental_standardize
 from src.scanning import (add_severity_labels, check_word_counts,
                           filter_mic_channel, scan_audio_files,
                           validate_wav_headers)
+from src.training.models import GATED_FUSION_MODELS
 
 TASK_LABEL_COLUMN = {"detection": "Group", "severity": "Severity"}
 TASK_LABEL_MAP = {"detection": config.GROUP_LABEL_MAP, "severity": config.SEVERITY_LABEL_MAP}
@@ -55,9 +57,14 @@ def stratified_train_val_split(df: pd.DataFrame, label_column: str,
                                ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Split off a per-class fraction of df for validation.
 
-    Utterance-level (not speaker-disjoint): the held-out fold speaker is
-    already excluded upstream by the LOSO/severity split, so a validation
-    speaker overlapping with train here does not leak test-fold identity.
+    LEGACY (TrainingConfig.val_protocol="utterance"). Utterance-level, NOT
+    speaker-disjoint: every validation speaker also contributes ~90% of its
+    utterances to training. It does not leak the held-out TEST speaker, but
+    it makes validation a within-speaker memorization check — for severity,
+    where the label is a speaker attribute, val loss then selects checkpoints
+    and stops early on a signal that cannot see cross-speaker failure (the
+    audited 11-fold run: val F1 flat at ~0.36-0.44 while held-out speakers
+    scored 0% or ~98%). Use speaker_disjoint_train_val_split instead.
     """
     rng = np.random.default_rng(seed)
     train_parts, val_parts = [], []
@@ -73,6 +80,60 @@ def stratified_train_val_split(df: pd.DataFrame, label_column: str,
     train_df = pd.concat(train_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
     val_df = pd.concat(val_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
     return train_df, val_df
+
+
+def speaker_disjoint_train_val_split(df: pd.DataFrame, label_column: str, seed: int,
+                                     fold_id: str = "",
+                                     val_speakers_per_class: int = 1,
+                                     min_train_speakers_per_class: int = 2
+                                     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Carve whole SPEAKERS out of a fold's training portion for validation:
+
+        train speakers -> training
+        val speakers   -> model selection / early stopping / LR schedule
+        test speaker   -> the outer LOSO evaluation (already removed upstream)
+
+    so no validation utterance comes from a speaker the model trained on.
+    Per class, `val_speakers_per_class` speakers move to validation, but only
+    while at least `min_train_speakers_per_class` speakers of that class stay
+    in training — a class is never reduced to a single training speaker (its
+    "class" signal would then be one person's voice) and never vanishes.
+
+    For the 15-speaker severity LOSO (4 Very Low / 3 Low / 3 Mid / 5 High)
+    that yields 3-4 validation speakers per fold, one per eligible class, and
+    10-11 training speakers with >= 2 per class. The choice is seeded per
+    (seed, fold_id), so it is reproducible and differs across folds.
+    """
+    rng = np.random.default_rng([seed, zlib.crc32(fold_id.encode("utf-8"))])
+    val_speakers = []
+    for _, group in sorted(df.groupby(label_column), key=lambda item: str(item[0])):
+        speakers = sorted(group["Speaker_ID"].unique().tolist())
+        n_val = min(val_speakers_per_class, len(speakers) - min_train_speakers_per_class)
+        if n_val <= 0:
+            continue
+        val_speakers.extend(sorted(rng.choice(speakers, size=n_val, replace=False).tolist()))
+    if not val_speakers:
+        raise ValueError(
+            f"No class has more than {min_train_speakers_per_class} training speakers, "
+            f"so no speaker-disjoint validation set can be formed for fold {fold_id!r}.")
+
+    val_mask = df["Speaker_ID"].isin(val_speakers)
+    train_df = df[~val_mask].sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    val_df = df[val_mask].sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    return train_df, val_df
+
+
+def split_train_val(df: pd.DataFrame, label_column: str, protocol: str, seed: int,
+                    fold_id: str = "", val_fraction: float = config.DEFAULT_VAL_FRACTION
+                    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Dispatch on TrainingConfig.val_protocol: "speaker" (default,
+    speaker_disjoint_train_val_split) or "utterance" (legacy
+    stratified_train_val_split)."""
+    if protocol == "speaker":
+        return speaker_disjoint_train_val_split(df, label_column, seed, fold_id=fold_id)
+    if protocol == "utterance":
+        return stratified_train_val_split(df, label_column, val_fraction, seed)
+    raise ValueError(f"val_protocol must be 'speaker' or 'utterance', got {protocol!r}")
 
 
 def compute_class_weights(train_df: pd.DataFrame, task: str) -> torch.Tensor:
@@ -93,11 +154,11 @@ def compute_class_weights(train_df: pd.DataFrame, task: str) -> torch.Tensor:
 # variant either is the MFCC CNN or fuses with it, so it needs the tensor.
 MODELS_WITHOUT_MFCC = frozenset({"deep_frozen", "deep_lora"})
 
-# The one-shot three-branch severity model — the only one whose Dataset
-# needs the segmental/suprasegmental tensors and a per-fold speaker label
-# map (see src.dataset.UASpeechDataset's include_three_branch/
+# The three-branch severity model and its ablations — the only ones whose
+# Dataset needs the segmental/suprasegmental tensors and a per-fold speaker
+# label map (see src.dataset.UASpeechDataset's include_three_branch/
 # speaker_label_map and src.models.gated_fusion.GatedFusionModel).
-MODELS_WITH_THREE_BRANCH = frozenset({"gated_fusion_three_branch"})
+MODELS_WITH_THREE_BRANCH = GATED_FUSION_MODELS
 
 
 def build_speaker_label_map(train_df: pd.DataFrame) -> Dict[str, int]:
@@ -153,11 +214,10 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
 
     speaker_label_map (Speaker_ID -> contiguous int, see
     build_speaker_label_map) is given only for MODELS_WITH_THREE_BRANCH, and
-    applied ONLY to the train/val Datasets — val speakers are always a
-    subset of this fold's training speakers (stratified_train_val_split
-    carves val out of the train portion), but the held-out TEST speaker is
-    never a key in this map by construction (that is the whole point of a
-    LOSO fold), so the test Dataset must never look it up.
+    applied to the train Dataset, and to val only when every val speaker is
+    also a training speaker (see val_has_speaker_labels below). The held-out
+    TEST speaker is never a key in this map by construction (that is the
+    whole point of a LOSO fold), so the test Dataset never looks it up.
 
     For MODELS_WITH_THREE_BRANCH, segmental/suprasegmental channel
     normalization statistics (src.preprocessing.segmental_standardizer /
@@ -207,11 +267,20 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
         loader_kwargs.update(persistent_workers=True, prefetch_factor=4,
                              worker_init_fn=_init_worker)
 
+    # Speaker labels for validation only when every validation speaker is a
+    # TRAINING speaker (the legacy utterance-level split). Under the
+    # speaker-disjoint split none of them is — they are not keys of
+    # speaker_label_map — so validation carries no speaker-adversary term and
+    # val loss is the severity objective (plus the complementarity penalty).
+    val_has_speaker_labels = (speaker_label_map is not None
+                              and set(val_df["Speaker_ID"]).issubset(speaker_label_map))
+
     train_loader = DataLoader(
         dataset(train_df, with_speaker_labels=True), batch_size=batch_size, shuffle=True,
         drop_last=len(train_df) > batch_size, **loader_kwargs)
     val_loader = DataLoader(
-        dataset(val_df, with_speaker_labels=True), batch_size=batch_size, shuffle=False, **loader_kwargs)
+        dataset(val_df, with_speaker_labels=val_has_speaker_labels), batch_size=batch_size,
+        shuffle=False, **loader_kwargs)
     test_loader = DataLoader(
         dataset(test_df, with_speaker_labels=False), batch_size=batch_size, shuffle=False, **loader_kwargs)
     return train_loader, val_loader, test_loader

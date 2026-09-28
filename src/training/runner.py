@@ -24,7 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src import config
 from src.console import (V, print_architecture, print_banner, print_fold_progress,
-                        print_header, print_kv, print_metrics, print_note, progress,
+                        print_header, print_kv, print_metrics, print_note,
                         print_signal_chain, print_status, print_subheader, print_table)
 from src.praat import FEATURE_COLUMNS as PRAAT_FEATURE_COLUMNS
 from src.praat import load_praat_table
@@ -32,7 +32,7 @@ from src.splits import (build_severity_folds, get_severity_split, iter_loso_fold
                         iter_screening_folds, iter_severity_loso_folds, sample_severity_folds)
 from src.training.checkpoint import load_checkpoint, save_checkpoint
 from src.training.data import (TASK_LABEL_COLUMN, build_loaders, build_speaker_label_map,
-                               compute_class_weights, stratified_train_val_split)
+                               compute_class_weights, split_train_val)
 from src.training.early_stopping import EarlyStopping
 from src.training.engine import EpochResult, build_optimizer, run_epoch
 from src.training.metrics import compute_confusion_matrix, compute_metrics
@@ -40,10 +40,13 @@ from src.training.models import (MODEL_DESCRIPTIONS, SEVERITY_MODEL_NAME,
                                  MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING,
                                  MODELS_REQUIRING_PRAAT, build_model)
 from src.training.reporting import (FOLD_CACHED, FOLD_COMPLETED, FOLD_FAILED,
-                                    FOLD_SKIPPED_DEADLINE, aggregate_fold_metrics,
-                                    describe_fold, record_fold, save_confusion_matrix,
+                                    FOLD_INTERRUPTED, FOLD_SKIPPED_DEADLINE,
+                                    aggregate_fold_metrics, describe_fold,
+                                    print_fold_report, print_pooled_evaluation,
+                                    print_run_coverage, print_runtime_status,
+                                    record_fold, run_coverage, save_confusion_matrix,
                                     save_embeddings, save_metrics, save_predictions,
-                                    save_roc_curve, summarize_registry)
+                                    save_roc_curve)
 from src.training.utils import resolve_device, set_seed
 
 
@@ -119,6 +122,24 @@ class TrainingConfig:
     # step-by-step debugging of a single batch/epoch.
     show_batch_progress: bool = False
 
+    # How each fold's validation set is carved from its training portion —
+    # see src.training.data.split_train_val. "speaker" (default): whole
+    # speakers, disjoint from training, so model selection and early stopping
+    # see cross-speaker generalization. "utterance": the legacy 10% per-class
+    # utterance split, whose validation speakers are also training speakers.
+    val_protocol: str = "speaker"
+
+    # None = config.WAV2VEC_GRADIENT_CHECKPOINTING. Numerically identical
+    # either way; only speed/memory differ (see benchmark_batch_sizes).
+    gradient_checkpointing: Optional[bool] = None
+
+    # Runtime guard (see run_training): a fold is started only if
+    # now + fold_estimate * safety_factor stays inside the deadline. Before any
+    # fold has run in this session the estimate is fold_time_estimate_s (e.g.
+    # from src.training.session.project_runtime), or no estimate at all.
+    fold_time_estimate_s: Optional[float] = None
+    safety_factor: float = 1.15
+
 
 def build_folds(df: pd.DataFrame, task: str, cfg: Optional["TrainingConfig"] = None):
     """Yield (fold_id, train_df, test_df) for the requested task's protocol."""
@@ -186,12 +207,29 @@ def _load_completed_fold(run_name: str, fold_id: str, task: str
     return metrics_dict, y_true, y_pred, y_prob, speakers
 
 
+class FoldInterrupted(RuntimeError):
+    """Raised by run_fold between epochs when the next epoch would cross the
+    session's hard deadline. The fold's latest.pt is already on disk, so a
+    later session resumes it mid-fold instead of losing it to Kaggle's kill."""
+
+
 def _format_hm(seconds: float) -> str:
     """0 <= seconds -> 'XhYYm', for the elapsed/ETA lines below."""
     seconds = max(0.0, seconds)
     hours, remainder = divmod(int(seconds), 3600)
     minutes = remainder // 60
     return f"{hours}h{minutes:02d}m"
+
+
+def _monitored_value(result: EpochResult) -> float:
+    """What early stopping, best-checkpoint selection and the LR scheduler
+    track: the validation ORDINAL loss when the model reports one (the
+    GatedFusionModel family), else the total validation loss. The ordinal
+    term alone keeps model selection comparable across ablations that do and
+    do not add a complementarity penalty to their total loss."""
+    extras = result.extras or {}
+    value = extras.get("ordinal_loss")
+    return float(value) if value is not None and np.isfinite(value) else float(result.loss)
 
 
 def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
@@ -201,7 +239,8 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
             fold_index: int = 1, n_folds: int = 1,
             run_start_time: Optional[float] = None,
             total_epochs_planned: Optional[int] = None,
-            epochs_completed_before: int = 0
+            epochs_completed_before: int = 0,
+            hard_deadline: Optional[float] = None
             ) -> Tuple[Dict, EpochResult]:
     """Train, validate, checkpoint, and test-evaluate one fold. Returns
     (metrics_dict, test_result) — the caller pools test_result across
@@ -211,31 +250,42 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     optional whole-run bookkeeping (set by run_training) used only to print
     an "elapsed / estimated remaining" line after each epoch — a fold
     trained standalone (e.g. from a notebook cell or the budget-benchmark
-    path) simply omits them and gets the per-epoch line without the ETA."""
+    path) simply omits them and gets the per-epoch line without the ETA.
+
+    `hard_deadline` (time.monotonic()), if given, is checked before every
+    epoch: when the next epoch — estimated from the slowest one so far —
+    would end past it, the fold raises FoldInterrupted instead of starting it.
+    latest.pt is already saved at that point, so the fold resumes mid-way in
+    a later session."""
     fold_start = time.monotonic()
     label_column = TASK_LABEL_COLUMN[cfg.task]
     num_classes = config.NUM_CLASSES[cfg.task]
 
-    train_df, val_df = stratified_train_val_split(
-        train_df, label_column, cfg.val_fraction, cfg.seed)
+    train_df, val_df = split_train_val(train_df, label_column, cfg.val_protocol, cfg.seed,
+                                       fold_id=fold_id, val_fraction=cfg.val_fraction)
+    val_speakers = sorted(val_df["Speaker_ID"].unique().tolist())
+    if cfg.val_protocol == "speaker":
+        overlap = set(val_speakers) & set(train_df["Speaker_ID"])
+        if overlap:
+            raise RuntimeError(f"Speaker leakage: {sorted(overlap)} in both train and val.")
+    if set(test_df["Speaker_ID"]) & (set(train_df["Speaker_ID"]) | set(val_speakers)):
+        raise RuntimeError(f"Speaker leakage: held-out speaker(s) of fold {fold_id} "
+                           "also appear in train or val.")
 
     if cfg.limit_samples is not None:
         train_df = _limit_samples(train_df, cfg.limit_samples, label_column)
-        # Restrict val to train's (now-limited) speakers BEFORE capping it —
-        # src.training.data.build_loaders' speaker_label_map is built from
-        # this train_df alone and is documented to assume "val speakers are
-        # always a subset of this fold's training speakers". That holds
-        # naturally at full scale (~700 utterances/speaker), but capping
-        # train_df and val_df independently by class alone (not speaker) can
-        # otherwise leave a speaker in val_df with zero rows in the capped
-        # train_df, which crashes UASpeechDataset.__getitem__'s speaker_index
-        # lookup (KeyError) for the three-branch model — reproduced by the
-        # notebook's own SMOKE_RUN (limit_samples=16).
-        val_df = val_df[val_df["Speaker_ID"].isin(train_df["Speaker_ID"])]
+        if cfg.val_protocol == "utterance":
+            # Restrict val to train's (now-limited) speakers BEFORE capping it —
+            # under the utterance protocol val speakers are training speakers
+            # and get speaker labels (src.training.data.build_loaders), so a val
+            # speaker with zero rows left in the capped train_df would crash
+            # UASpeechDataset.__getitem__'s speaker_index lookup (KeyError) —
+            # reproduced by the notebook's own SMOKE_RUN (limit_samples=16).
+            val_df = val_df[val_df["Speaker_ID"].isin(train_df["Speaker_ID"])]
         val_df = _limit_samples(val_df, max(2, cfg.limit_samples // 4), label_column)
         test_df = _limit_samples(test_df, cfg.limit_samples, label_column)
 
-    # Only meaningful for SEVERITY_MODEL_NAME (see build_model/GatedFusionModel's
+    # Only meaningful for the GatedFusionModel family (see build_model's
     # adversarial speaker head) — harmless to build unconditionally for every
     # other model, since build_loaders only forwards it when the model actually
     # needs the three-branch Dataset fields.
@@ -247,7 +297,8 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
         frozen_embedding_table=frozen_embedding_table, model_name=cfg.model,
         speaker_label_map=speaker_label_map)
 
-    model = build_model(cfg.model, num_classes, num_speakers=len(speaker_label_map)).to(device)
+    model = build_model(cfg.model, num_classes, num_speakers=len(speaker_label_map),
+                        gradient_checkpointing=cfg.gradient_checkpointing).to(device)
     optimizer = build_optimizer(model, cfg.lr_head, cfg.lr_backbone, cfg.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5,
                                   patience=max(1, cfg.patience // 2))
@@ -288,13 +339,17 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
 
     print_fold_progress(fold_id, fold_index, n_folds,
                         len(train_df), len(val_df), len(test_df))
+    print(f"    train speakers ({train_df['Speaker_ID'].nunique()}) | "
+          f"val speakers ({len(val_speakers)}, {cfg.val_protocol}-level): "
+          f"{', '.join(val_speakers)} | test: {', '.join(sorted(test_df['Speaker_ID'].unique()))}")
     if fold_index == 1:
         print_architecture(model, cfg.model)
         print()
 
     epochs_completed = 0
-    best_epoch, best_val_f1 = None, None
+    best_epoch, best_val_f1, best_monitored = None, None, None
     start_epoch = 0
+    slowest_epoch_s = 0.0
     if latest_ckpt_path.exists():
         checkpoint = load_checkpoint(latest_ckpt_path, model, optimizer, scheduler, scaler,
                                      map_location=str(device))
@@ -305,12 +360,21 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
         early_stopping.should_stop = es_state.get("should_stop", False)
         best_epoch = checkpoint.get("best_epoch")
         best_val_f1 = checkpoint.get("best_val_f1")
+        best_monitored = checkpoint.get("best_monitored")
+        slowest_epoch_s = float(checkpoint.get("slowest_epoch_s") or 0.0)
         epochs_completed = start_epoch
         print(f"    Resuming fold {fold_id} from {latest_ckpt_path.name} "
              f"-- epoch {start_epoch}/{cfg.epochs} onward "
              f"(model/optimizer/scheduler/scaler/early-stopping state restored)")
 
     for epoch in range(start_epoch, cfg.epochs) if not early_stopping.should_stop else ():
+        if (hard_deadline is not None and slowest_epoch_s > 0
+                and time.monotonic() + slowest_epoch_s > hard_deadline):
+            writer.close()
+            raise FoldInterrupted(
+                f"fold {fold_id}: epoch {epoch + 1} (~{_format_hm(slowest_epoch_s)}) would end "
+                f"past the session's hard deadline — stopped after {epochs_completed} epoch(s); "
+                f"{latest_ckpt_path.name} resumes it next session.")
         epoch_start = time.monotonic()
         train_desc = (f"epoch {epoch + 1}/{cfg.epochs} train" if cfg.show_batch_progress else "")
         val_desc = (f"epoch {epoch + 1}/{cfg.epochs} val" if cfg.show_batch_progress else "")
@@ -323,10 +387,12 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
                                scaler, cfg.grad_clip, cfg.task, train=False,
                                description=val_desc,
                                amp_dtype=amp_dtype, amp_enabled=use_amp)
-        scheduler.step(val_result.loss)
+        monitored = _monitored_value(val_result)
+        scheduler.step(monitored)
 
         writer.add_scalar("Loss/train", train_result.loss, epoch)
         writer.add_scalar("Loss/val", val_result.loss, epoch)
+        writer.add_scalar("Loss/val_monitored", monitored, epoch)
         for name, value in train_result.metrics.items():
             writer.add_scalar(f"Train/{name}", value, epoch)
         for name, value in val_result.metrics.items():
@@ -334,28 +400,35 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
         writer.add_scalar("LR", optimizer.param_groups[-1]["lr"], epoch)
 
         epochs_completed = epoch + 1
-        is_best = early_stopping.step(val_result.loss)
+        is_best = early_stopping.step(monitored)
         if is_best:
             save_checkpoint(best_ckpt_path, model, optimizer, scheduler, scaler,
-                            epoch, val_result.loss)
-            best_epoch, best_val_f1 = epoch + 1, val_result.metrics["f1"]
+                            epoch, monitored)
+            best_epoch, best_val_f1, best_monitored = epoch + 1, val_result.metrics["f1"], monitored
+
+        epoch_time_s = time.monotonic() - epoch_start
+        slowest_epoch_s = max(slowest_epoch_s, epoch_time_s)
 
         # Every epoch, improving or not -- see latest_ckpt_path's comment
         # above. Written after best.pt so an interrupted save never leaves
         # latest.pt claiming an epoch whose best.pt update didn't land.
         save_checkpoint(latest_ckpt_path, model, optimizer, scheduler, scaler,
-                        epoch, val_result.loss,
+                        epoch, monitored,
                         extra={"early_stopping": {"best": early_stopping.best,
                                                   "num_bad_epochs": early_stopping.num_bad_epochs,
                                                   "should_stop": early_stopping.should_stop},
                               "best_epoch": best_epoch, "best_val_f1": best_val_f1,
+                              "best_monitored": best_monitored,
+                              "slowest_epoch_s": slowest_epoch_s,
                               "fold_id": fold_id})
 
-        epoch_time_s = time.monotonic() - epoch_start
+        val_metrics = val_result.metrics
         print(f"    Epoch {epoch + 1:02d}/{cfg.epochs} | "
              f"Train Loss: {train_result.loss:.4f} | "
-             f"Val Loss: {val_result.loss:.4f} | "
-             f"Val F1: {val_result.metrics['f1']:.4f} | "
+             f"Val Loss: {val_result.loss:.4f} (ordinal {monitored:.4f}) | "
+             f"Val Acc: {val_metrics['accuracy']:.3f} | "
+             f"Val F1: {val_metrics['f1']:.4f} | "
+             f"Val MAE: {val_metrics['ordinal_mae']:.3f} | "
              f"Time: {epoch_time_s / 60:.1f} min" + ("  <-- best" if is_best else ""))
 
         if run_start_time is not None and total_epochs_planned:
@@ -365,11 +438,11 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
             remaining_epochs = max(0, total_epochs_planned - epochs_done_total)
             eta_s = avg_per_epoch_s * remaining_epochs
             print(f"      Elapsed: {_format_hm(elapsed_s)}  |  "
-                 f"Estimated remaining: {_format_hm(eta_s)}")
+                 f"Upper-bound remaining (every fold at max epochs): {_format_hm(eta_s)}")
 
         if early_stopping.should_stop:
             print(f"    early stopping at epoch {epoch + 1} "
-                 f"(no val-loss improvement for {cfg.patience} epochs)")
+                 f"(no val ordinal-loss improvement for {cfg.patience} epochs)")
             break
 
     if best_ckpt_path.exists():
@@ -383,18 +456,33 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
                                         if cfg.show_batch_progress else ""),
                             amp_dtype=amp_dtype, amp_enabled=use_amp)
     inference_time_s = time.monotonic() - inference_start
-    fold_time_s = time.monotonic() - fold_start
+
+    class_names = (config.SEVERITY_CLASS_NAMES if cfg.task == "severity"
+                   else config.DETECTION_CLASS_NAMES)
+    pred_counts = np.bincount(test_result.y_pred, minlength=num_classes)
+    argmax_counts = np.bincount(test_result.y_pred_argmax, minlength=num_classes)
+    diagnostics = (model.coral_threshold_diagnostics()
+                   if hasattr(model, "coral_threshold_diagnostics") else {})
+    fold_record = {
+        "fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
+        "true_label": ";".join(sorted(test_df[label_column].unique())),
+        "pred_distribution": {name: int(n) for name, n in zip(class_names, pred_counts)},
+        "argmax_pred_distribution": {name: int(n) for name, n in zip(class_names, argmax_counts)},
+        "epochs_completed": epochs_completed,
+        "best_epoch": best_epoch, "best_val_f1": best_val_f1,
+        "best_val_monitored": best_monitored,
+        "val_protocol": cfg.val_protocol, "val_speakers": ";".join(val_speakers),
+        "n_train_speakers": int(train_df["Speaker_ID"].nunique()),
+        "n_train": int(len(train_df)), "n_val": int(len(val_df)),
+        "batch_size": cfg.batch_size,
+        "train_time_s": train_time_s, "inference_time_s": inference_time_s,
+        **diagnostics,
+    }
 
     save_predictions(config.PREDICTIONS_DIR / run_name / f"{fold_id}.csv",
                      test_result.filenames, test_result.speaker_ids, test_result.y_true,
-                     test_result.y_pred, test_result.y_prob, cfg.task)
-    save_metrics(config.METRICS_DIR / run_name / f"{fold_id}.json",
-                {"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
-                 "epochs_completed": epochs_completed,
-                 "best_epoch": best_epoch, "best_val_f1": best_val_f1,
-                 "fold_time_s": fold_time_s, "train_time_s": train_time_s,
-                 "inference_time_s": inference_time_s,
-                 **(test_result.extras or {})})
+                     test_result.y_pred, test_result.y_prob, cfg.task,
+                     y_pred_argmax=test_result.y_pred_argmax)
     save_confusion_matrix(
         config.CONFUSION_MATRIX_DIR / run_name / f"{fold_id}.png",
         compute_confusion_matrix(test_result.y_true, test_result.y_pred, cfg.task),
@@ -406,25 +494,19 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
                     test_result.embeddings, test_result.y_true, test_result.speaker_ids,
                     test_result.filenames, branch_embeddings=test_result.branch_embeddings,
                     gate_weights=test_result.gate_weights)
-
     writer.close()
-    print_kv(f"Fold {fold_id} held-out test", ", ".join(
-        f"{k}={v:.3f}" for k, v in test_result.metrics.items()))
 
-    print()
-    print(f"  FOLD {fold_index}/{n_folds} ({fold_id}) COMPLETE")
-    print(f"  Best Val F1   : {best_val_f1:.4f}" if best_val_f1 is not None
-         else "  Best Val F1   : n/a (no improving epoch)")
-    print(f"  Best Epoch    : {best_epoch}/{cfg.epochs}" if best_epoch is not None
-         else f"  Best Epoch    : n/a/{cfg.epochs}")
-    print(f"  Fold Time     : {_format_hm(fold_time_s)}")
+    # Timed after every artifact is written, so fold_time_s is the real cost of
+    # a fold — what the runtime guard in run_training projects from.
+    fold_record["fold_time_s"] = time.monotonic() - fold_start
+    # Metrics last: _load_completed_fold treats metrics + predictions as the
+    # "fold finished" marker, so it must not exist before everything else does.
+    save_metrics(config.METRICS_DIR / run_name / f"{fold_id}.json",
+                 {**fold_record, **(test_result.extras or {})})
+
+    print_fold_report(fold_record, fold_index, n_folds, cfg.epochs, cfg.task)
     print(f"  Checkpoint    : {best_ckpt_path}")
-
-    return ({"fold": fold_id, "test_loss": test_result.loss, **test_result.metrics,
-             "epochs_completed": epochs_completed,
-             "best_epoch": best_epoch, "best_val_f1": best_val_f1,
-             "fold_time_s": fold_time_s, "train_time_s": train_time_s,
-             "inference_time_s": inference_time_s}, test_result)
+    return fold_record, test_result
 
 
 def _registry_kwargs(cfg: TrainingConfig, run_name: str, expected_folds: int) -> Dict:
@@ -439,24 +521,40 @@ def _registry_kwargs(cfg: TrainingConfig, run_name: str, expected_folds: int) ->
 
 
 def run_training(df: pd.DataFrame, cfg: TrainingConfig,
-                 deadline: Optional[float] = None) -> Tuple[pd.DataFrame, Dict[str, float]]:
+                 deadline: Optional[float] = None,
+                 hard_deadline: Optional[float] = None,
+                 session_start: Optional[float] = None,
+                 session_budget_s: Optional[float] = None
+                 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
     Run every requested fold for cfg.task/cfg.model, then aggregate.
 
-    `deadline`, if given, is a time.monotonic() timestamp: once reached, no
-    new fold is started (already-completed folds still load instantly from
-    disk via _load_completed_fold) and the run stops cleanly, printing how
-    many folds it got through. Re-calling run_training() later resumes from
-    the next fold — this is what lets a multi-hour job run in bounded,
-    unattended-safe sessions instead of one continuous multi-day pass.
+    Runtime safety (all time.monotonic() timestamps, all optional):
+      deadline       the SAFE budget end. A fold is started only if its
+                     projected end — now + fold estimate x cfg.safety_factor —
+                     falls before it; the estimate is the mean wall time of the
+                     folds trained so far in this session, or
+                     cfg.fold_time_estimate_s before the first one. Otherwise
+                     that fold and every later one are recorded as skipped and
+                     the run stops cleanly.
+      hard_deadline  checked between epochs inside a fold (see run_fold): a
+                     fold whose next epoch would cross it is interrupted, not
+                     killed mid-write — it resumes from latest.pt next session.
+      session_start / session_budget_s  only for the per-fold runtime report
+                     (elapsed session time, projected finish, safety margin).
 
-    Returns (per_fold_summary_df, pooled_metrics_dict). Every fold's
+    Re-calling run_training() later resumes: finished folds load instantly
+    from disk via _load_completed_fold, an interrupted one resumes mid-fold.
+
+    Returns (per_fold_summary_df, pooled_metrics_dict). pooled_metrics also
+    carries the run's coverage ("run_status" COMPLETE / PARTIAL / FAILED,
+    "expected_folds", "completed_folds"), which is written to
+    outputs/metrics/<run_name>/RUN_STATUS.json as well. Every fold's
     checkpoint/log/predictions/metrics/confusion-matrix/ROC/embedding is
     written under outputs/ as a side effect. Pooled metrics — predictions
     concatenated across every fold before scoring — are what's comparable
-    to the base paper's LOSO numbers; per-fold precision/recall/AUROC are
-    degenerate for detection, since each LOSO fold's held-out speaker is
-    entirely one class.
+    to the base paper's LOSO numbers; per-fold class-sensitive metrics are
+    undefined, since each LOSO fold's held-out speaker is entirely one class.
     """
     set_seed(cfg.seed)
     config.ensure_directories()
@@ -485,7 +583,8 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         protocol = ("Leave-One-Speaker-Out" if cfg.cv_protocol != "screening"
                     else f"screening ({cfg.screening_folds}-fold, speaker-grouped)")
     elif cfg.severity_protocol == "full_loso":
-        protocol = "full-population Leave-One-Speaker-Out (PRIMARY, all 15 dysarthric speakers)"
+        protocol = (f"full-population Leave-One-Speaker-Out (PRIMARY, all "
+                    f"{len(config.DYSARTHRIC_IDS)} dysarthric speakers)")
     else:
         protocol = "balanced leave-one-speaker-per-class-out (SECONDARY, 3/class)"
         if cfg.severity_fold_sample is not None:
@@ -497,11 +596,15 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     print_kv("Task", f"{cfg.task} ({config.NUM_CLASSES[cfg.task]}-class)")
     print_kv("Model", f"{cfg.model} — {MODEL_DESCRIPTIONS.get(cfg.model, '')}")
     print_kv("Cross-validation protocol", protocol)
+    print_kv("Validation protocol", "speaker-disjoint (whole speakers held out of training)"
+             if cfg.val_protocol == "speaker"
+             else "utterance-level (LEGACY — val speakers are also training speakers)")
     print_kv("Run name", run_name)
     print_kv("Device", device)
     print_kv("Epochs / batch size", f"{cfg.epochs} / {cfg.batch_size}")
     print_kv("LR (head / wav2vec backbone)", f"{cfg.lr_head} / {cfg.lr_backbone}")
-    print_kv("Early stopping patience", f"{cfg.patience} epochs on validation loss")
+    print_kv("Early stopping patience", f"{cfg.patience} epochs on validation ordinal loss")
+    print_kv("Severity decoding", "median of the CORAL distribution (threshold count)")
     if praat_table is not None:
         print_kv("Praat pathway", f"{len(PRAAT_FEATURE_COLUMNS)} features, "
                  f"standardized per fold from the train split only")
@@ -544,26 +647,37 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
 
     print()
     print_kv("Selected folds", ", ".join(fold_id for fold_id, _, _ in fold_iter))
-    print_kv("Total folds", n_folds)
-    print_kv("Epochs per fold", cfg.epochs)
+    print_kv("Expected folds", n_folds)
+    print_kv("Epochs per fold (max)", cfg.epochs)
 
     registry_base = _registry_kwargs(cfg, run_name, n_folds)
     fold_metrics = []
+    fold_status: Dict[str, str] = {}
     pooled_true, pooled_pred, pooled_prob, pooled_speakers = [], [], [], []
-    failed_folds = []
-    # Whole-run bookkeeping for the per-epoch "Elapsed / Estimated remaining"
-    # line inside run_fold — epochs_completed_running is an actual measured
-    # count (not folds_done * cfg.epochs), since early stopping/resume mean
-    # folds rarely run the full cfg.epochs.
+    # Whole-run bookkeeping for the per-epoch "Elapsed" line inside run_fold
+    # and for the runtime guard: only folds TRAINED in this session inform the
+    # time estimate (cache-loaded ones cost nothing).
     run_start_time = time.monotonic()
     total_epochs_planned = n_folds * cfg.epochs
     epochs_completed_running = 0
-    # Run-level bar: without it, the only cross-fold signal was one-shot text
-    # printed at each fold's start/end, with total silence in between on top
-    # of the per-batch bars nested inside run_fold — nothing showed overall
-    # elapsed/ETA across a run that can legitimately take many hours.
-    fold_bar = progress(range(n_folds), f"{run_name} -- fold progress",
-                        total=n_folds, unit="fold", leave=True)
+    session_fold_times: List[float] = []
+
+    def estimated_fold_seconds() -> Optional[float]:
+        if session_fold_times:
+            return float(np.mean(session_fold_times))
+        return cfg.fold_time_estimate_s
+
+    def skip_remaining(from_index: int, status: str, reason: str) -> None:
+        print_note(reason)
+        for j, (skipped_id, _, skipped_test_df) in enumerate(fold_iter[from_index - 1:],
+                                                             start=from_index):
+            if skipped_id in fold_status:
+                continue
+            fold_status[skipped_id] = status if j == from_index else FOLD_SKIPPED_DEADLINE
+            record_fold(**registry_base, fold_id=skipped_id, fold_index=j,
+                        status=fold_status[skipped_id],
+                        fold_description=describe_fold(skipped_test_df))
+
     for i, (fold_id, train_df, test_df) in enumerate(fold_iter, start=1):
         # Held-out composition is known before training and is recorded whatever
         # the fold's outcome — so a fold that never ran still leaves a registry
@@ -572,53 +686,63 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         # shrinking the denominator to whatever happened to finish.
         fold_description = describe_fold(test_df)
 
-        # Resume support: a long unattended run (full 28-fold LOSO across six
-        # model variants is realistically hours-to-days) can be interrupted
-        # and restarted without redoing folds that already finished.
+        # Resume support: a long unattended run can be interrupted and
+        # restarted without redoing folds that already finished.
         cached = _load_completed_fold(run_name, fold_id, cfg.task)
-        if cached is None and deadline is not None and time.monotonic() >= deadline:
-            print_note(f"Time budget reached after {i - 1}/{n_folds} folds — "
-                      "stopping early. Re-run this cell to resume.")
-            # Record every remaining fold as skipped, not merely this one: the
-            # run is stopping here, so all of them are equally un-evaluated and
-            # the registry should say so rather than leave them absent (absent
-            # is indistinguishable from "never configured").
-            for j, (skipped_id, _, skipped_test_df) in enumerate(fold_iter[i - 1:], start=i):
-                record_fold(**registry_base, fold_id=skipped_id, fold_index=j,
-                            status=FOLD_SKIPPED_DEADLINE,
-                            fold_description=describe_fold(skipped_test_df))
-            fold_bar.close()
-            break
+
+        if cached is None and deadline is not None:
+            now = time.monotonic()
+            estimate = estimated_fold_seconds()
+            projected_end = now + (estimate or 0.0) * cfg.safety_factor
+            if now >= deadline or projected_end > deadline:
+                skip_remaining(i, FOLD_SKIPPED_DEADLINE, (
+                    f"Runtime guard: not starting fold {i}/{n_folds} ({fold_id}) — "
+                    + (f"projected to need {_format_hm(estimate * cfg.safety_factor)} "
+                       f"(estimate x{cfg.safety_factor:.2f}) but only "
+                       f"{_format_hm(max(0.0, deadline - now))} of safe budget remain."
+                       if estimate else "the safe budget is already spent.")
+                    + " Remaining folds are recorded as SKIPPED; re-run to resume."))
+                break
+
         if cached is not None:
             metrics_dict, y_true, y_pred, y_prob, speakers = cached
             print_kv(f"Fold {fold_id}", "already completed — loaded from disk, skipping retrain")
+            fold_status[fold_id] = FOLD_CACHED
             record_fold(**registry_base, fold_id=fold_id, fold_index=i,
                         status=FOLD_CACHED, fold_description=fold_description,
                         num_classes_present=int(len(np.unique(y_true))),
                         epochs_completed=metrics_dict.get("epochs_completed"),
                         runtime_s=metrics_dict.get("fold_time_s"))
         else:
+            fold_started = time.monotonic()
             try:
                 metrics_dict, test_result = run_fold(fold_id, train_df, test_df, cfg, device,
                                                      run_name, praat_table, frozen_embedding_table,
                                                      fold_index=i, n_folds=n_folds,
                                                      run_start_time=run_start_time,
                                                      total_epochs_planned=total_epochs_planned,
-                                                     epochs_completed_before=epochs_completed_running)
+                                                     epochs_completed_before=epochs_completed_running,
+                                                     hard_deadline=hard_deadline)
+            except FoldInterrupted as exc:
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                skip_remaining(i, FOLD_INTERRUPTED,
+                               f"Hard deadline: {exc} Later folds are recorded as SKIPPED.")
+                break
             except Exception:
                 # One fold's OOM/transient failure should not abort a run that
                 # may have already spent hours on earlier folds — log it, free
                 # whatever CUDA memory the failed attempt held, and move on.
                 print_status(f"Fold {fold_id} failed — skipping (see traceback below)", ok=False)
                 print(traceback.format_exc())
-                failed_folds.append(fold_id)
+                fold_status[fold_id] = FOLD_FAILED
                 record_fold(**registry_base, fold_id=fold_id, fold_index=i,
                             status=FOLD_FAILED, fold_description=fold_description)
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-                fold_bar.set_postfix_str(f"{fold_id} FAILED")
-                fold_bar.update(1)
                 continue
+            session_fold_times.append(time.monotonic() - fold_started)
+            fold_status[fold_id] = FOLD_COMPLETED
             record_fold(**registry_base, fold_id=fold_id, fold_index=i,
                         status=FOLD_COMPLETED, fold_description=fold_description,
                         num_classes_present=metrics_dict.get("n_classes_present"),
@@ -628,11 +752,9 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
             speakers = test_result.speaker_ids
             # Each fold builds a fresh model/optimizer/scaler (run_fold) that goes
             # out of scope here; without an explicit empty_cache(), the CUDA
-            # allocator's cached-but-unused blocks can fragment across 28-81
-            # sequential folds and quietly shrink the effective free memory a
-            # later fold sees, risking a late-run OOM (or reduced_precision
-            # allocator lock-in) hours into an unattended session. Skipped for
-            # cache-hit folds above since they never allocated anything.
+            # allocator's cached-but-unused blocks can fragment across sequential
+            # folds and quietly shrink the effective free memory a later fold
+            # sees, risking a late-run OOM hours into an unattended session.
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -644,19 +766,25 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         pooled_prob.append(y_prob)
         pooled_speakers.extend(speakers)
 
-        fold_accuracy = metrics_dict.get("accuracy")
-        postfix = f"{fold_id} acc={fold_accuracy:.3f}" if fold_accuracy is not None else fold_id
-        fold_bar.set_postfix_str(postfix)
-        fold_bar.update(1)
-    fold_bar.close()
+        remaining = [fid for fid, _, _ in fold_iter if fid not in fold_status]
+        print_runtime_status(
+            folds_done=len(fold_status), n_folds=n_folds, remaining_folds=len(remaining),
+            run_elapsed_s=time.monotonic() - run_start_time,
+            fold_estimate_s=estimated_fold_seconds(), n_timed_folds=len(session_fold_times),
+            safety_factor=cfg.safety_factor,
+            session_elapsed_s=(time.monotonic() - session_start) if session_start else None,
+            session_budget_s=session_budget_s,
+            deadline_in_s=(deadline - time.monotonic()) if deadline is not None else None)
 
-    if failed_folds:
-        print_note(f"{len(failed_folds)} fold(s) failed and were excluded from pooling: "
-                  f"{failed_folds}")
+    coverage = run_coverage([fid for fid, _, _ in fold_iter], fold_status)
+    print_run_coverage(coverage, run_name)
+    save_metrics(config.METRICS_DIR / run_name / "RUN_STATUS.json", coverage)
 
     if not fold_metrics:
-        print_kv("Result", "No folds matched cfg.folds/cfg.max_folds; nothing was trained.")
-        return pd.DataFrame(), {}
+        print_kv("Result", "No fold produced a result; nothing to pool.")
+        return pd.DataFrame(), {"run_status": coverage["status"],
+                                "expected_folds": coverage["expected"],
+                                "completed_folds": 0}
 
     summary = aggregate_fold_metrics(config.METRICS_DIR, run_name, fold_metrics)
 
@@ -665,58 +793,24 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     y_prob = np.concatenate(pooled_prob)
     pooled_metrics = compute_metrics(y_true, y_pred, y_prob, cfg.task)
 
-    save_metrics(config.METRICS_DIR / run_name / "ALL_FOLDS_pooled.json", pooled_metrics)
     save_confusion_matrix(
         config.CONFUSION_MATRIX_DIR / run_name / "ALL_FOLDS_pooled.png",
         compute_confusion_matrix(y_true, y_pred, cfg.task),
-        cfg.task, title=f"{run_name} — all folds pooled")
+        cfg.task, title=f"{run_name} — {coverage['completed']}/{coverage['expected']} "
+                        f"folds pooled ({coverage['status']})")
     save_roc_curve(config.ROC_DIR / run_name / "ALL_FOLDS_pooled.png",
                    y_true, y_prob, cfg.task, title=f"{run_name} — all folds pooled")
 
-    print_header(f"Results — {run_name}  ({len(fold_metrics)} fold(s), "
-                 f"{len(y_true):,} held-out utterances)")
+    print_header(f"Results — {run_name}  ({coverage['completed']}/{coverage['expected']} "
+                 f"fold(s), {len(y_true):,} held-out utterances, {coverage['status']})")
+    print_subheader("Per-fold mean +/- std (defined metrics only)")
+    print_table(summary.dropna(how="all").reset_index().rename(columns={"index": "metric"}))
 
-    print_subheader("Per-fold mean +/- std")
-    print_table(summary.reset_index().rename(columns={"index": "metric"}))
-    if cfg.task == "detection" and cfg.cv_protocol != "screening":
-        print()
-        print_note("Every LOSO fold holds out ONE speaker, who is entirely one class, so "
-                   "per-fold precision / recall / specificity / AUROC are undefined")
-        print_note("(reported as NaN, not 0 — see src.training.metrics). Only 'accuracy' "
-                   "is meaningful per fold; the pooled numbers below are the reportable ones.")
-    if cfg.task == "severity" and cfg.severity_protocol == "full_loso":
-        print()
-        print_note("Every severity LOSO fold holds out ONE speaker, and severity labels are "
-                   "assigned at the SPEAKER level, so every held-out fold is entirely one "
-                   "severity class too — per-fold balanced accuracy / precision / recall / "
-                   "F1 / AUROC are undefined (NaN) for the same reason as detection above.")
-        print_note("Only per-fold 'accuracy' and 'ordinal_mae' are meaningful per fold; the "
-                   "pooled numbers below (predictions concatenated across all folds first) "
-                   "are the reportable multi-class result.")
-
-    # Coverage before metrics, deliberately: a pooled number from 2 of 28 folds
-    # looks identical to one from 28 of 28, and the reader needs to know which
-    # they are looking at BEFORE they read the number.
-    coverage = summarize_registry()
-    this_run = coverage[coverage["run_name"] == run_name]
-    if not this_run.empty:
-        row = this_run.iloc[0]
-        print_subheader("Evaluation coverage")
-        print_kv("Folds completed", f"{int(row['completed_folds'])} / "
-                 f"{int(row['expected_folds'])}  ({row['coverage']:.1%})")
-        print_kv("Folds with >1 held-out class", int(row["valid_folds"]))
-        print_kv("Pooled set covers both classes", bool(row["pooled_has_both_classes"]))
-        print_kv("Run status", row["status"])
-        if row["status"] != "COMPLETED":
-            print_note(f"This run is {row['status']} — it did not reach its intended "
-                       f"{int(row['expected_folds'])} folds. The pooled metrics below "
-                       "describe only the folds that ran and are NOT a final result.")
-        if not row["pooled_has_both_classes"] and cfg.task == "detection":
-            print_note("The pooled held-out set contains only ONE class, so pooled "
-                       "precision / recall / F1 / AUROC are undefined (NaN). This run "
-                       "carries no evidence about detection performance.")
-
-    print_metrics(pooled_metrics,
-                  title="Pooled across all folds (base-paper-style LOSO reporting)")
-
+    pooled_report = print_pooled_evaluation(y_true, y_pred, y_prob, cfg.task, coverage,
+                                            speakers=pooled_speakers)
+    pooled_metrics.update({"run_status": coverage["status"],
+                           "expected_folds": coverage["expected"],
+                           "completed_folds": coverage["completed"]})
+    save_metrics(config.METRICS_DIR / run_name / "ALL_FOLDS_pooled.json",
+                 {**pooled_metrics, **pooled_report})
     return summary, pooled_metrics

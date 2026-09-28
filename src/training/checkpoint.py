@@ -18,6 +18,7 @@ both through one format would make one of them non-idiomatic:
 nothing here is a Keras model.
 """
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -25,16 +26,36 @@ import joblib
 import torch
 
 
+# "model_state" holds every trainable parameter plus every buffer, but NOT
+# the frozen parameters — i.e. the frozen wav2vec2 backbone, which is
+# reloaded from its pretrained checkpoint whenever the model is built. For
+# the three-branch model that is ~0.75M of ~95M parameters: a ~9 MB file (weights
+# plus AdamW state)
+# instead of ~386 MB, written after every epoch. The full-size files filled
+# 8.5 GB of Kaggle's ~20 GB /kaggle/working after 11 of 15 folds.
+COMPACT_STATE_SCOPE = "trainable_params_and_buffers"
+
+
+def _frozen_parameter_names(model: torch.nn.Module) -> set:
+    return {name for name, param in model.named_parameters() if not param.requires_grad}
+
+
 def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
                     scheduler, scaler: torch.amp.GradScaler, epoch: int,
                     monitored_value: float, extra: Optional[dict] = None) -> None:
     """`extra` is merged into the saved dict as-is (e.g. early-stopping state,
     fold id) -- used by the per-epoch "latest" resume checkpoint in
-    src.training.runner.run_fold; the best-checkpoint call site simply omits it."""
+    src.training.runner.run_fold; the best-checkpoint call site simply omits it.
+
+    Written to a temporary file and renamed into place, so a session killed
+    mid-save leaves the previous checkpoint intact rather than a truncated one."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    frozen = _frozen_parameter_names(model)
     checkpoint = {
         "epoch": epoch,
-        "model_state": model.state_dict(),
+        "model_state": {key: value for key, value in model.state_dict().items()
+                        if key not in frozen},
+        "state_scope": COMPACT_STATE_SCOPE,
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "scaler_state": scaler.state_dict(),
@@ -42,15 +63,30 @@ def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
     }
     if extra:
         checkpoint.update(extra)
-    torch.save(checkpoint, path)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(checkpoint, temp_path)
+    os.replace(temp_path, path)
 
 
 def load_checkpoint(path: Path, model: torch.nn.Module,
                     optimizer: Optional[torch.optim.Optimizer] = None,
                     scheduler=None, scaler: Optional[torch.amp.GradScaler] = None,
                     map_location: str = "cpu") -> dict:
+    """Restore a checkpoint into an already-built `model`. A compact
+    checkpoint (see COMPACT_STATE_SCOPE) must supply every key except frozen
+    parameters — anything else missing, or any unexpected key, raises rather
+    than silently leaving part of the model at its initialization."""
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
-    model.load_state_dict(checkpoint["model_state"])
+    if checkpoint.get("state_scope") == COMPACT_STATE_SCOPE:
+        missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+        frozen = _frozen_parameter_names(model)
+        missing_trainable = [key for key in missing if key not in frozen]
+        if missing_trainable or unexpected:
+            raise RuntimeError(
+                f"Checkpoint {path} does not match this model: missing non-frozen "
+                f"keys {missing_trainable[:5]}, unexpected keys {list(unexpected)[:5]}.")
+    else:
+        model.load_state_dict(checkpoint["model_state"])
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state"])
     if scheduler is not None:

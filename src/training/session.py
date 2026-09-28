@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -60,6 +61,7 @@ class ThroughputMeasurement:
     n_train_measured: int
     n_eval_measured: int
     peak_memory_mb: float = 0.0
+    gradient_checkpointing: Optional[bool] = None   # None = config default
 
     def epoch_seconds(self, n_train: int, n_val: int) -> float:
         """Projected cost of one fold-epoch: a training pass over n_train plus
@@ -67,13 +69,32 @@ class ThroughputMeasurement:
         return n_train / self.train_samples_per_s + n_val / self.eval_samples_per_s
 
 
-def calibrate_throughput(df: pd.DataFrame, model_name: str, task: str = "severity",
-                         batch_size: int = config.DEFAULT_BATCH_SIZE,
-                         num_workers: int = 4,
-                         n_train_samples: int = 960,
-                         n_eval_samples: int = 320,
-                         seed: int = config.DEFAULT_SEED) -> ThroughputMeasurement:
-    """Measure real train and eval throughput on a truncated slice of fold 1.
+def _calibration_slices(df: pd.DataFrame, model_name: str, task: str, n_train_samples: int,
+                        n_eval_samples: int, seed: int
+                        ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Train/eval slices of fold 1, split exactly as a real fold is
+    (src.training.data.split_train_val, default speaker-disjoint protocol).
+    Sampled rather than head(): a contiguous slice of a fold's train split is
+    ordered by speaker and would measure one speaker's utterance lengths."""
+    from src.training.data import split_train_val
+    from src.training.runner import TrainingConfig, build_folds
+
+    cfg = TrainingConfig(task=task, model=model_name, seed=seed)
+    fold_id, train_df, _ = next(iter(build_folds(df, task, cfg)))
+    label_column = "Group" if task == "detection" else "Severity"
+    train_df, val_df = split_train_val(train_df, label_column, cfg.val_protocol, cfg.seed,
+                                       fold_id=fold_id, val_fraction=cfg.val_fraction)
+    train_slice = train_df.sample(n=min(n_train_samples, len(train_df)),
+                                  random_state=seed).reset_index(drop=True)
+    eval_slice = val_df.sample(n=min(n_eval_samples, len(val_df)),
+                               random_state=seed).reset_index(drop=True)
+    return train_slice, eval_slice
+
+
+def _measure(train_slice: pd.DataFrame, eval_slice: pd.DataFrame, model_name: str,
+             task: str, batch_size: int, num_workers: int, seed: int,
+             gradient_checkpointing: Optional[bool] = None) -> ThroughputMeasurement:
+    """One timed measurement of the REAL training step at one configuration.
 
     Deliberately reuses src.training.engine.run_epoch rather than hand-rolling
     a timing loop: a hand-rolled loop would drift from the real step (autocast
@@ -84,45 +105,29 @@ def calibrate_throughput(df: pd.DataFrame, model_name: str, task: str = "severit
     pay for CUDA context creation, cuDNN autotuning, both loaders' worker
     spawn, the wav2vec2 weight load and the first touch of the disk caches.
     Folding those one-time costs into a per-sample rate is exactly the error
-    that made the old benchmark unusable for projection.
-
-    Writes nothing to outputs/ — no run_name, no checkpoints, no metrics.
+    that made the old benchmark unusable for projection. BOTH loaders, not
+    just the training one: each spawns its own persistent workers on first
+    iteration, and leaving that cold start inside the eval measurement once
+    reported eval as SLOWER than training.
     """
-    from src.models.gated_fusion import GatedFusionModel  # noqa: F401  (registry)
-    from src.training.data import (build_loaders, build_speaker_label_map,
-                                   compute_class_weights, stratified_train_val_split)
+    from src.training.data import build_loaders, build_speaker_label_map, compute_class_weights
     from src.training.engine import build_optimizer, run_epoch
     from src.training.models import build_model
-    from src.training.runner import TrainingConfig, build_folds
-    from src.training.utils import resolve_device
+    from src.training.utils import resolve_device, set_seed
 
-    print_subheader("Throughput calibration")
-
-    cfg = TrainingConfig(task=task, model=model_name, batch_size=batch_size,
-                         num_workers=num_workers, seed=seed)
-    fold_id, train_df, test_df = next(iter(build_folds(df, task, cfg)))
-    label_column = "Group" if task == "detection" else "Severity"
-    train_df, val_df = stratified_train_val_split(train_df, label_column,
-                                                  cfg.val_fraction, cfg.seed)
-
-    # Sample rather than head(): a contiguous slice of a fold's train split is
-    # ordered by speaker and would measure one speaker's utterance lengths.
-    train_slice = train_df.sample(n=min(n_train_samples, len(train_df)),
-                                  random_state=seed).reset_index(drop=True)
-    eval_slice = val_df.sample(n=min(n_eval_samples, len(val_df)),
-                               random_state=seed).reset_index(drop=True)
-
-    device = resolve_device(cfg.device)
+    set_seed(seed)
+    device = resolve_device(None)
     speaker_label_map = build_speaker_label_map(train_slice)
     train_loader, eval_loader, _ = build_loaders(
-        train_slice, eval_slice, eval_slice, cfg.batch_size, cfg.num_workers,
-        pin_memory=(device.type == "cuda"), model_name=cfg.model,
+        train_slice, eval_slice, eval_slice.iloc[:0], batch_size, num_workers,
+        pin_memory=(device.type == "cuda"), model_name=model_name,
         speaker_label_map=speaker_label_map)
 
     num_classes = config.NUM_CLASSES[task]
-    model = build_model(cfg.model, num_classes,
-                        num_speakers=len(speaker_label_map)).to(device)
-    optimizer = build_optimizer(model, cfg.lr_head, cfg.lr_backbone, cfg.weight_decay)
+    model = build_model(model_name, num_classes, num_speakers=len(speaker_label_map),
+                        gradient_checkpointing=gradient_checkpointing).to(device)
+    optimizer = build_optimizer(model, config.DEFAULT_LR_HEAD, config.DEFAULT_LR_BACKBONE,
+                                config.DEFAULT_WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss(weight=compute_class_weights(train_slice, task).to(device))
 
     use_amp = device.type == "cuda"
@@ -130,69 +135,181 @@ def calibrate_throughput(df: pd.DataFrame, model_name: str, task: str = "severit
     amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
     scaler = torch.amp.GradScaler(device=device.type,
                                   enabled=use_amp and amp_dtype == torch.float16)
-
     common = dict(criterion=criterion, device=device, task=task, scaler=scaler,
-                  grad_clip_norm=cfg.grad_clip, amp_dtype=amp_dtype,
+                  grad_clip_norm=config.DEFAULT_GRAD_CLIP_NORM, amp_dtype=amp_dtype,
                   amp_enabled=use_amp)
 
-    print_kv("Device", f"{device} ({torch.cuda.get_device_name(device)})"
-             if device.type == "cuda" else str(device))
-    print_kv("AMP dtype", str(amp_dtype).replace("torch.", ""))
-    print_kv("Calibration slice", f"{len(train_slice):,} train / {len(eval_slice):,} eval "
-                                  f"at batch size {cfg.batch_size}")
+    try:
+        # -- warm-up (discarded) ---------------------------------------------
+        run_epoch(model, train_loader, optimizer=optimizer, train=True, **common)
+        run_epoch(model, eval_loader, optimizer=None, train=False, **common)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(device)
 
-    # -- warm-up (discarded) -------------------------------------------------
-    # BOTH loaders, not just the training one. Each DataLoader spawns its own
-    # persistent worker processes on first iteration, and each worker pays a
-    # cold start: interpreter fork/spawn, torch import, the first parquet read
-    # of the span table, and the first .npy touches. Warming only the train
-    # loader left all of that inside the eval measurement, which on a 128-sample
-    # slice reported eval as SLOWER than training — a forward-only pass being
-    # slower than forward+backward is the tell that the number is startup cost,
-    # not throughput. The projection multiplies the eval rate by every fold's
-    # validation split, so an understated rate inflates the whole budget.
-    print_status("Warm-up passes over both loaders (CUDA context, cuDNN autotune, "
-                 "worker spawn, wav2vec2 load) — not timed...", ok=True)
-    run_epoch(model, train_loader, optimizer=optimizer, train=True, **common)
-    run_epoch(model, eval_loader, optimizer=None, train=False, **common)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats(device)
+        # -- timed training pass ---------------------------------------------
+        start = time.monotonic()
+        run_epoch(model, train_loader, optimizer=optimizer, train=True, **common)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        train_rate = len(train_slice) / max(time.monotonic() - start, 1e-9)
 
-    # -- timed training pass --------------------------------------------------
-    start = time.monotonic()
-    run_epoch(model, train_loader, optimizer=optimizer, train=True, **common)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    train_rate = len(train_slice) / max(time.monotonic() - start, 1e-9)
+        # -- timed eval pass -------------------------------------------------
+        start = time.monotonic()
+        run_epoch(model, eval_loader, optimizer=None, train=False, **common)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        eval_rate = len(eval_slice) / max(time.monotonic() - start, 1e-9)
 
-    # -- timed eval pass ------------------------------------------------------
-    start = time.monotonic()
-    run_epoch(model, eval_loader, optimizer=None, train=False, **common)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    eval_rate = len(eval_slice) / max(time.monotonic() - start, 1e-9)
+        peak_mb = (torch.cuda.max_memory_allocated(device) / 1024 ** 2
+                   if device.type == "cuda" else 0.0)
+    finally:
+        del model, optimizer, train_loader, eval_loader
+        if device.type == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:        # the CUDA error that brought us here, re-raised
+                pass
 
-    peak_mb = (torch.cuda.max_memory_allocated(device) / 1024 ** 2
-               if device.type == "cuda" else 0.0)
-
-    measurement = ThroughputMeasurement(
+    return ThroughputMeasurement(
         train_samples_per_s=train_rate, eval_samples_per_s=eval_rate,
-        batch_size=cfg.batch_size, device=str(device),
+        batch_size=batch_size, device=str(device),
         amp_dtype=str(amp_dtype).replace("torch.", ""),
         n_train_measured=len(train_slice), n_eval_measured=len(eval_slice),
-        peak_memory_mb=peak_mb)
+        peak_memory_mb=peak_mb, gradient_checkpointing=gradient_checkpointing)
 
-    print_kv("Train throughput", f"{train_rate:,.1f} samples/s")
-    print_kv("Eval throughput", f"{eval_rate:,.1f} samples/s")
-    if peak_mb:
-        print_kv("Peak GPU memory", f"{peak_mb:,.0f} MB")
-    _warn_if_still_input_bound(train_rate)
 
-    del model, optimizer, train_loader, eval_loader
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+def calibrate_throughput(df: pd.DataFrame, model_name: str, task: str = "severity",
+                         batch_size: int = config.DEFAULT_BATCH_SIZE,
+                         num_workers: int = 4,
+                         n_train_samples: int = 960,
+                         n_eval_samples: int = 320,
+                         seed: int = config.DEFAULT_SEED,
+                         gradient_checkpointing: Optional[bool] = None) -> ThroughputMeasurement:
+    """Measure real train and eval throughput on a truncated slice of fold 1
+    at one configuration (see _measure). Writes nothing to outputs/."""
+    print_subheader("Throughput calibration")
+    train_slice, eval_slice = _calibration_slices(df, model_name, task, n_train_samples,
+                                                  n_eval_samples, seed)
+    print_kv("Calibration slice", f"{len(train_slice):,} train / {len(eval_slice):,} eval "
+                                  f"at batch size {batch_size}")
+    print_status("Warm-up passes over both loaders (CUDA context, cuDNN autotune, "
+                 "worker spawn, wav2vec2 load) — not timed...", ok=True)
+    measurement = _measure(train_slice, eval_slice, model_name, task, batch_size,
+                           num_workers, seed, gradient_checkpointing=gradient_checkpointing)
+    print_kv("Device", measurement.device)
+    print_kv("AMP dtype", measurement.amp_dtype)
+    print_kv("Train throughput", f"{measurement.train_samples_per_s:,.1f} samples/s")
+    print_kv("Eval throughput", f"{measurement.eval_samples_per_s:,.1f} samples/s")
+    if measurement.peak_memory_mb:
+        print_kv("Peak GPU memory", f"{measurement.peak_memory_mb:,.0f} MB")
+    _warn_if_still_input_bound(measurement.train_samples_per_s)
     return measurement
+
+
+def benchmark_batch_sizes(df: pd.DataFrame, model_name: str, task: str = "severity",
+                          batch_sizes: Sequence[int] = (32, 64, 96, 128),
+                          checkpointing_options: Sequence[bool] = (True, False),
+                          num_workers: int = 4, timed_batches: int = 6,
+                          min_gain: float = 0.10, max_memory_fraction: float = 0.85,
+                          seed: int = config.DEFAULT_SEED
+                          ) -> Tuple[ThroughputMeasurement, pd.DataFrame]:
+    """Short throughput/memory benchmark over batch size x gradient
+    checkpointing, then pick the configuration to train with.
+
+    Each configuration trains `timed_batches` batches after a discarded
+    warm-up of the same size (a few minutes in total, not an epoch per
+    candidate). A configuration is STABLE if it neither runs out of memory nor
+    peaks above `max_memory_fraction` of the card — headroom for the longest
+    utterances and allocator fragmentation over 15 folds.
+
+    Selection: per batch size, the faster checkpointing setting (the two are
+    numerically identical). Then, walking batch sizes upward, a larger batch
+    replaces the current choice only if it is stable AND at least `min_gain`
+    faster — "largest stable batch that buys meaningful throughput", not the
+    largest that fits. Larger batches also mean fewer optimizer steps per
+    epoch at an unchanged learning rate, a real optimization change, so a
+    marginal speedup is not worth it.
+
+    Returns (chosen measurement, table of every configuration).
+    """
+    print_subheader("Batch-size benchmark")
+    device_total_mb = (torch.cuda.get_device_properties(0).total_memory / 1024 ** 2
+                       if torch.cuda.is_available() else float("inf"))
+    rows: List[Dict] = []
+    measurements: Dict[Tuple[int, bool], ThroughputMeasurement] = {}
+
+    for gradient_checkpointing in checkpointing_options:
+        previous_rate = 0.0
+        for batch_size in sorted(batch_sizes):
+            train_slice, eval_slice = _calibration_slices(
+                df, model_name, task, n_train_samples=batch_size * timed_batches,
+                n_eval_samples=2 * batch_size, seed=seed)
+            row = {"batch_size": batch_size, "grad_checkpointing": gradient_checkpointing}
+            try:
+                m = _measure(train_slice, eval_slice, model_name, task, batch_size,
+                             num_workers, seed, gradient_checkpointing=gradient_checkpointing)
+            except RuntimeError as exc:          # torch.cuda.OutOfMemoryError is a subclass
+                if "out of memory" not in str(exc):
+                    raise
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass
+                rows.append({**row, "train_samples_s": float("nan"),
+                             "eval_samples_s": float("nan"), "peak_mb": float("nan"),
+                             "stable": False, "note": "OOM"})
+                print_kv(f"bs={batch_size} ckpt={gradient_checkpointing}", "out of memory")
+                break                       # larger batches at this setting will OOM too
+            stable = m.peak_memory_mb <= max_memory_fraction * device_total_mb
+            measurements[(batch_size, gradient_checkpointing)] = m
+            rows.append({**row, "train_samples_s": round(m.train_samples_per_s, 1),
+                         "eval_samples_s": round(m.eval_samples_per_s, 1),
+                         "peak_mb": round(m.peak_memory_mb),
+                         "stable": stable,
+                         "note": "" if stable else f">{max_memory_fraction:.0%} of GPU memory"})
+            print_kv(f"bs={batch_size} ckpt={gradient_checkpointing}",
+                     f"{m.train_samples_per_s:6.1f} train/s  {m.eval_samples_per_s:6.1f} eval/s  "
+                     f"peak {m.peak_memory_mb:,.0f} MB")
+            if not stable:
+                # Over the memory ceiling: a larger batch only goes further over
+                # (and on Windows/WDDM spills into system RAM instead of raising
+                # OOM, collapsing throughput rather than failing).
+                break
+            if m.train_samples_per_s < previous_rate:
+                break                       # slower than the smaller batch: stop escalating
+            previous_rate = m.train_samples_per_s
+
+    table = pd.DataFrame(rows)
+    best_per_size: Dict[int, ThroughputMeasurement] = {}
+    for (batch_size, _), m in measurements.items():
+        stable_row = table[(table["batch_size"] == batch_size)
+                           & (table["grad_checkpointing"] == m.gradient_checkpointing)]
+        if not bool(stable_row["stable"].iloc[0]):
+            continue
+        current = best_per_size.get(batch_size)
+        if current is None or m.train_samples_per_s > current.train_samples_per_s:
+            best_per_size[batch_size] = m
+    if not best_per_size:
+        raise RuntimeError("No stable batch-size configuration — every candidate ran out of "
+                           "memory or exceeded the memory ceiling.")
+
+    chosen = None
+    for batch_size in sorted(best_per_size):
+        candidate = best_per_size[batch_size]
+        if chosen is None or candidate.train_samples_per_s >= chosen.train_samples_per_s * (1 + min_gain):
+            chosen = candidate
+    table["chosen"] = [(r.batch_size == chosen.batch_size
+                        and r.grad_checkpointing == chosen.gradient_checkpointing)
+                       for r in table.itertuples()]
+    print()
+    print_table(table)
+    print_status(f"Chosen: batch size {chosen.batch_size}, gradient checkpointing "
+                 f"{'on' if chosen.gradient_checkpointing else 'off'} — "
+                 f"{chosen.train_samples_per_s:,.1f} train samples/s, "
+                 f"peak {chosen.peak_memory_mb:,.0f} MB "
+                 f"(a larger batch had to be >= {min_gain:.0%} faster to be chosen)", ok=True)
+    return chosen, table
 
 
 def _warn_if_still_input_bound(train_rate: float) -> None:
@@ -269,7 +386,7 @@ def project_runtime(df: pd.DataFrame, measurement: ThroughputMeasurement,
     TrainingConfig.max_folds (that truncation is run_training's job), which
     is why it is applied here explicitly rather than via `cfg`.
     """
-    from src.training.data import stratified_train_val_split
+    from src.training.data import split_train_val
     from src.training.runner import TrainingConfig, build_folds
 
     cfg = TrainingConfig(task=task, model=model_name, seed=seed)
@@ -280,15 +397,22 @@ def project_runtime(df: pd.DataFrame, measurement: ThroughputMeasurement,
         folds = folds[:max_folds]
     n_folds = n_folds if n_folds is not None else len(folds)
 
+    # Mean train/val size over EVERY fold, split exactly as run_fold splits it
+    # (speaker-disjoint validation: 3 or 4 validation speakers depending on the
+    # held-out speaker's class, so fold sizes genuinely differ).
     label_column = "Group" if task == "detection" else "Severity"
-    _, train_df, test_df = folds[0]
-    train_df, val_df = stratified_train_val_split(train_df, label_column,
-                                                  cfg.val_fraction, cfg.seed)
+    sizes = []
+    for fold_id, train_df, test_df in folds:
+        fold_train, fold_val = split_train_val(train_df, label_column, cfg.val_protocol,
+                                               cfg.seed, fold_id=fold_id,
+                                               val_fraction=cfg.val_fraction)
+        sizes.append((len(fold_train), len(fold_val), len(test_df)))
+    n_train, n_val, n_test = (int(round(x)) for x in np.mean(sizes, axis=0))
 
-    epoch_s = measurement.epoch_seconds(len(train_df), len(val_df))
+    epoch_s = measurement.epoch_seconds(n_train, n_val)
     fold_s = fold_setup_seconds + epochs * epoch_s + fold_overhead_seconds
     return {
-        "n_train": len(train_df), "n_val": len(val_df), "n_test": len(test_df),
+        "n_train": n_train, "n_val": n_val, "n_test": n_test,
         "n_folds": n_folds, "epochs": epochs,
         "epoch_seconds": epoch_s, "fold_seconds": fold_s,
         "total_seconds": n_folds * fold_s,

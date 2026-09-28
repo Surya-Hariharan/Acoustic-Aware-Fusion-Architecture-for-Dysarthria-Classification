@@ -62,6 +62,38 @@ MODEL_DESCRIPTIONS = {
                           "cross-branch complementarity + speaker-invariance regularization"),
 }
 
+# Controlled ablations of SEVERITY_MODEL_NAME — every one is a
+# GatedFusionModel with the same encoders, CORAL head, data, folds,
+# validation protocol, optimizer and epochs; only the listed switches differ
+# (see GatedFusionModel's docstring). Unlisted switches take the ablation
+# baseline: gated fusion, no complementarity loss, no speaker adversary — so
+# ab7/ab8 each add exactly ONE regularizer to ab6, and SEVERITY_MODEL_NAME
+# itself (both regularizers) is the "full + comp + GRL" row of the table.
+#
+# ab3 "wav2vec2 + acoustic" is read as the plain-fusion baseline: all three
+# encoders, embeddings simply concatenated (no gate), so ab3 vs ab6 isolates
+# what the learned gate adds.
+_ALL_BRANCHES = ("learned", "segmental", "supra")
+SEVERITY_ABLATIONS = {
+    "ab1_wav2vec2_only": dict(branches=("learned",)),
+    "ab2_acoustic_only": dict(branches=("segmental", "supra")),
+    "ab3_wav2vec2_acoustic_concat": dict(branches=_ALL_BRANCHES, fusion="concat"),
+    "ab4_wav2vec2_segmental": dict(branches=("learned", "segmental")),
+    "ab5_wav2vec2_suprasegmental": dict(branches=("learned", "supra")),
+    "ab6_full_fusion": dict(branches=_ALL_BRANCHES),
+    "ab7_full_complementarity": dict(branches=_ALL_BRANCHES, use_complementarity=True),
+    "ab8_full_speaker_grl": dict(branches=_ALL_BRANCHES, use_speaker_adversary=True),
+}
+_ABLATION_DEFAULTS = dict(fusion="gated", use_complementarity=False, use_speaker_adversary=False)
+
+for _name, _switches in SEVERITY_ABLATIONS.items():
+    MODEL_DESCRIPTIONS[_name] = "Severity ablation — " + ", ".join(
+        f"{key}={value}" for key, value in {**_ABLATION_DEFAULTS, **_switches}.items())
+
+# Every model built as a GatedFusionModel — the ones whose Dataset needs the
+# segmental/suprasegmental tensors (src.training.data.MODELS_WITH_THREE_BRANCH).
+GATED_FUSION_MODELS = frozenset({SEVERITY_MODEL_NAME, *SEVERITY_ABLATIONS})
+
 # Models whose DataLoader must also carry Phase 4's Praat feature vector.
 # src.training.runner reads this to decide whether to load praat_features.csv.
 MODELS_REQUIRING_PRAAT = frozenset({"attention_fusion_praat"})
@@ -146,15 +178,21 @@ class DeepClassifier(nn.Module):
             waveform, mfcc, praat, attention_mask, deep_embedding))
 
 
-def build_model(model_name: str, num_classes: int, num_speakers: int = 1) -> nn.Module:
-    """Instantiate one of the seven legacy ablation variants, or the
-    three-branch severity architecture, by name.
+def build_model(model_name: str, num_classes: int, num_speakers: int = 1,
+                gradient_checkpointing: Optional[bool] = None) -> nn.Module:
+    """Instantiate one of the seven legacy ablation variants, the
+    three-branch severity architecture, or one of its SEVERITY_ABLATIONS, by
+    name.
 
-    num_speakers: only consumed by SEVERITY_MODEL_NAME (sizes its
+    num_speakers: only consumed by the GatedFusionModel family (sizes its
     adversarial speaker head to the current fold's training-speaker count —
     see src.models.gated_fusion.GatedFusionModel); ignored by every other
-    model.
+    model. gradient_checkpointing likewise (None = config default).
     """
+    if model_name in SEVERITY_ABLATIONS:
+        return GatedFusionModel(num_classes=num_classes, num_speakers=num_speakers,
+                                gradient_checkpointing=gradient_checkpointing,
+                                **{**_ABLATION_DEFAULTS, **SEVERITY_ABLATIONS[model_name]})
     if model_name == "acoustic":
         return AcousticClassifier(num_classes=num_classes)
     if model_name == "deep_frozen":
@@ -170,9 +208,10 @@ def build_model(model_name: str, num_classes: int, num_speakers: int = 1) -> nn.
     if model_name == "attention_fusion_praat":
         return AttentionFusionPraatModel(num_classes=num_classes)
     if model_name == SEVERITY_MODEL_NAME:
-        return GatedFusionModel(num_classes=num_classes, num_speakers=num_speakers)
+        return GatedFusionModel(num_classes=num_classes, num_speakers=num_speakers,
+                                gradient_checkpointing=gradient_checkpointing)
     raise ValueError(f"Unknown model '{model_name}'. Choose from "
-                     f"{MODEL_NAMES + (SEVERITY_MODEL_NAME,)}.")
+                     f"{MODEL_NAMES + (SEVERITY_MODEL_NAME,) + tuple(SEVERITY_ABLATIONS)}.")
 
 
 def parameter_counts(model: nn.Module) -> Dict[str, float]:

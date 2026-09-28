@@ -29,12 +29,17 @@ from src import config
 
 
 def save_predictions(path: Path, filenames, speaker_ids, y_true: np.ndarray,
-                     y_pred: np.ndarray, y_prob: np.ndarray, task: str) -> None:
+                     y_pred: np.ndarray, y_prob: np.ndarray, task: str,
+                     y_pred_argmax: Optional[np.ndarray] = None) -> None:
     """Per-utterance predictions for one fold.
 
     `filename` is the first column and is what makes Phase 5 possible: it joins
     a row back to its audio file (for spectrograms) and to outputs/praat_features.csv
     (for the error/feature correlation). speaker_id alone cannot do either.
+
+    `y_pred_argmax`, when given (ordinal models, whose y_pred is the CORAL
+    median decode), is written as an extra column so the decode choice can be
+    audited from the CSV alone.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     class_names = config.DETECTION_CLASS_NAMES if task == "detection" else config.SEVERITY_CLASS_NAMES
@@ -47,6 +52,8 @@ def save_predictions(path: Path, filenames, speaker_ids, y_true: np.ndarray,
         "y_pred_label": [class_names[i] for i in y_pred],
         "correct": np.asarray(y_true) == np.asarray(y_pred),
     })
+    if y_pred_argmax is not None:
+        df["y_pred_argmax"] = y_pred_argmax
     if task == "detection":
         df["prob_positive"] = y_prob
     else:
@@ -144,7 +151,10 @@ def aggregate_fold_metrics(metrics_dir: Path, run_name: str,
     """Average metrics across folds (mean +/- std) and save a summary table."""
     metrics_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(fold_metrics)
-    metric_cols = [c for c in df.columns if c != "fold"]
+    # Numeric scalars only — fold records also carry labels, speaker lists and
+    # per-class prediction counts, which have no mean.
+    metric_cols = [c for c in df.columns if c != "fold"
+                   and pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])]
     summary = df[metric_cols].agg(["mean", "std"]).T
     summary.columns = ["mean", "std"]
 
@@ -183,6 +193,8 @@ FOLD_COMPLETED = "COMPLETED"        # trained and evaluated in this session
 FOLD_CACHED = "CACHED"              # loaded from a previous session's output
 FOLD_FAILED = "FAILED"              # raised; excluded from pooling
 FOLD_SKIPPED_DEADLINE = "SKIPPED_DEADLINE"   # budget ran out before it started
+FOLD_INTERRUPTED = "INTERRUPTED"    # started, stopped between epochs at the hard
+                                    # deadline; resumes from latest.pt next session
 
 # Run-level rollups.
 RUN_COMPLETED = "COMPLETED"         # every expected fold has a result
@@ -309,7 +321,8 @@ def summarize_registry(registry_path: Optional[Path] = None) -> pd.DataFrame:
             "completed_folds": completed,
             "valid_folds": int((classes > 1).sum()),
             "failed_folds": int((group["status"] == FOLD_FAILED).sum()),
-            "skipped_folds": int((group["status"] == FOLD_SKIPPED_DEADLINE).sum()),
+            "skipped_folds": int(group["status"].isin(
+                [FOLD_SKIPPED_DEADLINE, FOLD_INTERRUPTED]).sum()),
             "coverage": completed / expected if expected else 0.0,
             # Distinct held-out labels across every completed fold. One fold of
             # Healthy plus one of Dysarthric pools to both classes even though
@@ -334,6 +347,311 @@ def _pooled_class_count(completed_folds: pd.DataFrame) -> int:
             if "=" in pair:
                 labels.add(pair.split("=", 1)[1])
     return len(labels)
+
+
+# ---------------------------------------------------------------------------
+# Run-level console reports (src.training.runner.run_training)
+#
+# Every count below is derived from the fold list the run was actually
+# configured with — never a hard-coded protocol size — and every metric that
+# is undefined on the data it would be computed from is printed as N/A with
+# the reason, never as a number.
+# ---------------------------------------------------------------------------
+RUN_STATUS_COMPLETE = "COMPLETE"
+RUN_STATUS_PARTIAL = "PARTIAL"
+RUN_STATUS_FAILED = "FAILED"
+
+
+def _fmt_duration(seconds: Optional[float]) -> str:
+    if seconds is None or not np.isfinite(seconds):
+        return "n/a"
+    seconds = max(0.0, float(seconds))
+    hours, remainder = divmod(int(round(seconds)), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{secs:02d}s"
+
+
+def _fmt_metric(value) -> str:
+    return "N/A" if value is None or not np.isfinite(value) else f"{value:.4f}"
+
+
+def run_coverage(expected_fold_ids: List[str], fold_status: Dict[str, str]) -> Dict:
+    """Coverage of one run_training call over its configured folds: which
+    folds produced a result (trained now or loaded from disk), which failed,
+    which were skipped by the runtime guard or interrupted, and which are
+    therefore missing — plus the COMPLETE / PARTIAL / FAILED status."""
+    expected = list(expected_fold_ids)
+    done = [f for f in expected if fold_status.get(f) in (FOLD_COMPLETED, FOLD_CACHED)]
+    failed = [f for f in expected if fold_status.get(f) == FOLD_FAILED]
+    interrupted = [f for f in expected if fold_status.get(f) == FOLD_INTERRUPTED]
+    skipped = [f for f in expected
+               if fold_status.get(f) in (FOLD_SKIPPED_DEADLINE, FOLD_INTERRUPTED)]
+    missing = [f for f in expected if f not in done]
+    if expected and len(done) == len(expected):
+        status = RUN_STATUS_COMPLETE
+    elif done:
+        status = RUN_STATUS_PARTIAL
+    else:
+        status = RUN_STATUS_FAILED
+    return {
+        "expected": len(expected), "completed": len(done),
+        "trained_this_session": sum(fold_status.get(f) == FOLD_COMPLETED for f in expected),
+        "loaded_from_disk": sum(fold_status.get(f) == FOLD_CACHED for f in expected),
+        "completion_pct": round(100.0 * len(done) / len(expected), 1) if expected else 0.0,
+        "status": status,
+        "expected_folds": expected, "completed_folds": done, "missing_folds": missing,
+        "failed_folds": failed, "skipped_folds": skipped, "interrupted_folds": interrupted,
+    }
+
+
+def print_run_coverage(coverage: Dict, run_name: str) -> None:
+    from src.console import print_header, print_kv, print_note, print_status
+
+    print_header(f"Fold coverage — {run_name}")
+    print_kv("Expected folds", coverage["expected"])
+    print_kv("Completed folds", f"{coverage['completed']}  "
+             f"({coverage['trained_this_session']} trained this session, "
+             f"{coverage['loaded_from_disk']} loaded from disk)")
+    print_kv("Missing folds", f"{len(coverage['missing_folds'])}  "
+             f"{', '.join(coverage['missing_folds']) or '—'}")
+    print_kv("Failed folds", f"{len(coverage['failed_folds'])}  "
+             f"{', '.join(coverage['failed_folds']) or '—'}")
+    print_kv("Skipped folds (runtime guard)", f"{len(coverage['skipped_folds'])}  "
+             f"{', '.join(coverage['skipped_folds']) or '—'}"
+             + (f"  (interrupted mid-fold: {', '.join(coverage['interrupted_folds'])})"
+                if coverage["interrupted_folds"] else ""))
+    print_kv("Completion", f"{coverage['completion_pct']:.1f}%")
+    print_status(f"Run status: {coverage['status']}",
+                 ok=coverage["status"] == RUN_STATUS_COMPLETE)
+    if coverage["status"] != RUN_STATUS_COMPLETE:
+        print_note(f"This run is {coverage['status']}: {coverage['completed']} of "
+                   f"{coverage['expected']} LOSO folds have a result. Any pooled number "
+                   "below describes only those folds and is NOT a final thesis result. "
+                   "Re-run the same configuration to resume the missing folds.")
+
+
+def print_fold_report(record: Dict, fold_index: int, n_folds: int, max_epochs: int,
+                      task: str) -> None:
+    """The per-fold summary block. Class-sensitive metrics (macro-F1,
+    balanced accuracy, AUROC) are printed as N/A whenever the held-out set
+    contains a single true class — always the case for a severity LOSO fold,
+    whose one held-out speaker has one severity label."""
+    from src.console import print_kv, print_note
+
+    print()
+    print(f"  FOLD {fold_index}/{n_folds} ({record['fold']}) COMPLETE")
+    print_kv("Held-out speaker", record["fold"])
+    print_kv("True severity" if task == "severity" else "True class", record.get("true_label"))
+    print_kv("Test utterances", record.get("n_samples"))
+    print_kv("Accuracy", _fmt_metric(record.get("accuracy")))
+    if task == "severity":
+        print_kv("Ordinal MAE", _fmt_metric(record.get("ordinal_mae")))
+    best_epoch = record.get("best_epoch")
+    print_kv("Best epoch", f"{best_epoch}/{max_epochs} of {record.get('epochs_completed')} run"
+             if best_epoch is not None else f"n/a (no improving epoch) of {max_epochs}")
+    print_kv("Training time", f"{_fmt_duration(record.get('train_time_s'))}  "
+             f"(fold total {_fmt_duration(record.get('fold_time_s'))})")
+    distribution = record.get("pred_distribution") or {}
+    print_kv("Predicted class distribution",
+             " | ".join(f"{name} {count}" for name, count in distribution.items()))
+    argmax_distribution = record.get("argmax_pred_distribution")
+    if argmax_distribution and argmax_distribution != distribution:
+        print_kv("  (argmax decode, for audit)",
+                 " | ".join(f"{name} {count}" for name, count in argmax_distribution.items()))
+    if record.get("n_classes_present", 0) < 2:
+        print_kv("Macro-F1 / balanced acc. / AUROC",
+                 "N/A — undefined: the held-out set has a single true class")
+    else:
+        print_kv("Macro-F1 / balanced acc. / AUROC",
+                 f"{_fmt_metric(record.get('f1'))} / {_fmt_metric(record.get('balanced_accuracy'))}"
+                 f" / {_fmt_metric(record.get('auroc'))}")
+    if record.get("val_speakers"):
+        print_kv("Validation speakers", record["val_speakers"].replace(";", ", ")
+                 + f"  ({record.get('val_protocol')}-level)")
+    if "coral_thresholds" in record:
+        print_kv("CORAL threshold biases",
+                 f"{record['coral_thresholds']} "
+                 f"({'rank-ordered' if record.get('coral_thresholds_ordered') else 'NOT ordered'})")
+        if not record.get("coral_thresholds_ordered"):
+            print_note("Threshold biases are not rank-ordered, so the median decode and "
+                       "CORAL's raw threshold count can differ for some utterances.")
+
+
+def print_runtime_status(folds_done: int, n_folds: int, remaining_folds: int,
+                         run_elapsed_s: float, fold_estimate_s: Optional[float],
+                         n_timed_folds: int, safety_factor: float,
+                         session_elapsed_s: Optional[float] = None,
+                         session_budget_s: Optional[float] = None,
+                         deadline_in_s: Optional[float] = None) -> None:
+    """After every fold: elapsed time, average fold time, estimated time to
+    finish, and whether that finish lands inside the session budget with
+    margin. ON TRACK = projected finish (estimate x safety_factor) inside the
+    safe deadline; AT RISK = inside it only without the safety factor;
+    WILL NOT FIT = the runtime guard will skip folds."""
+    from src.console import print_kv, print_subheader
+
+    print_subheader(f"Runtime — {folds_done}/{n_folds} folds accounted for")
+    print_kv("Elapsed (this run)", _fmt_duration(run_elapsed_s))
+    if session_elapsed_s is not None:
+        print_kv("Elapsed (whole session)", _fmt_duration(session_elapsed_s)
+                 + (f" of {_fmt_duration(session_budget_s)} budget" if session_budget_s else ""))
+    if fold_estimate_s is None:
+        print_kv("Average fold time", "n/a (no fold trained this session yet)")
+        return
+    print_kv("Average fold time", f"{_fmt_duration(fold_estimate_s)} "
+             f"({'mean of ' + str(n_timed_folds) + ' trained fold(s)' if n_timed_folds else 'prior estimate'})")
+    remaining_s = remaining_folds * fold_estimate_s
+    print_kv("Remaining folds", remaining_folds)
+    print_kv("Estimated remaining time", f"{_fmt_duration(remaining_s)} "
+             f"({_fmt_duration(remaining_s * safety_factor)} with x{safety_factor:.2f} safety)")
+    if session_elapsed_s is not None and session_budget_s:
+        projected = session_elapsed_s + remaining_s
+        print_kv("Projected session total", f"{_fmt_duration(projected)} of "
+                 f"{_fmt_duration(session_budget_s)} (margin {_fmt_duration(session_budget_s - projected)})")
+    if deadline_in_s is not None:
+        margin = deadline_in_s - remaining_s * safety_factor
+        status = ("ON TRACK" if margin >= 0
+                  else "AT RISK" if deadline_in_s - remaining_s >= 0
+                  else "WILL NOT FIT — the runtime guard will skip the folds that do not fit")
+        print_kv("Safe budget remaining", _fmt_duration(deadline_in_s))
+        print_kv("Safety margin at finish", _fmt_duration(margin) if margin >= 0
+                 else f"-{_fmt_duration(-margin)}")
+        print_kv("Estimated completion status", status)
+
+
+def print_pooled_evaluation(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
+                            task: str, coverage: Dict,
+                            speakers: Optional[List[str]] = None) -> Dict:
+    """Pooled evaluation over every completed held-out speaker: headline
+    metrics, confusion matrix, true/predicted class distributions, and
+    per-class precision/recall/F1 — each marked N/A where undefined (a class
+    never predicted has no precision; a class absent from the pooled set has
+    no recall or AUROC). Labelled PARTIAL whenever coverage is incomplete.
+    Returns the per-class table and distributions as a JSON-able dict."""
+    from sklearn.metrics import confusion_matrix as sk_confusion_matrix
+    from sklearn.metrics import roc_auc_score
+
+    from src.console import print_header, print_kv, print_note, print_subheader, print_table
+    from src.training.metrics import compute_metrics
+
+    class_names = (config.SEVERITY_CLASS_NAMES if task == "severity"
+                   else config.DETECTION_CLASS_NAMES)
+    labels = list(range(len(class_names)))
+    status = coverage["status"]
+    tag = "" if status == RUN_STATUS_COMPLETE else f" — {status}, NOT A FINAL RESULT"
+    print_header(f"Pooled held-out evaluation ({coverage['completed']}/{coverage['expected']} "
+                 f"folds, {len(y_true):,} utterances){tag}")
+    if status != RUN_STATUS_COMPLETE:
+        print_note(f"Missing folds: {', '.join(coverage['missing_folds'])}. Pooled numbers "
+                   "from a partial LOSO run are not comparable to the full protocol.")
+
+    metrics = compute_metrics(y_true, y_pred, y_prob, task)
+    print_subheader("Headline metrics")
+    absent = [name for i, name in enumerate(class_names) if not (y_true == i).any()]
+    if absent:
+        print_note(f"No held-out utterances of {', '.join(absent)} yet: macro F1 / balanced "
+                   f"accuracy average over the {len(class_names) - len(absent)} present "
+                   f"classes only, and macro AUROC is undefined.")
+    for key, label in (("accuracy", "Accuracy"), ("f1", "Macro F1"),
+                       ("f1_weighted", "Weighted F1"),
+                       ("balanced_accuracy", "Balanced accuracy"),
+                       ("ordinal_mae", "Ordinal MAE"), ("auroc", "AUROC (macro one-vs-rest)")):
+        if key == "ordinal_mae" and task != "severity":
+            continue
+        value = metrics.get(key)
+        reason = ""
+        if value is None or not np.isfinite(value):
+            reason = ("  — undefined: fewer than 2 true classes pooled"
+                      if metrics["n_classes_present"] < 2
+                      else "  — undefined: not every class is present in the pooled set")
+        print_kv(label, _fmt_metric(value) + reason)
+
+    cm = sk_confusion_matrix(y_true, y_pred, labels=labels)
+    print_subheader("Confusion matrix (rows = true, columns = predicted)")
+    cm_df = pd.DataFrame(cm, index=class_names, columns=class_names)
+    print_table(cm_df.reset_index().rename(columns={"index": "true \\ predicted"}))
+
+    true_counts = cm.sum(axis=1)
+    pred_counts = cm.sum(axis=0)
+    rows = []
+    for i, name in enumerate(class_names):
+        tp = cm[i, i]
+        precision = tp / pred_counts[i] if pred_counts[i] > 0 else float("nan")
+        recall = tp / true_counts[i] if true_counts[i] > 0 else float("nan")
+        f1 = (2 * precision * recall / (precision + recall)
+              if np.isfinite(precision) and np.isfinite(recall) and (precision + recall) > 0
+              else (0.0 if np.isfinite(recall) and true_counts[i] > 0 else float("nan")))
+        binary = (y_true == i).astype(int)
+        if 0 < binary.sum() < len(binary):
+            prob_i = y_prob if (task == "detection" and i == 1) else (
+                1 - y_prob if task == "detection" else y_prob[:, i])
+            auroc = float(roc_auc_score(binary, prob_i))
+        else:
+            auroc = float("nan")
+        rows.append({"class": name, "true_n": int(true_counts[i]), "pred_n": int(pred_counts[i]),
+                     "precision": precision, "recall": recall, "f1": f1, "auroc_ovr": auroc})
+    per_class = pd.DataFrame(rows)
+    print_subheader("Per-class (N/A = undefined: never predicted / absent from pooled set)")
+    shown = per_class.copy()
+    for column in ("precision", "recall", "f1", "auroc_ovr"):
+        shown[column] = shown[column].map(_fmt_metric)
+    print_table(shown)
+
+    print_subheader("Class distributions")
+    print_kv("True", " | ".join(f"{n} {int(c)}" for n, c in zip(class_names, true_counts)))
+    print_kv("Predicted", " | ".join(f"{n} {int(c)}" for n, c in zip(class_names, pred_counts)))
+    never = [n for n, c in zip(class_names, pred_counts) if c == 0]
+    if never:
+        print_note(f"Never predicted: {', '.join(never)}.")
+
+    report = {"confusion_matrix": cm.tolist(), "class_names": class_names,
+              "per_class": per_class.to_dict(orient="records"),
+              "true_distribution": dict(zip(class_names, true_counts.tolist())),
+              "pred_distribution": dict(zip(class_names, pred_counts.tolist()))}
+
+    if speakers is not None and task == "severity":
+        # One decision per speaker — the median of that speaker's utterance
+        # predictions — since severity is a speaker-level clinical label.
+        frame = pd.DataFrame({"speaker": speakers, "y_true": y_true, "y_pred": y_pred})
+        per_speaker = frame.groupby("speaker").agg(
+            true=("y_true", "first"), pred=("y_pred", lambda s: int(np.floor(np.median(s)))))
+        speaker_acc = float((per_speaker["true"] == per_speaker["pred"]).mean())
+        speaker_mae = float((per_speaker["true"] - per_speaker["pred"]).abs().mean())
+        print_subheader("Speaker-level (median of each speaker's utterance predictions)")
+        print_kv("Speakers correct", f"{int((per_speaker['true'] == per_speaker['pred']).sum())}"
+                 f" / {len(per_speaker)}  (accuracy {speaker_acc:.4f}, MAE {speaker_mae:.4f})")
+        report["speaker_level"] = {"accuracy": speaker_acc, "ordinal_mae": speaker_mae,
+                                   "predictions": {s: {"true": int(r.true), "pred": int(r.pred)}
+                                                   for s, r in per_speaker.iterrows()}}
+    return report
+
+
+def redecode_saved_predictions(predictions_dir: Path) -> pd.DataFrame:
+    """Re-score a finished severity run's saved per-fold prediction CSVs
+    under both decodings — argmax (what runs before the ordinal-decoding fix
+    reported) and the CORAL median (src.losses.coral_rank_from_class_probs) —
+    from the stored class probabilities alone, no retraining. For auditing an
+    old run; its validation protocol is unchanged by this, so it is NOT a
+    substitute for re-running under the speaker-disjoint protocol."""
+    from src.losses import coral_rank_from_class_probs
+    from src.training.metrics import compute_metrics
+
+    frames = [pd.read_csv(p) for p in sorted(Path(predictions_dir).glob("*.csv"))]
+    if not frames:
+        raise FileNotFoundError(f"No prediction CSVs under {predictions_dir}")
+    preds = pd.concat(frames, ignore_index=True)
+    prob_cols = [f"prob_{name.replace(' ', '_')}" for name in config.SEVERITY_CLASS_NAMES]
+    probs = preds[prob_cols].to_numpy()
+    y_true = preds["y_true"].to_numpy()
+    decodes = {"argmax": probs.argmax(axis=1),
+               "coral_median": coral_rank_from_class_probs(torch.from_numpy(probs)).numpy()}
+    rows = []
+    for name, y_pred in decodes.items():
+        metrics = compute_metrics(y_true, y_pred, probs, "severity")
+        rows.append({"decode": name, **{k: metrics[k] for k in (
+            "accuracy", "f1", "f1_weighted", "balanced_accuracy", "ordinal_mae", "auroc")},
+            "pred_distribution": np.bincount(y_pred, minlength=len(prob_cols)).tolist()})
+    return pd.DataFrame(rows)
 
 
 def save_experiment_bundle(experiment_name: str, model_name: str, task: str,
@@ -624,6 +942,16 @@ def _software_versions() -> Dict[str, Optional[str]]:
     return versions
 
 
+def _ablation_switches(model_name: str) -> Optional[Dict]:
+    """The GatedFusionModel switches a named severity ablation uses, or None
+    for the primary model / legacy variants."""
+    from src.training.models import _ABLATION_DEFAULTS, SEVERITY_ABLATIONS
+    if model_name not in SEVERITY_ABLATIONS:
+        return None
+    return {key: (list(value) if isinstance(value, tuple) else value)
+            for key, value in {**_ABLATION_DEFAULTS, **SEVERITY_ABLATIONS[model_name]}.items()}
+
+
 def build_final_run_configuration(cfg, df: pd.DataFrame, num_speakers_total: int) -> Dict:
     """
     Everything the brief's Section 23 "FINAL RUN CONFIGURATION" block needs,
@@ -670,7 +998,12 @@ def build_final_run_configuration(cfg, df: pd.DataFrame, num_speakers_total: int
         "fusion": {"method": "learned softmax gate over 3 branch embeddings",
                   "fused_dim": audit["fusion"]["fused_dim"]},
         "severity_head": {"method": "CORAL ordinal regression",
-                          "loss": "class-weighted CORAL binary cross-entropy sum"},
+                          "loss": "class-weighted CORAL binary cross-entropy sum",
+                          "decoding": "median of the CORAL distribution (threshold count)"},
+        "validation": {"protocol": getattr(cfg, "val_protocol", "utterance"),
+                       "monitored": "validation ordinal (CORAL) loss"},
+        "ablation": _ablation_switches(cfg.model),
+        "gradient_checkpointing": getattr(cfg, "gradient_checkpointing", None),
         "optimizer": {"type": "AdamW", "lr_head": cfg.lr_head, "lr_backbone": cfg.lr_backbone,
                      "weight_decay": cfg.weight_decay, "batch_size": cfg.batch_size,
                      "epochs": cfg.epochs, "patience": cfg.patience,
@@ -742,7 +1075,12 @@ def print_final_run_configuration(cfg, df: pd.DataFrame) -> Dict:
     f = final_config["fusion"]
     print(f"Fusion: method={f['method']}, fused_dim={f['fused_dim']}\n")
     sh = final_config["severity_head"]
-    print(f"Severity: head={sh['method']}, loss={sh['loss']}\n")
+    print(f"Severity: head={sh['method']}, loss={sh['loss']}, decoding={sh['decoding']}\n")
+    v = final_config["validation"]
+    print(f"Validation: {v['protocol']}-level split, early stopping on {v['monitored']}")
+    if final_config["ablation"]:
+        print(f"Ablation switches: {final_config['ablation']}")
+    print(f"Gradient checkpointing: {final_config['gradient_checkpointing']}\n")
 
     o = final_config["optimizer"]
     print(f"Optimizer: {o['type']}")

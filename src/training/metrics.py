@@ -117,8 +117,15 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
         precision = recall = f1 = f1_weighted = specificity = auroc = float("nan")
         balanced_accuracy = float("nan")
     else:
+        # Macro averages run over the classes PRESENT in y_true: a class with
+        # no true samples has no recall, so including it would add a
+        # fabricated F1 of 0 (e.g. a partial LOSO run whose completed folds
+        # cover only two severity classes, or a validation set with no Low
+        # speaker). With every class present — a complete severity LOSO run —
+        # this is exactly the all-labels macro average.
+        macro_labels = labels if task == "detection" else sorted(int(c) for c in classes_present)
         precision, recall, f1, _ = precision_recall_fscore_support(
-            y_true, y_pred, labels=labels, average=average, zero_division=0)
+            y_true, y_pred, labels=macro_labels, average=average, zero_division=0)
         _, _, f1_weighted, _ = precision_recall_fscore_support(
             y_true, y_pred, labels=labels, average="weighted", zero_division=0)
         balanced_accuracy = float(balanced_accuracy_score(y_true, y_pred))

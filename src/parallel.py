@@ -42,12 +42,12 @@ this one:
    worker in place once it hits max_tasks_per_child), not of thread
    contention, which would not care about a task-count boundary at all.
 
-In this environment — a Kaggle kernel whose main process has already
-initialized a CUDA context (cell 1.2's torch.cuda calls, well before any pool
-is created) — the DEFAULT start method spawns initial workers fine, but
-ProcessPoolExecutor's in-place respawn of a worker mid-run appears to hang
-deterministically. The fix here does not depend on knowing the exact reason:
-it simply avoids that code path. Instead of asking ProcessPoolExecutor to
+The mechanism is ProcessPoolExecutor's own bookkeeping, not the environment:
+every item was submit()-ed up front, and with max_tasks_per_child set the
+executor retires a worker once it reaches the limit but only starts
+replacements from submit() — which had already returned for all 21,420
+items — so after 4 x 200 tasks no worker is left and the remaining futures
+never run (CPython gh-115634). Avoiding the in-place respawn is the fix. Instead of asking ProcessPoolExecutor to
 recycle a worker in place, resilient_process_map processes `items` in
 batches of max_tasks_per_child * n_workers, fully shutting down (wait=True)
 and recreating the pool between batches. This bounds per-worker task count
@@ -58,6 +58,7 @@ better-tested code path than an in-place mid-run respawn.
 """
 
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from multiprocessing import get_context
 from typing import Callable, List, Tuple, TypeVar
 
 from src import config
@@ -143,7 +144,12 @@ def _run_one_batch(
     results: List[R] = []
     skipped: List[T] = []
 
-    executor = ProcessPoolExecutor(max_workers=n_workers, initializer=_worker_thread_init)
+    # 'spawn', not Linux's default 'fork': the parent is a Jupyter kernel with
+    # a CUDA context and several live threads, which fork does not copy
+    # safely (a lock held by another thread at fork time stays held forever
+    # in the child). Every worker_fn here is module-level, hence picklable.
+    executor = ProcessPoolExecutor(max_workers=n_workers, mp_context=get_context("spawn"),
+                                   initializer=_worker_thread_init)
     try:
         future_to_item = {executor.submit(worker_fn, item): item for item in batch}
         pending = set(future_to_item)
