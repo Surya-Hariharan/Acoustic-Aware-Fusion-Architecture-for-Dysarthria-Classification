@@ -289,7 +289,11 @@ SUPRA_VAD_SPEECH_PAD_MS = 150
 # thrashed anyway, so it bought little for that memory. With the VAD spans on
 # disk (VAD_SPAN_CACHE_PATH above) a miss costs ~10 ms, so the LRU stops being
 # load-bearing and the RAM is better spent on DataLoader prefetch depth.
-PREPROCESS_CACHE_SIZE = 512
+# 512 -> 64: with the feature store serving every engineered feature (as
+# shared memory maps), these LRUs only save a ~5 ms wav read per hit — not
+# worth ~200 MB in each of several spawned DataLoader worker processes on a
+# 16 GB machine.
+PREPROCESS_CACHE_SIZE = 64
 
 # Recycle each precompute worker after this many tasks, in the one-time
 # VAD-span and Praat-feature precompute passes (src.vad_cache,
@@ -375,7 +379,7 @@ WAV2VEC_APPLY_SPEC_AUGMENT = False
 # True keeps the historical behaviour; src.training.session.
 # benchmark_batch_sizes measures both settings so a run can turn it off when
 # the GPU has the memory to spare (the T4 run peaked at 3.6 of 15.6 GB).
-WAV2VEC_GRADIENT_CHECKPOINTING = True
+WAV2VEC_GRADIENT_CHECKPOINTING = False   # RTX 4060 benchmark: +32% throughput, 5.8 GB peak at batch 32
 
 # Phase 6: attention-based fusion. The 768-dim deep and 128-dim acoustic frame
 # sequences are projected into a shared FUSION_ATTN_DIM space so cross-attention
@@ -476,6 +480,36 @@ DEFAULT_PATIENCE      = 3        # early stopping, in epochs without improvement
 DEFAULT_GRAD_CLIP_NORM = 1.0
 DEFAULT_VAL_FRACTION  = 0.1      # held out from each fold's train split
 DEFAULT_SEED           = 42
+
+# ---------------------------------------------------------------------------
+# Local hardware profile — i7-12700H (14C/20T), 16 GB RAM, RTX 4060 Laptop
+# (8 GB), NVMe. Sized from the measured RTX 4060 benchmark (batch 32,
+# gradient checkpointing off: 76 train samples/s, 5.8 GB peak VRAM) and from
+# Windows' DataLoader model: every worker is a SPAWNED process that imports
+# torch (~0.4-0.6 GB RSS each), so worker count is bounded by RAM, not cores.
+# With the feature store serving all engineered features, one item costs
+# ~10 ms of CPU (a wav read + slice), so 4 training workers already supply
+# several times what the GPU consumes.
+# ---------------------------------------------------------------------------
+# "float16" (with a live GradScaler) or "bfloat16" (Ampere+ only, no scaler).
+AMP_DTYPE = "float16"
+# Measured: 4 train + 2 val + 2 test workers peaked at 8.2 GB across the
+# process tree and left 0.4 GB of RAM free. One item costs ~10-15 ms of CPU,
+# so 3 training workers supply ~200 items/s against ~76/s consumed.
+TRAIN_NUM_WORKERS = 3            # persistent, training loader
+EVAL_NUM_WORKERS = 2             # validation loader (persistent, reused every epoch)
+TEST_NUM_WORKERS = 0             # test loader: one 255-utterance pass per fold, in-process
+DATALOADER_PREFETCH_FACTOR = 4   # batches queued per worker
+# Cap PyTorch's share of VRAM. On Windows (WDDM) exceeding physical VRAM does
+# not raise OOM — it silently spills into system RAM and throughput collapses
+# ~10x (measured: batch 64 without checkpointing ran at 4 samples/s). A cap
+# turns that into a clean, catchable OOM and keeps ~0.8 GB for the display.
+CUDA_MEMORY_FRACTION = 0.90
+CUDNN_BENCHMARK = True           # fixed 4 s input shape -> autotuned conv kernels
+# Feature-store build: each worker holds torch + Silero + parselmouth
+# (~0.5 GB); 8 leaves RAM headroom on 16 GB and saturates the P-cores.
+FEATURE_STORE_WORKERS = 8
+USE_TQDM = True                  # tqdm bars (False: throttled line log, for piped logs)
 
 
 def ensure_directories() -> None:

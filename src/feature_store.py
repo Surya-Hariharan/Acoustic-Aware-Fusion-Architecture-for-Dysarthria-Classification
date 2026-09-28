@@ -65,8 +65,8 @@ import numpy as np
 import pandas as pd
 
 from src import config
-from src.console import (ProgressReporter, format_duration, print_kv, print_note,
-                         print_status, print_subheader)
+from src.console import (format_duration, print_kv, print_note, print_status,
+                         print_subheader, progress)
 
 # Bump when the stored LAYOUT or the framewise extraction code
 # (src.praat.extract_*_sequence, src.preprocessing.extract_mfcc_features)
@@ -173,11 +173,46 @@ def _signature_ok(data, path: Path) -> bool:
     return True
 
 
+def _mmap_arrays(path: Path, data) -> Tuple[np.ndarray, np.ndarray]:
+    """(segmental, supra) as READ-ONLY memory maps of decompressed .npy
+    copies of this chunk, written once next to the writable store
+    (FEATURE_STORE_DIR/_mmap) and named by the source chunk's size + mtime,
+    so a rebuilt chunk never reuses a stale copy.
+
+    Why: every DataLoader worker on Windows is a separate spawned process. A
+    decompressed in-process copy (~19 MB per chunk, ~11 training chunks per
+    fold) was duplicated in all of them — measured 8.2 GB across the training
+    process tree on a 16 GB laptop. A memory-mapped file lives in the OS page
+    cache ONCE, shared by the main process and every worker, and the NVMe
+    serves any cold page in microseconds."""
+    stat = path.stat()
+    mmap_dir = Path(config.FEATURE_STORE_DIR) / "_mmap"
+    tag = f"{path.stem}-{stat.st_size}-{stat.st_mtime_ns}"
+    arrays = []
+    for name in ("segmental", "supra"):
+        target = mmap_dir / f"{tag}.{name}.npy"
+        if not target.exists():
+            mmap_dir.mkdir(parents=True, exist_ok=True)
+            for stale in mmap_dir.glob(f"{path.stem}-*.{name}.npy"):
+                try:                                    # copies of an older build of this chunk
+                    stale.unlink()
+                except OSError:                         # still mapped elsewhere (Windows) — harmless
+                    pass
+            temp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+            with open(temp, "wb") as handle:
+                np.save(handle, data[name])
+            try:
+                os.replace(temp, target)
+            except OSError:                             # another process got there first
+                temp.unlink(missing_ok=True)
+        arrays.append(np.load(target, mmap_mode="r"))
+    return arrays[0], arrays[1]
+
+
 @lru_cache(maxsize=None)
 def _load_chunk(key: str) -> Optional[_Chunk]:
-    """Whole chunk into memory, once per process (~19 MB per 255-utterance
-    chunk). DataLoader workers forked after the main process has loaded a
-    chunk share its pages copy-on-write."""
+    """One chunk, once per process: spans and filenames in memory (tiny), the
+    feature tensors as shared read-only memory maps (see _mmap_arrays)."""
     path = _chunk_path(key)
     if path is None:
         return None
@@ -186,9 +221,10 @@ def _load_chunk(key: str) -> Optional[_Chunk]:
             if not _signature_ok(data, path):
                 return None
             filenames = [str(name) for name in data["filenames"]]
+            segmental, supra = _mmap_arrays(path, data)
             return _Chunk(index={name: i for i, name in enumerate(filenames)},
                           spans={name: data[name] for name in SPAN_ARRAYS},
-                          segmental=data["segmental"], supra=data["supra"])
+                          segmental=segmental, supra=supra)
     except Exception as exc:
         _warn_once(str(path), f"Feature-store chunk {path} is unreadable ({exc}) — ignoring it.")
         return None
@@ -404,7 +440,7 @@ def build_feature_store(df: pd.DataFrame, n_workers: Optional[int] = None,
     """
     from src import vad as vad_module
 
-    n_workers = n_workers or max(1, (os.cpu_count() or 2))
+    n_workers = n_workers or config.FEATURE_STORE_WORKERS
     stall_timeout_s = stall_timeout_s or config.FEATURE_STORE_STALL_TIMEOUT_S
     out_dir = Path(config.FEATURE_STORE_DIR)
     chunks = plan_chunks(df)
@@ -431,8 +467,7 @@ def build_feature_store(df: pd.DataFrame, n_workers: Optional[int] = None,
     start = time.monotonic()
     round_size = max(1, n_workers * chunks_per_worker_per_round)
     rounds = [todo[i:i + round_size] for i in range(0, len(todo), round_size)]
-    bar = ProgressReporter(None, description="Building feature store", total=n_todo_files,
-                           unit="file")
+    bar = progress(None, "Building feature store", total=n_todo_files, unit="file")
     round_seconds: List[float] = []
     try:
         for r, round_keys in enumerate(rounds):
@@ -531,7 +566,6 @@ def verify_feature_store(df: pd.DataFrame, n: int = 24, seed: int = 0) -> None:
     on any mismatch — a wrong store is worse than an absent one, since it
     silently changes what the model trains on."""
     from src import vad as vad_module
-    from src.console import progress
 
     stored = df[df["Filepath"].map(lambda fp: _locate(fp) is not None)]
     if stored.empty:

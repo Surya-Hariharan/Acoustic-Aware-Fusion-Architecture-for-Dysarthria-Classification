@@ -9,6 +9,7 @@ PyTorch DataLoaders.
 """
 
 import zlib
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -40,7 +41,17 @@ def load_manifest() -> pd.DataFrame:
     torchaudio would then fail, or worse, silently train on silence.
     """
     if config.MANIFEST_PATH.exists():
-        return pd.read_csv(config.MANIFEST_PATH)
+        df = pd.read_csv(config.MANIFEST_PATH)
+        # Filepath is absolute and rooted wherever the manifest was written
+        # (another checkout location, another machine). If those files are
+        # not here but the same corpus is under this checkout's AUDIO_DIR
+        # (<Speaker>/<Filename>, extraction's layout), re-root onto it.
+        if len(df) and not Path(df["Filepath"].iloc[0]).exists():
+            rerooted = [str(config.AUDIO_DIR / s / f)
+                        for s, f in zip(df["Speaker_ID"], df["Filename"])]
+            if Path(rerooted[0]).exists():
+                df["Filepath"] = rerooted
+        return df
 
     df_audio = scan_audio_files()
     df_m6 = filter_mic_channel(df_audio)
@@ -193,7 +204,9 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
                   praat_table: Optional[pd.DataFrame] = None,
                   frozen_embedding_table: Optional[Dict[str, np.ndarray]] = None,
                   model_name: Optional[str] = None,
-                  speaker_label_map: Optional[Dict[str, int]] = None
+                  speaker_label_map: Optional[Dict[str, int]] = None,
+                  eval_num_workers: Optional[int] = None,
+                  test_num_workers: Optional[int] = None
                   ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Wrap the three fold DataFrames into DataLoaders.
@@ -262,10 +275,25 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     # utilization even though the model itself is correctly on cuda:
     # persistent_workers + prefetch_factor let background worker processes
     # prepare the next batch while the current one trains on the GPU.
-    loader_kwargs = dict(num_workers=num_workers, pin_memory=pin_memory)
-    if num_workers > 0:
-        loader_kwargs.update(persistent_workers=True, prefetch_factor=4,
-                             worker_init_fn=_init_worker)
+    #
+    # Worker budget per split (config "Local hardware profile"): on Windows
+    # each worker is a spawned process holding its own torch import, so
+    # workers cost RAM, not just cores. Train gets `num_workers` persistent
+    # workers; validation `eval_num_workers` persistent ones (reused every
+    # epoch — respawning them per epoch would cost seconds each time); the
+    # test loader runs once per fold (config.TEST_NUM_WORKERS, 0 = in the main
+    # process), so it never holds worker processes in RAM during training.
+    eval_num_workers = num_workers if eval_num_workers is None else eval_num_workers
+    test_num_workers = (config.TEST_NUM_WORKERS if test_num_workers is None
+                        else test_num_workers)
+
+    def loader_kwargs(workers: int, persistent: bool) -> dict:
+        kwargs = dict(num_workers=workers, pin_memory=pin_memory)
+        if workers > 0:
+            kwargs.update(persistent_workers=persistent,
+                          prefetch_factor=config.DATALOADER_PREFETCH_FACTOR,
+                          worker_init_fn=_init_worker)
+        return kwargs
 
     # Speaker labels for validation only when every validation speaker is a
     # TRAINING speaker (the legacy utterance-level split). Under the
@@ -277,10 +305,11 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
 
     train_loader = DataLoader(
         dataset(train_df, with_speaker_labels=True), batch_size=batch_size, shuffle=True,
-        drop_last=len(train_df) > batch_size, **loader_kwargs)
+        drop_last=len(train_df) > batch_size, **loader_kwargs(num_workers, persistent=True))
     val_loader = DataLoader(
         dataset(val_df, with_speaker_labels=val_has_speaker_labels), batch_size=batch_size,
-        shuffle=False, **loader_kwargs)
+        shuffle=False, **loader_kwargs(eval_num_workers, persistent=True))
     test_loader = DataLoader(
-        dataset(test_df, with_speaker_labels=False), batch_size=batch_size, shuffle=False, **loader_kwargs)
+        dataset(test_df, with_speaker_labels=False), batch_size=batch_size, shuffle=False,
+        **loader_kwargs(test_num_workers, persistent=False))
     return train_loader, val_loader, test_loader
