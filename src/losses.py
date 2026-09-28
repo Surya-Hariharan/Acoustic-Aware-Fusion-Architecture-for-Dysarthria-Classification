@@ -101,10 +101,36 @@ def coral_class_probs(threshold_logits: torch.Tensor) -> torch.Tensor:
 def coral_rank_predictions(threshold_logits: torch.Tensor) -> torch.Tensor:
     """(B, num_classes - 1) threshold logits -> (B,) predicted rank, via the
     CORAL paper's own decode rule: the number of thresholds whose predicted
-    probability exceeds 0.5. Used only as a diagnostic cross-check against
-    the argmax(class_probs) prediction the rest of the pipeline reports —
-    the two agree except in rare, mild non-monotonicity."""
+    probability exceeds 0.5 — see coral_rank_from_class_probs, the form the
+    training pipeline actually decodes with."""
     return (torch.sigmoid(threshold_logits) > 0.5).sum(dim=1)
+
+
+def coral_rank_from_class_probs(class_probs: torch.Tensor) -> torch.Tensor:
+    """(B, num_classes) CORAL class probabilities -> (B,) predicted rank:
+    the MEDIAN of each row's ordinal distribution, i.e. the number of k with
+    P(rank > k) > 0.5, where P(rank > k) = 1 - cumsum(class_probs)[k].
+
+    This is coral_rank_predictions' threshold-count rule recovered from the
+    differenced probabilities coral_class_probs produces — identical whenever
+    the threshold biases are rank-ordered (CORAL's shared weight vector makes
+    ordering the only way the two can disagree; see the per-fold
+    coral_thresholds_ordered diagnostic), up to coral_class_probs' 1e-6
+    floor. It works on anything that only kept class probabilities,
+    including saved prediction CSVs.
+
+    Why not argmax(class_probs), which this pipeline used to report: with
+    thresholds close together, the two middle classes' differenced mass
+    P(rank > k-1) - P(rank > k) is small even when the cumulative curve
+    crosses 0.5 right between them, so argmax lands on an extreme class.
+    Measured on a saved held-out fold (true class Low): cumulative
+    P(rank > k) = 0.175 / 0.127 / 0.090 — argmax predicted Low or Mid for
+    0 of 765 utterances, the median rule for 77. The median also minimizes
+    expected absolute rank error, i.e. it is the Bayes decision for ordinal
+    MAE, the task's own ordinal metric.
+    """
+    cumulative_gt = 1.0 - torch.cumsum(class_probs, dim=1)[:, :-1]    # (B, K-1)
+    return (cumulative_gt > 0.5).sum(dim=1)
 
 
 # ---------------------------------------------------------------------------

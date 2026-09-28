@@ -49,8 +49,11 @@ class DeepPathway(nn.Module):
                    src.models.gated_fusion.GatedFusionModel only.
     """
 
-    def __init__(self, use_lora: bool = True, normalize_input: bool = False):
+    def __init__(self, use_lora: bool = True, normalize_input: bool = False,
+                 gradient_checkpointing: Optional[bool] = None):
         super().__init__()
+        if gradient_checkpointing is None:
+            gradient_checkpointing = config.WAV2VEC_GRADIENT_CHECKPOINTING
         self.use_lora = use_lora
         self.normalize_input = normalize_input
         backbone_config = Wav2Vec2Config.from_pretrained(
@@ -75,20 +78,6 @@ class DeepPathway(nn.Module):
         self._feat_extract_output_lengths = backbone._get_feat_extract_output_lengths
 
         if use_lora:
-            # use_reentrant=False (not the older reentrant checkpoint) recomputes
-            # activations during backward instead of storing them for every
-            # transformer layer - the standard ~20% compute / ~40% activation-memory
-            # trade-off, which is what makes batch=32 safe on an 8 GB card. Only
-            # meaningful here (use_lora=True): the frozen backbone below never
-            # builds a backward graph at all (none of its params require grad),
-            # so checkpointing it would trade compute for memory it never spends.
-            # Must happen before get_peft_model - the reentrant-free checkpoint
-            # only needs *some* trainable param inside the wrapped segment (the
-            # LoRA adapters, injected next), not a grad-requiring input, so no
-            # enable_input_require_grads() workaround is needed (and Wav2Vec2Model
-            # has no input embeddings to hook into anyway - it takes raw audio).
-            backbone.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False})
             lora_config = LoraConfig(
                 r=config.LORA_RANK,
                 lora_alpha=config.LORA_ALPHA,
@@ -97,6 +86,27 @@ class DeepPathway(nn.Module):
                 bias="none",
             )
             self.wav2vec = get_peft_model(backbone, lora_config)
+            # use_reentrant=False recomputes activations during backward instead
+            # of storing them for every transformer layer - the standard ~20-30%
+            # compute / ~40% activation-memory trade-off. Only meaningful with
+            # LoRA: a frozen backbone never builds a backward graph at all.
+            #
+            # Enabled AFTER get_peft_model, on the same backbone module (peft
+            # wraps it in place). Enabling it BEFORE makes PeftModel.__init__
+            # call enable_input_require_grads(), which raises
+            # NotImplementedError on Transformers 4.x because Wav2Vec2Model has
+            # no input embeddings (it takes raw audio). The reentrant-free
+            # checkpoint only needs a trainable param inside each segment (the
+            # LoRA adapters), not a grad-requiring input, so the order changes
+            # nothing numerically.
+            #
+            # Switchable (config.WAV2VEC_GRADIENT_CHECKPOINTING): the Kaggle
+            # T4 run peaked at 3.6 of 15.6 GB, so memory is not the binding
+            # constraint there and the recompute may be pure overhead — see
+            # src.training.session.benchmark_batch_sizes, which measures both.
+            if gradient_checkpointing:
+                backbone.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False})
         else:
             for param in backbone.parameters():
                 param.requires_grad = False
