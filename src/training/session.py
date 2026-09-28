@@ -113,10 +113,12 @@ def _measure(train_slice: pd.DataFrame, eval_slice: pd.DataFrame, model_name: st
     from src.training.data import build_loaders, build_speaker_label_map, compute_class_weights
     from src.training.engine import build_optimizer, run_epoch
     from src.training.models import build_model
-    from src.training.utils import resolve_device, set_seed
+    from src.training.utils import (configure_local_runtime, resolve_amp_dtype,
+                                    resolve_device, set_seed)
 
     set_seed(seed)
     device = resolve_device(None)
+    configure_local_runtime(device)
     speaker_label_map = build_speaker_label_map(train_slice)
     train_loader, eval_loader, _ = build_loaders(
         train_slice, eval_slice, eval_slice.iloc[:0], batch_size, num_workers,
@@ -131,8 +133,7 @@ def _measure(train_slice: pd.DataFrame, eval_slice: pd.DataFrame, model_name: st
     criterion = nn.CrossEntropyLoss(weight=compute_class_weights(train_slice, task).to(device))
 
     use_amp = device.type == "cuda"
-    supports_bf16 = use_amp and torch.cuda.get_device_capability(device)[0] >= 8
-    amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
+    amp_dtype = resolve_amp_dtype(device)
     scaler = torch.amp.GradScaler(device=device.type,
                                   enabled=use_amp and amp_dtype == torch.float16)
     common = dict(criterion=criterion, device=device, task=task, scaler=scaler,
@@ -181,7 +182,7 @@ def _measure(train_slice: pd.DataFrame, eval_slice: pd.DataFrame, model_name: st
 
 def calibrate_throughput(df: pd.DataFrame, model_name: str, task: str = "severity",
                          batch_size: int = config.DEFAULT_BATCH_SIZE,
-                         num_workers: int = 4,
+                         num_workers: int = config.TRAIN_NUM_WORKERS,
                          n_train_samples: int = 960,
                          n_eval_samples: int = 320,
                          seed: int = config.DEFAULT_SEED,
@@ -210,7 +211,7 @@ def calibrate_throughput(df: pd.DataFrame, model_name: str, task: str = "severit
 def benchmark_batch_sizes(df: pd.DataFrame, model_name: str, task: str = "severity",
                           batch_sizes: Sequence[int] = (32, 64, 96, 128),
                           checkpointing_options: Sequence[bool] = (True, False),
-                          num_workers: int = 4, timed_batches: int = 6,
+                          num_workers: int = config.TRAIN_NUM_WORKERS, timed_batches: int = 6,
                           min_gain: float = 0.10, max_memory_fraction: float = 0.85,
                           seed: int = config.DEFAULT_SEED
                           ) -> Tuple[ThroughputMeasurement, pd.DataFrame]:

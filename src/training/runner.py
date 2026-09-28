@@ -24,7 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src import config
 from src.console import (V, print_architecture, print_banner, print_fold_progress,
-                        print_header, print_kv, print_metrics, print_note,
+                        print_header, print_kv, print_metrics, print_note, progress,
                         print_signal_chain, print_status, print_subheader, print_table)
 from src.praat import FEATURE_COLUMNS as PRAAT_FEATURE_COLUMNS
 from src.praat import load_praat_table
@@ -47,7 +47,8 @@ from src.training.reporting import (FOLD_CACHED, FOLD_COMPLETED, FOLD_FAILED,
                                     record_fold, run_coverage, save_confusion_matrix,
                                     save_embeddings, save_metrics, save_predictions,
                                     save_roc_curve)
-from src.training.utils import resolve_device, set_seed
+from src.training.utils import (configure_local_runtime, resolve_amp_dtype,
+                                resolve_device, set_seed)
 
 
 @dataclass
@@ -76,7 +77,9 @@ class TrainingConfig:
     # at all even though the model is correctly placed on cuda. Set to 0 to
     # fall back to the old synchronous behaviour (e.g. for step-by-step
     # debugging where worker processes make tracebacks harder to read).
-    num_workers: int = 4
+    num_workers: int = config.TRAIN_NUM_WORKERS      # training loader
+    eval_num_workers: int = config.EVAL_NUM_WORKERS  # validation loader
+    test_num_workers: int = config.TEST_NUM_WORKERS  # test loader (0 = main process)
 
     max_folds: Optional[int] = None                  # only run the first N folds
     folds: Optional[List[str]] = None                # only run these fold IDs
@@ -120,7 +123,7 @@ class TrainingConfig:
     # bar, so this is far cheaper than it was, but a per-batch report still
     # says nothing an epoch summary does not. Set True for interactive,
     # step-by-step debugging of a single batch/epoch.
-    show_batch_progress: bool = False
+    show_batch_progress: bool = True
 
     # How each fold's validation set is carved from its training portion —
     # see src.training.data.split_train_val. "speaker" (default): whole
@@ -293,6 +296,7 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
 
     train_loader, val_loader, test_loader = build_loaders(
         train_df, val_df, test_df, cfg.batch_size, cfg.num_workers,
+        eval_num_workers=cfg.eval_num_workers, test_num_workers=cfg.test_num_workers,
         pin_memory=(device.type == "cuda"), praat_table=praat_table,
         frozen_embedding_table=frozen_embedding_table, model_name=cfg.model,
         speaker_label_map=speaker_label_map)
@@ -306,23 +310,9 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     use_amp = cfg.amp if cfg.amp is not None else (device.type == "cuda")
-    # bf16 over fp16 whenever the GPU supports it NATIVELY (Ampere/Ada and
-    # later, i.e. compute capability >= 8.0 — including the RTX 4060): bf16
-    # keeps fp32's exponent range, so it can't underflow the way fp16 can mid
-    # LoRA fine-tuning, and needs no loss scaling — GradScaler is a no-op for
-    # gradient values in that range, so it's only left enabled for the fp16
-    # fallback path where scaling is actually load-bearing.
-    #
-    # The capability check is deliberate, and is NOT the same question as
-    # torch.cuda.is_bf16_supported(): recent PyTorch answers that one True on
-    # pre-Ampere cards where bf16 is EMULATED rather than run on the tensor
-    # cores. On a Kaggle T4 (Turing, sm_75) that silently trades the card's
-    # fast fp16 path for a slow software one — the opposite of what asking for
-    # AMP was meant to buy. Turing has no native bf16, so it gets fp16 plus a
-    # live GradScaler, which is the configuration fp16 needs anyway.
-    supports_bf16 = (device.type == "cuda"
-                     and torch.cuda.get_device_capability(device)[0] >= 8)
-    amp_dtype = torch.bfloat16 if (use_amp and supports_bf16) else torch.float16
+    # config.AMP_DTYPE (float16 by default, with a live GradScaler below);
+    # bfloat16 only where the GPU runs it natively — see resolve_amp_dtype.
+    amp_dtype = resolve_amp_dtype(device)
     scaler = torch.amp.GradScaler(device=device.type,
                                   enabled=use_amp and amp_dtype == torch.float16)
     early_stopping = EarlyStopping(patience=cfg.patience, mode="min")
@@ -559,6 +549,7 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     set_seed(cfg.seed)
     config.ensure_directories()
     device = resolve_device(cfg.device)
+    configure_local_runtime(device)
     run_name = cfg.run_name or f"{cfg.task}_{cfg.model}"
 
     # Phase 6 Model F only. Loaded once here rather than per fold — the features
@@ -661,6 +652,7 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     total_epochs_planned = n_folds * cfg.epochs
     epochs_completed_running = 0
     session_fold_times: List[float] = []
+    fold_bar = progress(None, f"{run_name} — LOSO folds", total=n_folds, unit="fold")
 
     def estimated_fold_seconds() -> Optional[float]:
         if session_fold_times:
@@ -740,6 +732,8 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
                             status=FOLD_FAILED, fold_description=fold_description)
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
+                fold_bar.update(1)
+                fold_bar.set_postfix_str(f"{fold_id} FAILED")
                 continue
             session_fold_times.append(time.monotonic() - fold_started)
             fold_status[fold_id] = FOLD_COMPLETED
@@ -766,6 +760,8 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         pooled_prob.append(y_prob)
         pooled_speakers.extend(speakers)
 
+        fold_bar.update(1)
+        fold_bar.set_postfix_str(f"{fold_id} acc={metrics_dict.get('accuracy', float('nan')):.3f}")
         remaining = [fid for fid, _, _ in fold_iter if fid not in fold_status]
         print_runtime_status(
             folds_done=len(fold_status), n_folds=n_folds, remaining_folds=len(remaining),
@@ -776,6 +772,7 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
             session_budget_s=session_budget_s,
             deadline_in_s=(deadline - time.monotonic()) if deadline is not None else None)
 
+    fold_bar.close()
     coverage = run_coverage([fid for fid, _, _ in fold_iter], fold_status)
     print_run_coverage(coverage, run_name)
     save_metrics(config.METRICS_DIR / run_name / "RUN_STATUS.json", coverage)

@@ -62,7 +62,7 @@ from multiprocessing import get_context
 from typing import Callable, List, Tuple, TypeVar
 
 from src import config
-from src.console import ProgressReporter, print_note
+from src.console import print_note, progress
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -113,7 +113,7 @@ def resilient_process_map(
     skipped: List[T] = []
     batch_size = max(1, max_tasks_per_child * n_workers)
 
-    bar = ProgressReporter(None, description=description, total=len(items), unit=unit)
+    bar = progress(None, description, total=len(items), unit=unit)
     try:
         for batch_start in range(0, len(items), batch_size):
             batch = items[batch_start:batch_start + batch_size]
@@ -135,7 +135,7 @@ def _run_one_batch(
     n_workers: int,
     description: str,
     stall_timeout_s: float,
-    bar: ProgressReporter,
+    bar,
 ) -> Tuple[List[R], List[T]]:
     """One batch's worth of work through a FRESH, short-lived pool — no
     max_tasks_per_child passed to it, since bounding per-worker task count is

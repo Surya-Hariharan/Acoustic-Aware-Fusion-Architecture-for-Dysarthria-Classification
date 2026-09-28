@@ -376,13 +376,26 @@ def _length_or_none(iterable) -> Optional[int]:
 
 
 def progress(iterable, description: str, total: Optional[int] = None,
-             leave: bool = True, unit: str = "it") -> ProgressReporter:
-    """Wrap a long-running loop in a ProgressReporter.
+             leave: bool = True, unit: str = "it"):
+    """Wrap a long-running loop (or, with iterable=None, a manually
+    update()-d counter) in a progress bar.
 
     One entry point so every stage (feature extraction, epochs, embedding
-    passes, fold loops) reports identically. Signature is unchanged from the
-    tqdm-backed version it replaces.
+    passes, fold loops) reports identically. config.USE_TQDM (default, local
+    interactive runs) returns a tqdm.auto bar — a live widget in Jupyter, a
+    terminal bar elsewhere; otherwise the throttled line-oriented
+    ProgressReporter above, which reads better in a saved/piped log. Both
+    support the same surface: iteration, update(), set_postfix_str(),
+    set_description(), close(), and the context-manager protocol.
     """
+    from src import config
+    if getattr(config, "USE_TQDM", False):
+        try:
+            from tqdm.auto import tqdm
+            return tqdm(iterable, desc=description, total=total, leave=leave, unit=unit,
+                        dynamic_ncols=True, smoothing=0.1)
+        except ImportError:
+            pass
     return ProgressReporter(iterable, description=description, total=total,
                             leave=leave, unit=unit)
 
