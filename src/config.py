@@ -54,6 +54,19 @@ SUPRASEGMENTAL_CACHE_DIR = FEATURE_CACHE_DIR / "suprasegmental"
 # commit and to ship inside a Kaggle dataset, which is the point.
 VAD_SPAN_CACHE_PATH = FEATURE_CACHE_DIR / "vad_spans.parquet"
 
+# Chunked, resumable feature store (src/feature_store.py): one compressed .npz
+# per (speaker, block) with VAD spans + raw segmental (43ch) + suprasegmental
+# (3ch) features. Consulted BEFORE the parquet span table and the per-file
+# .npy caches above, which remain as fallbacks. FEATURE_STORE_EXTRA_DIRS are
+# searched read-only after it — e.g. a previous Kaggle session's committed
+# output attached as a dataset (also settable via the FEATURE_STORE_EXTRA_DIRS
+# environment variable, os.pathsep-separated).
+FEATURE_STORE_DIR = FEATURE_CACHE_DIR / "store"
+FEATURE_STORE_EXTRA_DIRS: list = []
+# A chunk (255 utterances) takes a few minutes on one Kaggle vCPU; no chunk
+# finishing in 30 minutes means a stuck round, not a slow one.
+FEATURE_STORE_STALL_TIMEOUT_S = 1800
+
 # Three-branch severity architecture's figure/table/diagnostic subdirectories
 # (architecture plan Work Package C) — kept as separate named constants
 # rather than folded into FIGURE_DIR/ERROR_FIGURE_DIR so each analysis
@@ -357,6 +370,13 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj"]   # self-attention layers
 # pretrained by disabling that incompatible augmentation before model loading.
 WAV2VEC_APPLY_SPEC_AUGMENT = False
 
+# Recompute wav2vec2 activations in backward instead of storing them (see
+# src.models.deep_pathway). A pure speed/memory trade — identical gradients.
+# True keeps the historical behaviour; src.training.session.
+# benchmark_batch_sizes measures both settings so a run can turn it off when
+# the GPU has the memory to spare (the T4 run peaked at 3.6 of 15.6 GB).
+WAV2VEC_GRADIENT_CHECKPOINTING = True
+
 # Phase 6: attention-based fusion. The 768-dim deep and 128-dim acoustic frame
 # sequences are projected into a shared FUSION_ATTN_DIM space so cross-attention
 # between them is well-defined (queries and keys must share a dimension).
@@ -425,7 +445,11 @@ SEVERITY_CLASS_NAMES  = ["Very Low", "Low", "Mid", "High"]
 # on validation loss is expected to need on a 14-speaker training set per
 # fold; lower only trims the unused tail, it does not change what the model
 # learns before convergence.
-DEFAULT_EPOCHS        = 15
+# 15 -> 12: the audited run's best epochs (7-15, mean 12.5) were selected on a
+# within-speaker validation split; under speaker-disjoint validation early
+# stopping is expected to fire earlier, and 12 keeps a 15-fold run inside a
+# ~9 h Kaggle session with margin (see notebooks/speech-processing.ipynb §5).
+DEFAULT_EPOCHS        = 12
 # 32, not 16: AMP is already on for every CUDA run (src/training/runner.py),
 # and LoRA fine-tuning only backpropagates through a few hundred-K adapter
 # params, not the frozen backbone — a smaller batch was leaving GPU
@@ -462,5 +486,6 @@ def ensure_directories() -> None:
                        EXPERIMENTS_DIR, RESULTS_DIR,
                        SIGNAL_FIGURE_DIR, REPRESENTATION_FIGURE_DIR, EXPLAINABILITY_FIGURE_DIR,
                        ABLATION_FIGURE_DIR, METRIC_FIGURE_DIR, TABLES_DIR, DIAGNOSTICS_DIR,
-                       FEATURE_CACHE_DIR, SEGMENTAL_EXTRA_CACHE_DIR, SUPRASEGMENTAL_CACHE_DIR):
+                       FEATURE_CACHE_DIR, SEGMENTAL_EXTRA_CACHE_DIR, SUPRASEGMENTAL_CACHE_DIR,
+                       FEATURE_STORE_DIR):
         directory.mkdir(parents=True, exist_ok=True)

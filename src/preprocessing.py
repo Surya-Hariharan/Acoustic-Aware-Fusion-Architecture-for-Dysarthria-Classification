@@ -31,6 +31,7 @@ import torch
 import torchaudio
 
 from src import config
+from src import feature_store
 from src import vad as vad_module
 from src import vad_cache
 from src.console import print_kv, print_note, print_status, print_subheader, progress
@@ -437,7 +438,14 @@ def extract_mfcc_features_cached(filepath: str) -> torch.Tensor:
     """Same contract as extract_mfcc_features, memoized per (process, filepath).
     Passes the VAD-trimmed waveform's valid_length through so delta/delta-delta
     are computed only over real audio, not smeared across the padded tail —
-    see extract_mfcc_features's docstring."""
+    see extract_mfcc_features's docstring.
+
+    Served from the chunked feature store (src.feature_store) when it holds
+    this utterance: its segmental tensor's first 39 channels ARE this
+    function's output, stored."""
+    stored = feature_store.segmental_features(filepath)
+    if stored is not None:
+        return torch.from_numpy(stored[:3 * config.N_MFCC].copy()).unsqueeze(0)
     waveform, valid_length = load_and_preprocess_cached(filepath)
     return extract_mfcc_features(waveform, _shared_mfcc_transform(), valid_length=valid_length)
 
@@ -468,6 +476,10 @@ def extract_segmental_extra_features_cached(filepath: str) -> torch.Tensor:
     """
     from src.praat import extract_segmental_extra_sequence
 
+    stored = feature_store.segmental_features(filepath)
+    if stored is not None:
+        return torch.from_numpy(stored[3 * config.N_MFCC:].copy())
+
     cache_path = _disk_cache_path(config.SEGMENTAL_EXTRA_CACHE_DIR, filepath)
     if cache_path.exists():
         return torch.from_numpy(np.load(cache_path))
@@ -490,6 +502,9 @@ def extract_segmental_features_cached(filepath: str) -> torch.Tensor:
     formant+HNR (4 channels) along the channel axis -> (43, frames), the
     Segmental branch's full input (config.SEGMENTAL_CHANNELS — see
     src.models.segmental_pathway.SegmentalPathway)."""
+    stored = feature_store.segmental_features(filepath)
+    if stored is not None:
+        return torch.from_numpy(stored.copy())                       # (43, T)
     mfcc = extract_mfcc_features_cached(filepath).squeeze(0)         # (39, T)
     extra = extract_segmental_extra_features_cached(filepath)        # (4, T)
     return torch.cat([mfcc, extra], dim=0)                           # (43, T)
@@ -512,6 +527,10 @@ def extract_suprasegmental_features_cached(filepath: str) -> torch.Tensor:
     extract_segmental_extra_features_cached's docstring for why.
     """
     from src.praat import extract_suprasegmental_sequence
+
+    stored = feature_store.suprasegmental_features(filepath)
+    if stored is not None:
+        return torch.from_numpy(stored.copy())                       # (3, T)
 
     cache_path = _disk_cache_path(config.SUPRASEGMENTAL_CACHE_DIR, filepath)
     if cache_path.exists():

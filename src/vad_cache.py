@@ -394,21 +394,32 @@ def _span_table() -> Dict[str, Tuple[int, int, int, int, int]]:
 
     Returns {} when the cache is absent or stale, so every lookup below misses
     and callers take the live-VAD path.
+
+    Spans held by the chunked feature store (src.feature_store) are merged in
+    on top — the store is where precomputation now writes them, and its spans
+    were produced by the same _live_span as this table's.
     """
+    from src import feature_store
+
+    merged: Dict[str, Tuple[int, int, int, int, int]] = {}
     table = load_span_table()
-    if table is None:
-        return {}
-    columns = ["Filename", "num_samples", "speech_start", "speech_end",
-               "supra_start", "supra_end"]
-    return {
-        row[0]: (int(row[1]), int(row[2]), int(row[3]), int(row[4]), int(row[5]))
-        for row in table[columns].itertuples(index=False, name=None)
-    }
+    if table is not None:
+        columns = ["Filename", "num_samples", "speech_start", "speech_end",
+                   "supra_start", "supra_end"]
+        merged = {
+            row[0]: (int(row[1]), int(row[2]), int(row[3]), int(row[4]), int(row[5]))
+            for row in table[columns].itertuples(index=False, name=None)
+        }
+    merged.update(feature_store.span_table())
+    return merged
 
 
 def clear_span_table_cache() -> None:
     """Drop the per-process memoized table — for tests, and after a rebuild."""
+    from src import feature_store
+
     _span_table.cache_clear()
+    feature_store.span_table.cache_clear()
 
 
 def vad_span(filepath: str, *, supra: bool = False) -> Optional[Tuple[int, int]]:
