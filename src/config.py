@@ -379,7 +379,7 @@ WAV2VEC_APPLY_SPEC_AUGMENT = False
 # True keeps the historical behaviour; src.training.session.
 # benchmark_batch_sizes measures both settings so a run can turn it off when
 # the GPU has the memory to spare (the T4 run peaked at 3.6 of 15.6 GB).
-WAV2VEC_GRADIENT_CHECKPOINTING = False   # RTX 4060 benchmark: +32% throughput, 5.8 GB peak at batch 32
+WAV2VEC_GRADIENT_CHECKPOINTING = False   # measured: +32% throughput, 5.8 GB peak VRAM at batch 32
 
 # Phase 6: attention-based fusion. The 768-dim deep and 128-dim acoustic frame
 # sequences are projected into a shared FUSION_ATTN_DIM space so cross-attention
@@ -459,7 +459,7 @@ DEFAULT_EPOCHS        = 12
 # params, not the frozen backbone — a smaller batch was leaving GPU
 # throughput unused without buying any regularization benefit worth the
 # slower 28/81-fold sweep. wav2vec2-base at CLIP_SECONDS=4.0 with AMP fits
-# batch 32 comfortably on an 8 GB card (RTX 4060 and similar); drop to 16,
+# batch 32 comfortably on an 8 GB card; drop to 16,
 # then 8, if a fold OOMs on a smaller GPU. Re-measure with
 # src.training.budget.benchmark_batch_sizes on the actual machine before
 # trusting this as more than a starting point — it has not been verified
@@ -482,8 +482,8 @@ DEFAULT_VAL_FRACTION  = 0.1      # held out from each fold's train split
 DEFAULT_SEED           = 42
 
 # ---------------------------------------------------------------------------
-# Local hardware profile — i7-12700H (14C/20T), 16 GB RAM, RTX 4060 Laptop
-# (8 GB), NVMe. Sized from the measured RTX 4060 benchmark (batch 32,
+# Local hardware profile — 14-core/20-thread CPU, 16 GB RAM, 8 GB CUDA GPU,
+# NVMe SSD. Sized from this machine's measured benchmark (batch 32,
 # gradient checkpointing off: 76 train samples/s, 5.8 GB peak VRAM) and from
 # Windows' DataLoader model: every worker is a SPAWNED process that imports
 # torch (~0.4-0.6 GB RSS each), so worker count is bounded by RAM, not cores.
@@ -493,21 +493,47 @@ DEFAULT_SEED           = 42
 # ---------------------------------------------------------------------------
 # "float16" (with a live GradScaler) or "bfloat16" (Ampere+ only, no scaler).
 AMP_DTYPE = "float16"
-# Measured: 4 train + 2 val + 2 test workers peaked at 8.2 GB across the
-# process tree and left 0.4 GB of RAM free. One item costs ~10-15 ms of CPU,
-# so 3 training workers supply ~200 items/s against ~76/s consumed.
-TRAIN_NUM_WORKERS = 3            # persistent, training loader
-EVAL_NUM_WORKERS = 2             # validation loader (persistent, reused every epoch)
-TEST_NUM_WORKERS = 0             # test loader: one 255-utterance pass per fold, in-process
+# Measured on this machine: every spawned DataLoader worker re-imports torch
+# with its CUDA DLLs and costs ~1.95 GB of COMMIT (~0.7 GB resident) whatever
+# it loads. The old 3 train + 2 val persistent workers put the training tree at
+# 13 GB of commit and left 0.3 GB of RAM free — the "error code 1455" /
+# paging-stall failure mode. Throughput does not need them: with the feature
+# store memory-mapped, one worker supplies ~340 items/s and the main process
+# alone ~230 items/s, against ~76 items/s the GPU trains at. So: one persistent
+# worker overlaps training-batch loading with the GPU step, and validation/test
+# load in the main process (the GPU is idle between batches there anyway).
+TRAIN_NUM_WORKERS = 1            # persistent, training loader
+EVAL_NUM_WORKERS = 0             # validation loader (0 = in the main process)
+TEST_NUM_WORKERS = 0             # test loader: one pass per fold, in-process
 DATALOADER_PREFETCH_FACTOR = 4   # batches queued per worker
+# Per-process memory cost used to size worker pools against what is free
+# right now (src.training.utils.affordable_workers), so a run adapts to other
+# applications being open instead of paging or failing mid-fold.
+DATALOADER_WORKER_RAM_GB = 0.75      # measured 0.67-0.71 GB resident
+DATALOADER_WORKER_COMMIT_GB = 2.0    # measured 1.94 GB committed
+FEATURE_STORE_WORKER_RAM_GB = 0.9    # torch + Silero + parselmouth per build worker
+FEATURE_STORE_WORKER_COMMIT_GB = 2.2
+# Kept free for the OS, the notebook front end and the process's own growth.
+RAM_RESERVE_GB = 2.0
+COMMIT_RESERVE_GB = 4.0
+# Measured during a real fold: the training process commits ~10.4 GB — on
+# this Windows (WDDM) driver the ~6.3 GB of GPU memory PyTorch reserves is
+# charged to system commit as well. Worker counts are decided BEFORE a fold
+# reserves that, so training reserves room for it on top.
+TRAINING_COMMIT_RESERVE_GB = 8.0
+# Below this much free commit before a fold, a note asks to close applications:
+# ~6.5 GB GPU-backed commit + ~2 GB for the worker + margin.
+MIN_FREE_COMMIT_GB_PER_FOLD = 10.0
 # Cap PyTorch's share of VRAM. On Windows (WDDM) exceeding physical VRAM does
 # not raise OOM — it silently spills into system RAM and throughput collapses
 # ~10x (measured: batch 64 without checkpointing ran at 4 samples/s). A cap
 # turns that into a clean, catchable OOM and keeps ~0.8 GB for the display.
 CUDA_MEMORY_FRACTION = 0.90
 CUDNN_BENCHMARK = True           # fixed 4 s input shape -> autotuned conv kernels
-# Feature-store build: each worker holds torch + Silero + parselmouth
-# (~0.5 GB); 8 leaves RAM headroom on 16 GB and saturates the P-cores.
+# Feature-store build: an UPPER bound. Each worker holds torch + Silero +
+# parselmouth, so the pool is shrunk to what free RAM and commit allow at
+# build time (src.training.utils.affordable_workers) — 8 fixed workers on a
+# 16 GB machine with other applications open is what stalled the last build.
 FEATURE_STORE_WORKERS = 8
 USE_TQDM = True                  # tqdm bars (False: throttled line log, for piped logs)
 

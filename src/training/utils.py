@@ -32,7 +32,7 @@ _RUNTIME_CONFIGURED = False
 
 
 def configure_local_runtime(device: torch.device) -> None:
-    """One-time, per-process CUDA settings for the local RTX 4060 profile
+    """One-time, per-process CUDA settings for the local hardware profile
     (config "Local hardware profile"):
 
       * cudnn.benchmark — every input is the same fixed 4 s window, so
@@ -42,6 +42,11 @@ def configure_local_runtime(device: torch.device) -> None:
         past physical VRAM does not raise OOM but spills into system RAM and
         collapses throughput ~10x; the cap turns that into a clean OOM and
         leaves headroom for the display.
+
+    The cap is the smaller of that fraction and what is actually FREE on the
+    card now (less 0.3 GiB): VRAM another application holds (a browser, the
+    desktop compositor) is not available to training, and a cap above the
+    free amount would let the allocator spill instead of failing cleanly.
     """
     global _RUNTIME_CONFIGURED
     if _RUNTIME_CONFIGURED or device.type != "cuda":
@@ -49,8 +54,64 @@ def configure_local_runtime(device: torch.device) -> None:
     torch.backends.cudnn.benchmark = bool(config.CUDNN_BENCHMARK)
     if config.CUDA_MEMORY_FRACTION:
         index = device.index if device.index is not None else torch.cuda.current_device()
-        torch.cuda.set_per_process_memory_fraction(float(config.CUDA_MEMORY_FRACTION), index)
+        free, total = torch.cuda.mem_get_info(index)
+        fraction = min(float(config.CUDA_MEMORY_FRACTION), (free - 0.3 * 2 ** 30) / total)
+        torch.cuda.set_per_process_memory_fraction(max(fraction, 0.1), index)
+        if fraction < 0.75:
+            print_note(f"Only {free / 2 ** 30:.1f} of {total / 2 ** 30:.1f} GiB of GPU memory is "
+                       "free — another application is using the GPU. Training needs ~6 GiB at "
+                       "batch 32; close it (or restart the kernel) if a fold runs out of memory.")
     _RUNTIME_CONFIGURED = True
+
+
+def memory_status() -> dict:
+    """System memory right now, in GiB: available/total physical RAM and
+    available/limit COMMIT (RAM + page file).
+
+    Commit is what a Windows process actually runs out of — "The paging file
+    is too small" (error 1455) — and it is consumed far faster than RAM by
+    spawned workers (each maps torch's CUDA DLLs, ~2 GB committed). On
+    Windows it is read with GlobalMemoryStatusEx; elsewhere RAM + swap stands
+    in for it."""
+    gib = 2 ** 30
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return {"ram_available": status.ullAvailPhys / gib, "ram_total": status.ullTotalPhys / gib,
+                    "commit_available": status.ullAvailPageFile / gib,
+                    "commit_limit": status.ullTotalPageFile / gib}
+    except (AttributeError, OSError):
+        pass
+    import psutil
+    ram, swap = psutil.virtual_memory(), psutil.swap_memory()
+    return {"ram_available": ram.available / gib, "ram_total": ram.total / gib,
+            "commit_available": (ram.available + swap.free) / gib,
+            "commit_limit": (ram.total + swap.total) / gib}
+
+
+def affordable_workers(requested: int, ram_per_worker_gb: float, commit_per_worker_gb: float,
+                       reserve_ram_gb: float = None, reserve_commit_gb: float = None) -> int:
+    """The largest worker count <= `requested` whose memory fits in what is
+    free right now after the reserves — 0 if not even one does. Workers are a
+    throughput aid, never a requirement: every caller also works in-process."""
+    reserve_ram_gb = config.RAM_RESERVE_GB if reserve_ram_gb is None else reserve_ram_gb
+    reserve_commit_gb = config.COMMIT_RESERVE_GB if reserve_commit_gb is None else reserve_commit_gb
+    status = memory_status()
+    by_ram = int((status["ram_available"] - reserve_ram_gb) // ram_per_worker_gb)
+    by_commit = int((status["commit_available"] - reserve_commit_gb) // commit_per_worker_gb)
+    return max(0, min(int(requested), by_ram, by_commit))
 
 
 def resolve_device(requested: str = None) -> torch.device:

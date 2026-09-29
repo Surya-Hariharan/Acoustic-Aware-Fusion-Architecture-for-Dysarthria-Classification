@@ -182,7 +182,7 @@ def _mmap_arrays(path: Path, data) -> Tuple[np.ndarray, np.ndarray]:
     Why: every DataLoader worker on Windows is a separate spawned process. A
     decompressed in-process copy (~19 MB per chunk, ~11 training chunks per
     fold) was duplicated in all of them — measured 8.2 GB across the training
-    process tree on a 16 GB laptop. A memory-mapped file lives in the OS page
+    process tree on a 16 GB machine. A memory-mapped file lives in the OS page
     cache ONCE, shared by the main process and every worker, and the NVMe
     serves any cold page in microseconds."""
     stat = path.stat()
@@ -357,7 +357,8 @@ def _write_chunk(path: Path, records: List[Dict[str, object]]) -> None:
     temp_path = path.with_name(path.name + ".tmp")
     with open(temp_path, "wb") as handle:
         np.savez_compressed(handle, **arrays)
-    os.replace(temp_path, path)
+    from src.training.checkpoint import replace_with_retry   # retries a sync-client lock
+    replace_with_retry(temp_path, path)
 
 
 def _build_chunk(task: Tuple[str, List[str], str]) -> Dict[str, object]:
@@ -439,8 +440,9 @@ def build_feature_store(df: pd.DataFrame, n_workers: Optional[int] = None,
     within stall_timeout_s is killed and its chunks reported as failed.
     """
     from src import vad as vad_module
+    from src.training.utils import affordable_workers, memory_status
 
-    n_workers = n_workers or config.FEATURE_STORE_WORKERS
+    requested_workers = n_workers or config.FEATURE_STORE_WORKERS
     stall_timeout_s = stall_timeout_s or config.FEATURE_STORE_STALL_TIMEOUT_S
     out_dir = Path(config.FEATURE_STORE_DIR)
     chunks = plan_chunks(df)
@@ -463,6 +465,16 @@ def build_feature_store(df: pd.DataFrame, n_workers: Optional[int] = None,
 
     if config.VAD_ENABLED:
         vad_module.warmup_silero_vad()     # populate the torch.hub cache before workers load it
+
+    # Sized to the memory free NOW (at least one worker: the build has no
+    # in-process path), so other open applications shrink the pool instead
+    # of pushing the machine into paging.
+    n_workers = max(1, affordable_workers(min(requested_workers, len(todo)),
+                                          config.FEATURE_STORE_WORKER_RAM_GB,
+                                          config.FEATURE_STORE_WORKER_COMMIT_GB))
+    memory = memory_status()
+    print_kv("Build workers", f"{n_workers} (of up to {requested_workers}; "
+                              f"{memory['ram_available']:.1f} GiB RAM free)")
 
     start = time.monotonic()
     round_size = max(1, n_workers * chunks_per_worker_per_round)
