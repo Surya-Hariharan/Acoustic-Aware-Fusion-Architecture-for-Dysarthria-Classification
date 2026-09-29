@@ -307,7 +307,7 @@ class ProgressReporter:
         self.n += n
         self._maybe_emit()
 
-    def set_postfix_str(self, postfix: str) -> None:
+    def set_postfix_str(self, postfix: str, refresh: bool = True) -> None:
         self.postfix = postfix
 
     def set_description(self, description: str) -> None:
@@ -382,18 +382,23 @@ def progress(iterable, description: str, total: Optional[int] = None,
 
     One entry point so every stage (feature extraction, epochs, embedding
     passes, fold loops) reports identically. config.USE_TQDM (default, local
-    interactive runs) returns a tqdm.auto bar — a live widget in Jupyter, a
-    terminal bar elsewhere; otherwise the throttled line-oriented
-    ProgressReporter above, which reads better in a saved/piped log. Both
-    support the same surface: iteration, update(), set_postfix_str(),
-    set_description(), close(), and the context-manager protocol.
+    interactive runs) returns a TEXT tqdm bar on stdout — redrawn in place in
+    Jupyter/VS Code and in a terminal, and saved in the .ipynb as its final
+    state. Deliberately not the ipywidgets bar (tqdm.auto): a saved notebook
+    keeps only a widget's initial "0%| 0/79" text, which then reads as if
+    every epoch stalled. Otherwise the throttled line-oriented
+    ProgressReporter above, for piped logs. Both support the same surface:
+    iteration, update(), set_postfix_str(), set_description(), close(), and
+    the context-manager protocol.
     """
     from src import config
     if getattr(config, "USE_TQDM", False):
         try:
-            from tqdm.auto import tqdm
-            return tqdm(iterable, desc=description, total=total, leave=leave, unit=unit,
-                        dynamic_ncols=True, smoothing=0.1)
+            from tqdm import tqdm
+            return tqdm(iterable, desc=f"  {description}", total=total, leave=leave, unit=unit,
+                        file=sys.stdout, ncols=100, mininterval=0.5, smoothing=0.1,
+                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                                   "[{elapsed}<{remaining}, {rate_fmt}]{postfix}")
         except ImportError:
             pass
     return ProgressReporter(iterable, description=description, total=total,

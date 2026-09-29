@@ -27,6 +27,7 @@ src.training.runner.run_training, which concatenates every fold's predictions
 before scoring. A pooled set covering both classes has all metrics defined.
 """
 
+import warnings
 from typing import Dict
 
 import numpy as np
@@ -83,6 +84,18 @@ def ordinal_mae(y_true: np.ndarray, y_pred: np.ndarray, task: str) -> float:
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
                     task: str) -> Dict[str, float]:
+    """See _compute_metrics. sklearn's UndefinedMetricWarning / "y_pred
+    contains classes not in y_true" are silenced here: they fire every epoch
+    on a validation set that lacks a class (e.g. no Low speaker can be spared
+    for validation in a Low-speaker fold), and every such metric is already
+    returned as NaN — reported as N/A — by design (see the module docstring)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)      # UndefinedMetricWarning subclasses it
+        return _compute_metrics(y_true, y_pred, y_prob, task)
+
+
+def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
+                     task: str) -> Dict[str, float]:
     """
     Args:
         y_true: (N,) int labels.

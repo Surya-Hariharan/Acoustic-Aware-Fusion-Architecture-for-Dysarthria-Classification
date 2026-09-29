@@ -8,7 +8,9 @@ Also home to the EXPERIMENT REGISTRY (see below), the single record of what
 was actually evaluated — as opposed to what merely left a file behind.
 """
 
+import contextlib
 import hashlib
+import io
 import json
 import shutil
 from dataclasses import asdict
@@ -23,9 +25,10 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-from sklearn.metrics import roc_curve
+from sklearn.metrics import confusion_matrix, roc_curve
 
 from src import config
+from src.training.checkpoint import replace_with_retry
 
 
 def save_predictions(path: Path, filenames, speaker_ids, y_true: np.ndarray,
@@ -59,13 +62,21 @@ def save_predictions(path: Path, filenames, speaker_ids, y_true: np.ndarray,
     else:
         for i, name in enumerate(class_names):
             df[f"prob_{name.replace(' ', '_')}"] = y_prob[:, i]
-    df.to_csv(path, index=False)
+    temp_path = path.with_name(path.name + ".tmp")
+    df.to_csv(temp_path, index=False)
+    replace_with_retry(temp_path, path)
 
 
 def save_metrics(path: Path, metrics: Dict[str, float]) -> None:
+    """Atomic (temp file + retried replace): together with the predictions
+    CSV this file is the fold-finished marker, so it must never be left
+    half-written, and a sync client holding the old copy open must not fail
+    a fold whose training already finished."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    temp_path = path.with_name(path.name + ".tmp")
+    with open(temp_path, "w") as f:
         json.dump(metrics, f, indent=2)
+    replace_with_retry(temp_path, path)
 
 
 def save_confusion_matrix(path: Path, cm: np.ndarray, task: str, title: str) -> None:
@@ -266,8 +277,13 @@ def record_fold(run_name: str, model: str, task: str, cv_protocol: str,
         updated = new_row
     else:
         keep = ~((existing["run_name"] == run_name) & (existing["fold_id"] == fold_id))
-        updated = pd.concat([existing[keep], new_row], ignore_index=True)
-    updated.reindex(columns=REGISTRY_COLUMNS).to_csv(registry_path, index=False)
+        # All-NA columns dropped before concat (pandas deprecates letting them
+        # decide dtypes); the reindex below restores the full column set.
+        frames = [frame.dropna(axis=1, how="all") for frame in (existing[keep], new_row)]
+        updated = pd.concat([f for f in frames if not f.empty], ignore_index=True)
+    temp_path = registry_path.with_name(registry_path.name + ".tmp")
+    updated.reindex(columns=REGISTRY_COLUMNS).to_csv(temp_path, index=False)
+    replace_with_retry(temp_path, registry_path)
 
 
 def load_registry(registry_path: Optional[Path] = None) -> pd.DataFrame:
@@ -407,74 +423,50 @@ def run_coverage(expected_fold_ids: List[str], fold_status: Dict[str, str]) -> D
 def print_run_coverage(coverage: Dict, run_name: str) -> None:
     from src.console import print_header, print_kv, print_note, print_status
 
-    print_header(f"Fold coverage — {run_name}")
-    print_kv("Expected folds", coverage["expected"])
-    print_kv("Completed folds", f"{coverage['completed']}  "
-             f"({coverage['trained_this_session']} trained this session, "
+    print_header(f"Run status — {coverage['status']}")
+    print_kv("Folds with a result", f"{coverage['completed']} / {coverage['expected']}  "
+             f"({coverage['trained_this_session']} trained now, "
              f"{coverage['loaded_from_disk']} loaded from disk)")
-    print_kv("Missing folds", f"{len(coverage['missing_folds'])}  "
-             f"{', '.join(coverage['missing_folds']) or '—'}")
-    print_kv("Failed folds", f"{len(coverage['failed_folds'])}  "
-             f"{', '.join(coverage['failed_folds']) or '—'}")
-    print_kv("Skipped folds (runtime guard)", f"{len(coverage['skipped_folds'])}  "
-             f"{', '.join(coverage['skipped_folds']) or '—'}"
-             + (f"  (interrupted mid-fold: {', '.join(coverage['interrupted_folds'])})"
-                if coverage["interrupted_folds"] else ""))
-    print_kv("Completion", f"{coverage['completion_pct']:.1f}%")
-    print_status(f"Run status: {coverage['status']}",
-                 ok=coverage["status"] == RUN_STATUS_COMPLETE)
-    if coverage["status"] != RUN_STATUS_COMPLETE:
-        print_note(f"This run is {coverage['status']}: {coverage['completed']} of "
-                   f"{coverage['expected']} LOSO folds have a result. Any pooled number "
-                   "below describes only those folds and is NOT a final thesis result. "
-                   "Re-run the same configuration to resume the missing folds.")
+    if coverage["failed_folds"]:
+        print_kv("Failed", ", ".join(coverage["failed_folds"]))
+    if coverage["interrupted_folds"]:
+        print_kv("Interrupted (resumes mid-fold)", ", ".join(coverage["interrupted_folds"]))
+    not_started = [f for f in coverage["skipped_folds"] if f not in coverage["interrupted_folds"]]
+    if not_started:
+        print_kv("Not started", ", ".join(not_started))
+    if coverage["status"] == RUN_STATUS_COMPLETE:
+        print_status(f"All {coverage['expected']} folds of {run_name} are complete.", ok=True)
+    else:
+        print_note(f"Re-run the training cell to finish the "
+                   f"{len(coverage['missing_folds'])} missing fold(s) — finished folds load "
+                   "from disk. Pooled numbers until then are partial, not final.")
 
 
 def print_fold_report(record: Dict, fold_index: int, n_folds: int, max_epochs: int,
                       task: str) -> None:
-    """The per-fold summary block. Class-sensitive metrics (macro-F1,
-    balanced accuracy, AUROC) are printed as N/A whenever the held-out set
-    contains a single true class — always the case for a severity LOSO fold,
-    whose one held-out speaker has one severity label."""
-    from src.console import print_kv, print_note
+    """The end-of-fold summary: two lines. Only metrics DEFINED on one
+    held-out speaker are shown — a severity LOSO fold has a single true
+    class, so macro-F1 / balanced accuracy / AUROC exist only pooled (Section
+    7 of the notebook), never per fold."""
+    from src.console import print_note
 
-    print()
-    print(f"  FOLD {fold_index}/{n_folds} ({record['fold']}) COMPLETE")
-    print_kv("Held-out speaker", record["fold"])
-    print_kv("True severity" if task == "severity" else "True class", record.get("true_label"))
-    print_kv("Test utterances", record.get("n_samples"))
-    print_kv("Accuracy", _fmt_metric(record.get("accuracy")))
-    if task == "severity":
-        print_kv("Ordinal MAE", _fmt_metric(record.get("ordinal_mae")))
     best_epoch = record.get("best_epoch")
-    print_kv("Best epoch", f"{best_epoch}/{max_epochs} of {record.get('epochs_completed')} run"
-             if best_epoch is not None else f"n/a (no improving epoch) of {max_epochs}")
-    print_kv("Training time", f"{_fmt_duration(record.get('train_time_s'))}  "
-             f"(fold total {_fmt_duration(record.get('fold_time_s'))})")
+    parts = [f"accuracy {_fmt_metric(record.get('accuracy'))[:5]}"]
+    if task == "severity":
+        parts.append(f"ordinal MAE {_fmt_metric(record.get('ordinal_mae'))[:5]}")
+    parts.append(f"best epoch {best_epoch} of {record.get('epochs_completed')} run"
+                 if best_epoch is not None else "no improving epoch")
+    parts.append(f"fold time {_fmt_duration(record.get('fold_time_s'))}")
+    print(f"  Result     {record['fold']} ({record.get('true_label')}): " + " · ".join(parts))
     distribution = record.get("pred_distribution") or {}
-    print_kv("Predicted class distribution",
-             " | ".join(f"{name} {count}" for name, count in distribution.items()))
-    argmax_distribution = record.get("argmax_pred_distribution")
-    if argmax_distribution and argmax_distribution != distribution:
-        print_kv("  (argmax decode, for audit)",
-                 " | ".join(f"{name} {count}" for name, count in argmax_distribution.items()))
-    if record.get("n_classes_present", 0) < 2:
-        print_kv("Macro-F1 / balanced acc. / AUROC",
-                 "N/A — undefined: the held-out set has a single true class")
-    else:
-        print_kv("Macro-F1 / balanced acc. / AUROC",
-                 f"{_fmt_metric(record.get('f1'))} / {_fmt_metric(record.get('balanced_accuracy'))}"
-                 f" / {_fmt_metric(record.get('auroc'))}")
-    if record.get("val_speakers"):
-        print_kv("Validation speakers", record["val_speakers"].replace(";", ", ")
-                 + f"  ({record.get('val_protocol')}-level)")
-    if "coral_thresholds" in record:
-        print_kv("CORAL threshold biases",
-                 f"{record['coral_thresholds']} "
-                 f"({'rank-ordered' if record.get('coral_thresholds_ordered') else 'NOT ordered'})")
-        if not record.get("coral_thresholds_ordered"):
-            print_note("Threshold biases are not rank-ordered, so the median decode and "
-                       "CORAL's raw threshold count can differ for some utterances.")
+    print("  Predicted  " + " · ".join(f"{name} {count}" for name, count in distribution.items()))
+    if record.get("n_classes_present", 0) >= 2:
+        print(f"  Macro-F1 {_fmt_metric(record.get('f1'))} · balanced accuracy "
+              f"{_fmt_metric(record.get('balanced_accuracy'))} · AUROC "
+              f"{_fmt_metric(record.get('auroc'))}")
+    if "coral_thresholds" in record and not record.get("coral_thresholds_ordered"):
+        print_note(f"CORAL threshold biases {record['coral_thresholds']} are not rank-ordered; "
+                   "the median decode may differ from the raw threshold count here.")
 
 
 def print_runtime_status(folds_done: int, n_folds: int, remaining_folds: int,
@@ -483,51 +475,41 @@ def print_runtime_status(folds_done: int, n_folds: int, remaining_folds: int,
                          session_elapsed_s: Optional[float] = None,
                          session_budget_s: Optional[float] = None,
                          deadline_in_s: Optional[float] = None) -> None:
-    """After every fold: elapsed time, average fold time, estimated time to
-    finish, and whether that finish lands inside the session budget with
-    margin. ON TRACK = projected finish (estimate x safety_factor) inside the
-    safe deadline; AT RISK = inside it only without the safety factor;
-    WILL NOT FIT = the runtime guard will skip folds."""
-    from src.console import print_kv, print_subheader
-
-    print_subheader(f"Runtime — {folds_done}/{n_folds} folds accounted for")
-    print_kv("Elapsed (this run)", _fmt_duration(run_elapsed_s))
-    if session_elapsed_s is not None:
-        print_kv("Elapsed (whole session)", _fmt_duration(session_elapsed_s)
-                 + (f" of {_fmt_duration(session_budget_s)} budget" if session_budget_s else ""))
-    if fold_estimate_s is None:
-        print_kv("Average fold time", "n/a (no fold trained this session yet)")
-        return
-    print_kv("Average fold time", f"{_fmt_duration(fold_estimate_s)} "
-             f"({'mean of ' + str(n_timed_folds) + ' trained fold(s)' if n_timed_folds else 'prior estimate'})")
-    remaining_s = remaining_folds * fold_estimate_s
-    print_kv("Remaining folds", remaining_folds)
-    print_kv("Estimated remaining time", f"{_fmt_duration(remaining_s)} "
-             f"({_fmt_duration(remaining_s * safety_factor)} with x{safety_factor:.2f} safety)")
+    """After every fold, ONE line: folds accounted for, elapsed time, mean
+    fold time and the estimated time to finish — plus, only when a deadline
+    is set, whether that finish fits it (ON TRACK = with the safety factor,
+    AT RISK = only without it, WILL NOT FIT = the runtime guard will skip)."""
+    parts = [f"{folds_done}/{n_folds} folds done", f"elapsed {_fmt_duration(run_elapsed_s)}"]
     if session_elapsed_s is not None and session_budget_s:
-        projected = session_elapsed_s + remaining_s
-        print_kv("Projected session total", f"{_fmt_duration(projected)} of "
-                 f"{_fmt_duration(session_budget_s)} (margin {_fmt_duration(session_budget_s - projected)})")
-    if deadline_in_s is not None:
-        margin = deadline_in_s - remaining_s * safety_factor
-        status = ("ON TRACK" if margin >= 0
-                  else "AT RISK" if deadline_in_s - remaining_s >= 0
-                  else "WILL NOT FIT — the runtime guard will skip the folds that do not fit")
-        print_kv("Safe budget remaining", _fmt_duration(deadline_in_s))
-        print_kv("Safety margin at finish", _fmt_duration(margin) if margin >= 0
-                 else f"-{_fmt_duration(-margin)}")
-        print_kv("Estimated completion status", status)
+        parts.append(f"session {_fmt_duration(session_elapsed_s)} of "
+                     f"{_fmt_duration(session_budget_s)}")
+    if fold_estimate_s is not None and remaining_folds:
+        remaining_s = remaining_folds * fold_estimate_s
+        parts.append(f"mean fold {_fmt_duration(fold_estimate_s)}")
+        parts.append(f"about {_fmt_duration(remaining_s)} to go")
+        if deadline_in_s is not None:
+            margin = deadline_in_s - remaining_s * safety_factor
+            parts.append("ON TRACK" if margin >= 0
+                         else "AT RISK" if deadline_in_s - remaining_s >= 0
+                         else "WILL NOT FIT — later folds will be skipped")
+    print("  Progress   " + " · ".join(parts))
 
 
 def print_pooled_evaluation(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
                             task: str, coverage: Dict,
-                            speakers: Optional[List[str]] = None) -> Dict:
+                            speakers: Optional[List[str]] = None,
+                            verbose: bool = True) -> Dict:
     """Pooled evaluation over every completed held-out speaker: headline
     metrics, confusion matrix, true/predicted class distributions, and
     per-class precision/recall/F1 — each marked N/A where undefined (a class
     never predicted has no precision; a class absent from the pooled set has
     no recall or AUROC). Labelled PARTIAL whenever coverage is incomplete.
-    Returns the per-class table and distributions as a JSON-able dict."""
+    Returns the per-class table and distributions as a JSON-able dict;
+    verbose=False computes the same report without printing it."""
+    if not verbose:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return print_pooled_evaluation(y_true, y_pred, y_prob, task, coverage,
+                                           speakers=speakers, verbose=True)
     from sklearn.metrics import confusion_matrix as sk_confusion_matrix
     from sklearn.metrics import roc_auc_score
 
@@ -573,24 +555,7 @@ def print_pooled_evaluation(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.n
 
     true_counts = cm.sum(axis=1)
     pred_counts = cm.sum(axis=0)
-    rows = []
-    for i, name in enumerate(class_names):
-        tp = cm[i, i]
-        precision = tp / pred_counts[i] if pred_counts[i] > 0 else float("nan")
-        recall = tp / true_counts[i] if true_counts[i] > 0 else float("nan")
-        f1 = (2 * precision * recall / (precision + recall)
-              if np.isfinite(precision) and np.isfinite(recall) and (precision + recall) > 0
-              else (0.0 if np.isfinite(recall) and true_counts[i] > 0 else float("nan")))
-        binary = (y_true == i).astype(int)
-        if 0 < binary.sum() < len(binary):
-            prob_i = y_prob if (task == "detection" and i == 1) else (
-                1 - y_prob if task == "detection" else y_prob[:, i])
-            auroc = float(roc_auc_score(binary, prob_i))
-        else:
-            auroc = float("nan")
-        rows.append({"class": name, "true_n": int(true_counts[i]), "pred_n": int(pred_counts[i]),
-                     "precision": precision, "recall": recall, "f1": f1, "auroc_ovr": auroc})
-    per_class = pd.DataFrame(rows)
+    per_class = per_class_table(y_true, y_pred, y_prob, task)
     print_subheader("Per-class (N/A = undefined: never predicted / absent from pooled set)")
     shown = per_class.copy()
     for column in ("precision", "recall", "f1", "auroc_ovr"):
@@ -624,6 +589,139 @@ def print_pooled_evaluation(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.n
                                    "predictions": {s: {"true": int(r.true), "pred": int(r.pred)}
                                                    for s, r in per_speaker.iterrows()}}
     return report
+
+
+def per_class_table(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
+                    task: str) -> pd.DataFrame:
+    """One row per class: true/predicted counts, precision, recall, F1 and
+    one-vs-rest AUROC — NaN wherever undefined (precision of a class never
+    predicted; recall/F1/AUROC of a class absent from y_true)."""
+    from sklearn.metrics import roc_auc_score
+
+    class_names = (config.SEVERITY_CLASS_NAMES if task == "severity"
+                   else config.DETECTION_CLASS_NAMES)
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
+    true_counts, pred_counts = cm.sum(axis=1), cm.sum(axis=0)
+    rows = []
+    for i, name in enumerate(class_names):
+        tp = cm[i, i]
+        precision = tp / pred_counts[i] if pred_counts[i] > 0 else float("nan")
+        recall = tp / true_counts[i] if true_counts[i] > 0 else float("nan")
+        f1 = (2 * precision * recall / (precision + recall)
+              if np.isfinite(precision) and np.isfinite(recall) and (precision + recall) > 0
+              else (0.0 if np.isfinite(recall) and true_counts[i] > 0 else float("nan")))
+        binary = (y_true == i).astype(int)
+        if 0 < binary.sum() < len(binary):
+            prob_i = y_prob if (task == "detection" and i == 1) else (
+                1 - y_prob if task == "detection" else y_prob[:, i])
+            auroc = float(roc_auc_score(binary, prob_i))
+        else:
+            auroc = float("nan")
+        rows.append({"class": name, "true_n": int(true_counts[i]), "pred_n": int(pred_counts[i]),
+                     "precision": precision, "recall": recall, "f1": f1, "auroc_ovr": auroc})
+    return pd.DataFrame(rows)
+
+
+def collect_run_results(run_name: str, expected_folds: List[str],
+                        task: str = "severity") -> Dict[str, object]:
+    """Everything a results cell needs, rebuilt from the per-fold files on
+    disk (outputs/metrics/<run>/<fold>.json + outputs/predictions/<run>/<fold>.csv)
+    — so it is correct after a complete run, a partial one, or a run
+    interrupted mid-fold, and never depends on the in-memory return value of
+    run_training or on a RUN_STATUS file only a finished call writes.
+
+    Returns display-ready DataFrames plus the coverage summary:
+      coverage   expected / completed / missing / failed folds, status
+      per_fold   one row per completed fold (only per-fold-defined metrics)
+      pooled     headline pooled metrics, NaN (with a reason) where undefined
+      per_class  per-class precision / recall / F1 / AUROC
+      confusion  pooled confusion matrix (rows true, columns predicted)
+      speakers   speaker-level decision (median of utterance predictions)
+    """
+    from src.training.metrics import compute_metrics
+
+    class_names = (config.SEVERITY_CLASS_NAMES if task == "severity"
+                   else config.DETECTION_CLASS_NAMES)
+    rows, frames = [], []
+    for fold_id in expected_folds:
+        metrics_path = config.METRICS_DIR / run_name / f"{fold_id}.json"
+        predictions_path = config.PREDICTIONS_DIR / run_name / f"{fold_id}.csv"
+        if not (metrics_path.exists() and predictions_path.exists()):
+            continue
+        with open(metrics_path) as handle:
+            m = json.load(handle)
+        preds = pd.read_csv(predictions_path)
+        counts = np.bincount(preds["y_pred"], minlength=len(class_names))
+        row = {"Fold": fold_id,
+               "True class": m.get("true_label") or class_names[int(preds["y_true"].iloc[0])],
+               "Utterances": len(preds),
+               "Accuracy": m.get("accuracy")}
+        if task == "severity":
+            row["Ordinal MAE"] = m.get("ordinal_mae")
+        row.update({f"Pred {name}": int(c) for name, c in zip(class_names, counts)})
+        row.update({"Best epoch": m.get("best_epoch"),
+                    "Epochs run": m.get("epochs_completed"),
+                    "Train (min)": (m.get("train_time_s") or float("nan")) / 60,
+                    "Val speakers": str(m.get("val_speakers", "")).replace(";", ", ")})
+        rows.append(row)
+        frames.append(preds)
+
+    registry = load_registry()
+    completed = [r["Fold"] for r in rows]
+    failed = []
+    if not registry.empty:
+        mine = registry[(registry["run_name"] == run_name) & (registry["status"] == FOLD_FAILED)]
+        failed = [f for f in mine["fold_id"] if f not in completed]
+    missing = [f for f in expected_folds if f not in completed]
+    status = (RUN_STATUS_COMPLETE if expected_folds and len(completed) == len(expected_folds)
+              else RUN_STATUS_PARTIAL if completed else RUN_STATUS_FAILED)
+    coverage = {"expected": len(expected_folds), "completed": len(completed),
+                "completion_pct": round(100.0 * len(completed) / max(len(expected_folds), 1), 1),
+                "missing_folds": missing, "failed_folds": failed, "status": status}
+    results: Dict[str, object] = {"coverage": coverage, "per_fold": pd.DataFrame(rows)}
+    if not frames:
+        return results
+
+    preds = pd.concat(frames, ignore_index=True)
+    y_true = preds["y_true"].to_numpy()
+    y_pred = preds["y_pred"].to_numpy()
+    y_prob = (preds["prob_positive"].to_numpy() if task == "detection" else
+              preds[[f"prob_{n.replace(' ', '_')}" for n in class_names]].to_numpy())
+    metrics = compute_metrics(y_true, y_pred, y_prob, task)
+    absent = [n for i, n in enumerate(class_names) if not (y_true == i).any()]
+    reason = ("undefined: fewer than 2 true classes pooled" if metrics["n_classes_present"] < 2
+              else f"undefined: no held-out {', '.join(absent)} yet" if absent else "")
+    pooled_rows = []
+    for key, label in (("accuracy", "Accuracy"), ("f1", "Macro F1"), ("f1_weighted", "Weighted F1"),
+                       ("balanced_accuracy", "Balanced accuracy"), ("ordinal_mae", "Ordinal MAE"),
+                       ("auroc", "AUROC (macro one-vs-rest)")):
+        if key == "ordinal_mae" and task != "severity":
+            continue
+        value = metrics.get(key)
+        defined = value is not None and np.isfinite(value)
+        note = "" if defined else reason
+        if defined and absent and key in ("f1", "balanced_accuracy"):
+            note = f"over the {len(class_names) - len(absent)} classes present"
+        pooled_rows.append({"Metric": label, "Value": value if defined else float("nan"),
+                            "Note": note})
+    results["pooled"] = pd.DataFrame(pooled_rows)
+    results["n_utterances"] = int(len(y_true))
+    results["per_class"] = per_class_table(y_true, y_pred, y_prob, task)
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
+    results["confusion"] = pd.DataFrame(cm, index=[f"True {n}" for n in class_names],
+                                        columns=[f"Pred {n}" for n in class_names])
+    if task == "severity":
+        per_speaker = preds.groupby("speaker_id").agg(
+            true=("y_true", "first"), pred=("y_pred", lambda v: int(np.floor(np.median(v)))),
+            accuracy=("correct", "mean"))
+        results["speakers"] = pd.DataFrame({
+            "Speaker": per_speaker.index,
+            "True class": [class_names[int(t)] for t in per_speaker["true"]],
+            "Speaker-level prediction": [class_names[int(v)] for v in per_speaker["pred"]],
+            "Correct": per_speaker["true"].to_numpy() == per_speaker["pred"].to_numpy(),
+            "Utterance accuracy": per_speaker["accuracy"].to_numpy(),
+        }).reset_index(drop=True)
+    return results
 
 
 def redecode_saved_predictions(predictions_dir: Path) -> pd.DataFrame:
@@ -867,40 +965,26 @@ def feature_audit(model=None, num_classes: int = 4) -> Dict:
 def print_feature_audit(model=None, num_classes: int = 4) -> Dict:
     """Print the brief's FEATURE AUDIT block (Section 13) and return the same
     dict feature_audit() computes."""
+    from src.console import print_kv, print_subheader
+
     audit = feature_audit(model=model, num_classes=num_classes)
-    print("\n========== FEATURE AUDIT ==========\n")
-    print("LEARNED BRANCH")
-    print(f"Raw hidden representation: [B, T, {config.WAV2VEC_EMBED_DIM}]")
-    print(f"Projected representation: {audit['learned_branch']['projected_shape']}")
-    print(f"Learned representation dimensions: {audit['learned_branch']['dimensions']}\n")
+    learned, segmental = audit["learned_branch"], audit["segmental_branch"]
+    supra, fusion = audit["suprasegmental_branch"], audit["fusion"]
 
-    print("SEGMENTAL BRANCH")
-    print(f"Input feature channels: {audit['segmental_branch']['input_channels']}")
-    print(f"Input tensor: {audit['segmental_branch']['input_shape']}")
-    print(f"Projected representation: {audit['segmental_branch']['projected_shape']}")
-    print(f"Segmental representation dimensions: {audit['segmental_branch']['dimensions']}")
-    print("Segmental features (SHAP-surrogate table):")
-    for i, name in enumerate(audit["segmental_branch"]["shap_surrogate_feature_names"], start=1):
-        print(f"  {i}. {name}")
-    print()
+    def shape(values) -> str:
+        return " x ".join(str(v) for v in values)
 
-    print("SUPRASEGMENTAL BRANCH")
-    print(f"Input feature channels: {audit['suprasegmental_branch']['input_channels']}")
-    print(f"Input tensor: {audit['suprasegmental_branch']['input_shape']}")
-    print(f"Projected representation: {audit['suprasegmental_branch']['projected_shape']}")
-    print(f"Suprasegmental representation dimensions: {audit['suprasegmental_branch']['dimensions']}")
-    print("Suprasegmental features (SHAP-surrogate table):")
-    for i, name in enumerate(audit["suprasegmental_branch"]["shap_surrogate_feature_names"], start=1):
-        print(f"  {i}. {name}")
-    print()
-
-    fusion = audit["fusion"]
-    print("FUSION")
-    print(f"Learned: {fusion['learned_dim']}")
-    print(f"Segmental: {fusion['segmental_dim']}")
-    print(f"Suprasegmental: {fusion['supra_dim']}")
-    print(f"Total fused representation: {fusion['fused_dim']}")
-    print("\n====================================\n")
+    print_subheader("Feature audit (shapes read from a dummy forward pass)")
+    print_kv("Learned", f"[B x T x {config.WAV2VEC_EMBED_DIM}] -> pooled -> "
+                        f"[{shape(learned['projected_shape'])}]")
+    print_kv("Segmental", f"[{shape(segmental['input_shape'])}] -> "
+                          f"[{shape(segmental['projected_shape'])}]")
+    print_kv("  channels", ", ".join(segmental["engineered_feature_families"]))
+    print_kv("Suprasegmental", f"[{shape(supra['input_shape'])}] -> "
+                               f"[{shape(supra['projected_shape'])}]")
+    print_kv("  channels", ", ".join(supra["engineered_feature_families"]))
+    print_kv("Fused representation", f"{fusion['learned_dim']} + {fusion['segmental_dim']} + "
+                                     f"{fusion['supra_dim']} = {fusion['fused_dim']}")
     return audit
 
 
@@ -1022,84 +1106,74 @@ def print_final_run_configuration(cfg, df: pd.DataFrame) -> Dict:
     """Print the brief's Section 23 FINAL RUN CONFIGURATION block. Call
     once, immediately before the real training run — everything printed is
     also what write_frozen_config() persists."""
+    from src.console import print_header, print_kv, print_subheader
+
     num_speakers_total = int(df["Speaker_ID"].nunique()) if "Speaker_ID" in df.columns else 0
     final_config = build_final_run_configuration(cfg, df, num_speakers_total)
 
-    print("\n========== FINAL RUN CONFIGURATION ==========\n")
-    print(f"Run name: {final_config['run_name']}")
-    print(f"Model: {final_config['model']}")
-    print(f"Task: {final_config['task']}\n")
-
+    print_header("Final run configuration")
+    print_kv("Run name", final_config["run_name"])
+    print_kv("Model / task", f"{final_config['model']} / {final_config['task']}")
     prov = final_config["provenance"]
-    print(f"Git commit: {prov['git_commit'] or 'unavailable'}")
-    print(f"Software versions: {prov['software_versions']}\n")
+    versions = prov["software_versions"]
+    print_kv("Git commit", (prov["git_commit"] or "unavailable")[:12])
+    print_kv("Software", ", ".join(f"{name} {version}" for name, version in versions.items()
+                                   if version))
 
     d = final_config["dataset"]
-    print(f"Speakers (total in manifest): {d['speakers_total']}")
-    print(f"Severity classes: {d['severity_classes']}")
-    print(f"Severity protocol: {d['severity_protocol']}")
-    print(f"Fold speakers ({len(d['fold_speakers'])}): {d['fold_speakers']}")
-    print(f"Number of folds: {d['num_folds']}\n")
-
+    print_subheader("Data and protocol")
+    print_kv("Severity protocol", f"{d['severity_protocol']}, {d['num_folds']} folds")
+    print_kv("Fold order", ", ".join(d["fold_speakers"]))
+    print_kv("Classes", ", ".join(d["severity_classes"]))
     a = final_config["audio"]
-    print(f"Sampling rate: {a['sampling_rate']}")
-    print(f"Clip duration handling: {a['clip_seconds']}s fixed window "
-         f"({a['max_samples']} samples)")
-    print(f"Speech-focused VAD pad: {a['speech_focused_vad_pad_ms']}ms")
-    print(f"Temporal-preserving VAD pad: {a['temporal_preserving_vad_pad_ms']}ms\n")
-
-    lb = final_config["learned_branch"]
-    print("Learned:")
-    print(f"  Model: {lb['wav2vec2_model']}")
-    print(f"  LoRA: rank={lb['lora_rank']}, alpha={lb['lora_alpha']}, "
-         f"dropout={lb['lora_dropout']}, targets={lb['lora_target_modules']}")
-    print(f"  Projection dimensions: {lb['dimensions']}\n")
-
-    sb = final_config["segmental_branch"]
-    print("Segmental:")
-    print(f"  Feature channel count: {sb['input_channels']}")
-    print(f"  Feature families: {sb['engineered_feature_families']}")
-    print(f"  Projection dimensions: {sb['dimensions']}\n")
-
-    pb = final_config["suprasegmental_branch"]
-    print("Suprasegmental:")
-    print(f"  Feature channel count: {pb['input_channels']}")
-    print(f"  Feature families: {pb['engineered_feature_families']}")
-    print(f"  Projection dimensions: {pb['dimensions']}\n")
-
-    c = final_config["complementarity"]
-    print(f"Complementarity: method={c['method']}, lambda={c['lambda']}\n")
-    s = final_config["speaker_invariance"]
-    print(f"Speaker invariance: method={s['method']}, lambda={s['lambda']}, "
-         f"grl_lambda={s['grl_lambda']}\n")
-    f = final_config["fusion"]
-    print(f"Fusion: method={f['method']}, fused_dim={f['fused_dim']}\n")
-    sh = final_config["severity_head"]
-    print(f"Severity: head={sh['method']}, loss={sh['loss']}, decoding={sh['decoding']}\n")
+    print_kv("Audio", f"{a['sampling_rate']} Hz, {a['clip_seconds']:g} s window "
+                      f"({a['max_samples']:,} samples)")
+    print_kv("VAD padding (speech / temporal)", f"{a['speech_focused_vad_pad_ms']} ms / "
+                                                f"{a['temporal_preserving_vad_pad_ms']} ms")
     v = final_config["validation"]
-    print(f"Validation: {v['protocol']}-level split, early stopping on {v['monitored']}")
+    print_kv("Validation", f"{v['protocol']}-disjoint; early stopping on {v['monitored']}")
+
+    print_subheader("Architecture")
+    lb = final_config["learned_branch"]
+    print_kv("Learned branch", f"{lb['wav2vec2_model']} + LoRA r={lb['lora_rank']}, "
+                               f"alpha={lb['lora_alpha']}, dropout={lb['lora_dropout']}")
+    print_kv("  LoRA targets / projection", f"{', '.join(lb['lora_target_modules'])} / "
+                                           f"{config.WAV2VEC_EMBED_DIM} -> {lb['dimensions']}")
+    sb = final_config["segmental_branch"]
+    print_kv("Segmental branch", f"{sb['input_channels']} ch -> {sb['dimensions']}")
+    pb = final_config["suprasegmental_branch"]
+    print_kv("Suprasegmental branch", f"{pb['input_channels']} ch -> {pb['dimensions']}")
+    f = final_config["fusion"]
+    print_kv("Fusion", f"{f['method']} ({f['fused_dim']}-dim)")
+    sh = final_config["severity_head"]
+    print_kv("Severity head", f"{sh['method']}; decode = {sh['decoding']}")
+    c, s = final_config["complementarity"], final_config["speaker_invariance"]
+    print_kv("Complementarity penalty", f"lambda {c['lambda']}")
+    print_kv("Speaker adversary (GRL)", f"lambda {s['lambda']}, GRL strength {s['grl_lambda']}")
     if final_config["ablation"]:
-        print(f"Ablation switches: {final_config['ablation']}")
-    print(f"Gradient checkpointing: {final_config['gradient_checkpointing']}\n")
+        print_kv("Ablation switches", final_config["ablation"])
 
     o = final_config["optimizer"]
-    print(f"Optimizer: {o['type']}")
-    print(f"Learning rate (head / backbone): {o['lr_head']} / {o['lr_backbone']}")
-    print(f"Weight decay: {o['weight_decay']}")
-    print(f"Batch size: {o['batch_size']}")
-    print(f"Epochs (max, early-stopping patience {o['patience']}): {o['epochs']}")
-    print(f"Gradient clip norm: {o['grad_clip_norm']}")
-    print(f"Seed: {o['seed']}")
-    print("\n=============================================\n")
-
+    print_subheader("Optimisation")
+    print_kv("Optimizer", f"{o['type']}, lr {o['lr_head']:g} (head) / {o['lr_backbone']:g} "
+                          f"(backbone), weight decay {o['weight_decay']:g}")
+    print_kv("Batch size / max epochs / patience", f"{o['batch_size']} / {o['epochs']} / "
+                                                   f"{o['patience']}")
+    print_kv("Grad clip / seed / grad checkpointing",
+             f"{o['grad_clip_norm']} / {o['seed']} / {final_config['gradient_checkpointing']}")
     return final_config
 
 
 def _config_hash(final_config: Dict) -> str:
     """Stable hash of a FINAL RUN CONFIGURATION dict — used only to detect
     "this run_name was already frozen with a DIFFERENT configuration", not
-    for anything security-sensitive."""
-    payload = json.dumps(final_config, sort_keys=True, default=str).encode("utf-8")
+    for anything security-sensitive.
+
+    Provenance (git commit, package versions) is recorded but NOT hashed: it
+    describes the environment, not the experiment, and hashing it made every
+    commit between sessions refuse to resume a half-finished run."""
+    experiment = {key: value for key, value in final_config.items() if key != "provenance"}
+    payload = json.dumps(experiment, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 

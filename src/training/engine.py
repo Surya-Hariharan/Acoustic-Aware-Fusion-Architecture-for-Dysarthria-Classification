@@ -216,7 +216,7 @@ def run_epoch(model: nn.Module, loader, criterion: nn.Module,
                 # percentage/rate — the only per-batch feedback previously
                 # available was the bar's %, with actual loss only printed
                 # once the whole epoch finished.
-                batches.set_postfix_str(f"loss={running_loss / num_samples:.4f}")
+                batches.set_postfix_str(f"loss={running_loss / num_samples:.4f}", refresh=False)
 
             probs = torch.softmax(logits.detach().float(), dim=1)
             argmax_preds = probs.argmax(dim=1)

@@ -10,9 +10,11 @@ training logic itself.
 """
 
 import json
+import shutil
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -23,16 +25,14 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 
 from src import config
-from src.console import (V, print_architecture, print_banner, print_fold_progress,
-                        print_header, print_kv, print_metrics, print_note, progress,
-                        print_signal_chain, print_status, print_subheader, print_table)
+from src.console import H_LIGHT, LINE_WIDTH, V, print_header, print_kv, print_note, print_status
 from src.praat import FEATURE_COLUMNS as PRAAT_FEATURE_COLUMNS
 from src.praat import load_praat_table
 from src.splits import (build_severity_folds, get_severity_split, iter_loso_folds,
                         iter_screening_folds, iter_severity_loso_folds, sample_severity_folds)
 from src.training.checkpoint import load_checkpoint, save_checkpoint
 from src.training.data import (TASK_LABEL_COLUMN, build_loaders, build_speaker_label_map,
-                               compute_class_weights, split_train_val)
+                               compute_class_weights, shutdown_loaders, split_train_val)
 from src.training.early_stopping import EarlyStopping
 from src.training.engine import EpochResult, build_optimizer, run_epoch
 from src.training.metrics import compute_confusion_matrix, compute_metrics
@@ -47,8 +47,8 @@ from src.training.reporting import (FOLD_CACHED, FOLD_COMPLETED, FOLD_FAILED,
                                     record_fold, run_coverage, save_confusion_matrix,
                                     save_embeddings, save_metrics, save_predictions,
                                     save_roc_curve)
-from src.training.utils import (configure_local_runtime, resolve_amp_dtype,
-                                resolve_device, set_seed)
+from src.training.utils import (affordable_workers, configure_local_runtime, memory_status,
+                                resolve_amp_dtype, resolve_device, set_seed)
 
 
 @dataclass
@@ -117,13 +117,11 @@ class TrainingConfig:
     # DEFAULT_BATCH_SIZE was tuned for.
     grad_accum_steps: int = 1
 
-    # False (default): no per-batch progress line inside run_epoch, only the one
-    # epoch-summary line run_fold already prints. src.console.progress now
-    # throttles to one line every PROGRESS_INTERVAL_S rather than animating a
-    # bar, so this is far cheaper than it was, but a per-batch report still
-    # says nothing an epoch summary does not. Set True for interactive,
-    # step-by-step debugging of a single batch/epoch.
-    show_batch_progress: bool = True
+    # False (default): no per-batch progress bar inside run_epoch, only the one
+    # table row per epoch run_fold prints — a 15-fold run then reads as a
+    # compact report. Set True for interactive, step-by-step debugging of a
+    # single batch/epoch.
+    show_batch_progress: bool = False
 
     # How each fold's validation set is carved from its training portion —
     # see src.training.data.split_train_val. "speaker" (default): whole
@@ -142,6 +140,12 @@ class TrainingConfig:
     # from src.training.session.project_runtime), or no estimate at all.
     fold_time_estimate_s: Optional[float] = None
     safety_factor: float = 1.15
+
+    # A fold that raises is retried this many times — resuming from its
+    # latest.pt — before it is recorded as FAILED. A CUDA out-of-memory retry
+    # halves the batch and doubles gradient accumulation, so the effective
+    # batch (and the optimisation) stays the same at half the activation memory.
+    fold_retries: int = 2
 
 
 def build_folds(df: pd.DataFrame, task: str, cfg: Optional["TrainingConfig"] = None):
@@ -216,6 +220,23 @@ class FoldInterrupted(RuntimeError):
     later session resumes it mid-fold instead of losing it to Kaggle's kill."""
 
 
+class FoldDiverged(RuntimeError):
+    """Raised by run_fold when no epoch produced a finite validation loss. Its
+    checkpoints hold diverged weights, so the retry restarts the fold from
+    scratch in full float32 instead of resuming them."""
+
+
+# Column layout shared by the header below and run_fold's per-epoch rows.
+EPOCH_TABLE_HEADER = (f"  {'epoch':<7}{'train loss':>11}{'val loss':>10}{'val ordinal':>13}"
+                      f"{'val acc':>9}{'val F1':>9}{'val MAE':>9}{'time':>8}")
+
+
+def _fmt_cell(value: float, width: int = 9) -> str:
+    """A metric table cell; undefined metrics (NaN — e.g. macro-F1 on a
+    validation set with one class) read as 'n/a', not 'nan'."""
+    return f"{value:>{width}.3f}" if np.isfinite(value) else f"{'n/a':>{width}}"
+
+
 def _format_hm(seconds: float) -> str:
     """0 <= seconds -> 'XhYYm', for the elapsed/ETA lines below."""
     seconds = max(0.0, seconds)
@@ -233,6 +254,61 @@ def _monitored_value(result: EpochResult) -> float:
     extras = result.extras or {}
     value = extras.get("ordinal_loss")
     return float(value) if value is not None and np.isfinite(value) else float(result.loss)
+
+
+def _is_out_of_memory(exc: BaseException) -> bool:
+    return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower()
+
+
+def _is_host_memory_failure(exc: BaseException) -> bool:
+    """Windows running out of commit inside the DataLoader: "error code
+    1455" (the paging file is too small), a failed shared-memory mapping, or a
+    worker process killed for it."""
+    text = str(exc).lower()
+    return any(marker in text for marker in ("1455", "paging file", "shared file mapping",
+                                             "dataloader worker", "couldn't open shared"))
+
+
+def _adapt_after_failure(exc: BaseException, fold_cfg: TrainingConfig, run_name: str,
+                         fold_id: str) -> Tuple[TrainingConfig, str]:
+    """The configuration a failed fold is retried with, and a one-line
+    description of the change. Every retry resumes from latest.pt except a
+    diverged fold, whose checkpoints hold the diverged weights."""
+    if _is_out_of_memory(exc) and fold_cfg.batch_size >= 8:
+        adapted = replace(fold_cfg, batch_size=fold_cfg.batch_size // 2,
+                          grad_accum_steps=fold_cfg.grad_accum_steps * 2)
+        return adapted, (f"CUDA out of memory — batch {adapted.batch_size} x "
+                         f"{adapted.grad_accum_steps} accumulation (same effective batch), "
+                         "resuming from the last saved epoch.")
+    if _is_host_memory_failure(exc):
+        adapted = replace(fold_cfg, num_workers=0, eval_num_workers=0)
+        return adapted, ("system memory ran out in the data loader — loading in-process "
+                         "(no worker processes), resuming from the last saved epoch.")
+    if isinstance(exc, FoldDiverged):
+        shutil.rmtree(config.CHECKPOINT_DIR / run_name / fold_id, ignore_errors=True)
+        return (replace(fold_cfg, amp=False),
+                "training diverged — restarting this fold from scratch in float32.")
+    return fold_cfg, "resuming from the last saved epoch."
+
+
+def _save_fold_traceback(run_name: str, fold_id: str, attempt: int) -> Path:
+    """The full traceback of the exception being handled, written next to the
+    fold's TensorBoard logs rather than into the notebook output."""
+    path = config.LOG_DIR / run_name / f"{fold_id}_attempt{attempt}_error.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(traceback.format_exc(), encoding="utf-8")
+    return path
+
+
+def _warn_if_memory_low(fold_id: str) -> None:
+    """One note before a fold when this machine is short of memory — the
+    fold still starts (with fewer workers), but paging would slow it badly."""
+    memory = memory_status()
+    if (memory["commit_available"] < config.MIN_FREE_COMMIT_GB_PER_FOLD
+            or memory["ram_available"] < config.RAM_RESERVE_GB):
+        print_note(f"Low memory before fold {fold_id}: {memory['ram_available']:.1f} GiB RAM / "
+                   f"{memory['commit_available']:.1f} GiB commit free — close other "
+                   "applications (browsers, extra editor windows) to avoid paging.")
 
 
 def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
@@ -327,14 +403,16 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
     # exists purely to let a fresh process resume mid-fold.
     latest_ckpt_path = config.CHECKPOINT_DIR / run_name / fold_id / "latest.pt"
 
-    print_fold_progress(fold_id, fold_index, n_folds,
-                        len(train_df), len(val_df), len(test_df))
-    print(f"    train speakers ({train_df['Speaker_ID'].nunique()}) | "
-          f"val speakers ({len(val_speakers)}, {cfg.val_protocol}-level): "
-          f"{', '.join(val_speakers)} | test: {', '.join(sorted(test_df['Speaker_ID'].unique()))}")
-    if fold_index == 1:
-        print_architecture(model, cfg.model)
-        print()
+    true_label = ", ".join(sorted(test_df[label_column].unique()))
+    print()
+    print(H_LIGHT * LINE_WIDTH)
+    print(f"  FOLD {fold_index}/{n_folds}  {V}  held-out {fold_id} ({true_label})  {V}  "
+          f"train {len(train_df):,} · val {len(val_df):,} · test {len(test_df):,}")
+    print(f"  {train_df['Speaker_ID'].nunique()} training speakers; validation speakers "
+          f"{', '.join(val_speakers)}"
+          + (f"; batch {cfg.batch_size} x {cfg.grad_accum_steps} accumulation"
+             if cfg.grad_accum_steps > 1 else ""))
+    print(H_LIGHT * LINE_WIDTH)
 
     epochs_completed = 0
     best_epoch, best_val_f1, best_monitored = None, None, None
@@ -353,10 +431,11 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
         best_monitored = checkpoint.get("best_monitored")
         slowest_epoch_s = float(checkpoint.get("slowest_epoch_s") or 0.0)
         epochs_completed = start_epoch
-        print(f"    Resuming fold {fold_id} from {latest_ckpt_path.name} "
-             f"-- epoch {start_epoch}/{cfg.epochs} onward "
-             f"(model/optimizer/scheduler/scaler/early-stopping state restored)")
+        print(f"  Resumed from {latest_ckpt_path.name}: {start_epoch} epoch(s) already done "
+              f"(best so far: epoch {best_epoch}).")
 
+    if not early_stopping.should_stop and start_epoch < cfg.epochs:
+        print(EPOCH_TABLE_HEADER)
     for epoch in range(start_epoch, cfg.epochs) if not early_stopping.should_stop else ():
         if (hard_deadline is not None and slowest_epoch_s > 0
                 and time.monotonic() + slowest_epoch_s > hard_deadline):
@@ -413,30 +492,26 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
                               "fold_id": fold_id})
 
         val_metrics = val_result.metrics
-        print(f"    Epoch {epoch + 1:02d}/{cfg.epochs} | "
-             f"Train Loss: {train_result.loss:.4f} | "
-             f"Val Loss: {val_result.loss:.4f} (ordinal {monitored:.4f}) | "
-             f"Val Acc: {val_metrics['accuracy']:.3f} | "
-             f"Val F1: {val_metrics['f1']:.4f} | "
-             f"Val MAE: {val_metrics['ordinal_mae']:.3f} | "
-             f"Time: {epoch_time_s / 60:.1f} min" + ("  <-- best" if is_best else ""))
-
-        if run_start_time is not None and total_epochs_planned:
-            epochs_done_total = epochs_completed_before + epochs_completed
-            elapsed_s = time.monotonic() - run_start_time
-            avg_per_epoch_s = elapsed_s / max(epochs_done_total, 1)
-            remaining_epochs = max(0, total_epochs_planned - epochs_done_total)
-            eta_s = avg_per_epoch_s * remaining_epochs
-            print(f"      Elapsed: {_format_hm(elapsed_s)}  |  "
-                 f"Upper-bound remaining (every fold at max epochs): {_format_hm(eta_s)}")
+        print(f"  {epoch + 1:>3}/{cfg.epochs:<3}{train_result.loss:>11.4f}{val_result.loss:>10.4f}"
+              f"{monitored:>13.4f}{val_metrics['accuracy']:>9.3f}{_fmt_cell(val_metrics['f1'])}"
+              f"{val_metrics['ordinal_mae']:>9.3f}{epoch_time_s / 60:>7.1f}m"
+              + ("   * best" if is_best else ""))
+        if not (np.isfinite(train_result.loss) and np.isfinite(monitored)):
+            print_note(f"Non-finite loss in epoch {epoch + 1} (train {train_result.loss}, "
+                       f"val {monitored}) — this epoch cannot become the best checkpoint.")
 
         if early_stopping.should_stop:
-            print(f"    early stopping at epoch {epoch + 1} "
-                 f"(no val ordinal-loss improvement for {cfg.patience} epochs)")
+            print(f"  Early stop: validation ordinal loss did not improve for {cfg.patience} "
+                  f"epochs (best epoch {best_epoch}).")
             break
 
-    if best_ckpt_path.exists():
-        load_checkpoint(best_ckpt_path, model, map_location=str(device))
+    if not best_ckpt_path.exists():
+        # Every epoch's validation loss was non-finite: testing the last
+        # weights would report a diverged model as if it were a result.
+        writer.close()
+        raise FoldDiverged(f"fold {fold_id}: no epoch produced a finite validation loss, "
+                           "so there is no checkpoint to evaluate.")
+    load_checkpoint(best_ckpt_path, model, map_location=str(device))
 
     train_time_s = time.monotonic() - fold_start
     inference_start = time.monotonic()
@@ -495,7 +570,6 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame,
                  {**fold_record, **(test_result.extras or {})})
 
     print_fold_report(fold_record, fold_index, n_folds, cfg.epochs, cfg.task)
-    print(f"  Checkpoint    : {best_ckpt_path}")
     return fold_record, test_result
 
 
@@ -574,33 +648,11 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         protocol = ("Leave-One-Speaker-Out" if cfg.cv_protocol != "screening"
                     else f"screening ({cfg.screening_folds}-fold, speaker-grouped)")
     elif cfg.severity_protocol == "full_loso":
-        protocol = (f"full-population Leave-One-Speaker-Out (PRIMARY, all "
-                    f"{len(config.DYSARTHRIC_IDS)} dysarthric speakers)")
+        protocol = "severity Leave-One-Speaker-Out"
     else:
         protocol = "balanced leave-one-speaker-per-class-out (SECONDARY, 3/class)"
         if cfg.severity_fold_sample is not None:
             protocol += f" (subsampled to {cfg.severity_fold_sample} of 81)"
-
-    print_banner("UA-Speech Dysarthria Classification",
-                 f"{MODEL_DESCRIPTIONS.get(cfg.model, cfg.model)}")
-    print_subheader("Run configuration")
-    print_kv("Task", f"{cfg.task} ({config.NUM_CLASSES[cfg.task]}-class)")
-    print_kv("Model", f"{cfg.model} — {MODEL_DESCRIPTIONS.get(cfg.model, '')}")
-    print_kv("Cross-validation protocol", protocol)
-    print_kv("Validation protocol", "speaker-disjoint (whole speakers held out of training)"
-             if cfg.val_protocol == "speaker"
-             else "utterance-level (LEGACY — val speakers are also training speakers)")
-    print_kv("Run name", run_name)
-    print_kv("Device", device)
-    print_kv("Epochs / batch size", f"{cfg.epochs} / {cfg.batch_size}")
-    print_kv("LR (head / wav2vec backbone)", f"{cfg.lr_head} / {cfg.lr_backbone}")
-    print_kv("Early stopping patience", f"{cfg.patience} epochs on validation ordinal loss")
-    print_kv("Severity decoding", "median of the CORAL distribution (threshold count)")
-    if praat_table is not None:
-        print_kv("Praat pathway", f"{len(PRAAT_FEATURE_COLUMNS)} features, "
-                 f"standardized per fold from the train split only")
-
-    print_signal_chain()
 
     fold_iter = build_folds(df, cfg.task, cfg)
     if cfg.folds:
@@ -620,9 +672,33 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     is_reduced_scale = (cfg.limit_samples is not None
                         or (cfg.max_folds is not None and cfg.max_folds < full_fold_count)
                         or cfg.cv_protocol == "screening")
+
+    memory = memory_status()
+    amp_on = cfg.amp if cfg.amp is not None else device.type == "cuda"
+    print_header(f"Training — {run_name}")
+    print_kv("Model", cfg.model)
+    print_kv("Protocol", f"{protocol}, {n_folds} fold{'s' * (n_folds != 1)}; "
+                         + ("speaker-disjoint validation" if cfg.val_protocol == "speaker"
+                            else "utterance-level validation (LEGACY)"))
+    print_kv("Schedule", f"max {cfg.epochs} epochs, patience {cfg.patience}, batch "
+                         f"{cfg.batch_size}, lr {cfg.lr_head:g}/{cfg.lr_backbone:g}, "
+                         + (f"AMP {str(resolve_amp_dtype(device)).replace('torch.', '')}"
+                            if amp_on else "float32"))
+    print_kv("Data loading", f"{cfg.num_workers} train worker{'s' * (cfg.num_workers != 1)}; "
+                             "validation "
+                             + (f"{cfg.eval_num_workers} worker(s)" if cfg.eval_num_workers
+                                else "in-process"))
+    print_kv("Memory free at start", f"{memory['ram_available']:.1f} GiB RAM, "
+                                     f"{memory['commit_available']:.1f} GiB commit")
+    print_kv("Fold order", ", ".join(fold_id for fold_id, _, _ in fold_iter))
+    if praat_table is not None:
+        print_kv("Praat pathway", f"{len(PRAAT_FEATURE_COLUMNS)} features, "
+                 f"standardized per fold from the train split only")
     if is_reduced_scale:
-        print()
-        if cfg.cv_protocol == "screening":
+        if cfg.limit_samples is not None:
+            print_note("REDUCED SCALE — a pipeline check, not a reportable result "
+                       "(limit_samples is set).")
+        elif cfg.cv_protocol == "screening":
             print_note("SCREENING PROTOCOL — cheap speaker-grouped k-fold for ranking "
                        "ablation variants, not the base-paper's full LOSO result.")
         elif cfg.max_folds is not None and cfg.max_folds < full_fold_count:
@@ -636,11 +712,6 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
             print_note("REDUCED SCALE — this is a pipeline check, not a reportable result "
                        "(max_folds / limit_samples are set).")
 
-    print()
-    print_kv("Selected folds", ", ".join(fold_id for fold_id, _, _ in fold_iter))
-    print_kv("Expected folds", n_folds)
-    print_kv("Epochs per fold (max)", cfg.epochs)
-
     registry_base = _registry_kwargs(cfg, run_name, n_folds)
     fold_metrics = []
     fold_status: Dict[str, str] = {}
@@ -652,7 +723,6 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     total_epochs_planned = n_folds * cfg.epochs
     epochs_completed_running = 0
     session_fold_times: List[float] = []
-    fold_bar = progress(None, f"{run_name} — LOSO folds", total=n_folds, unit="fold")
 
     def estimated_fold_seconds() -> Optional[float]:
         if session_fold_times:
@@ -698,7 +768,10 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
 
         if cached is not None:
             metrics_dict, y_true, y_pred, y_prob, speakers = cached
-            print_kv(f"Fold {fold_id}", "already completed — loaded from disk, skipping retrain")
+            print(f"  Fold {i:>2}/{n_folds}  {fold_id:<4} ({metrics_dict.get('true_label')}) — "
+                  f"already complete, loaded from disk: accuracy "
+                  f"{metrics_dict.get('accuracy', float('nan')):.3f}, ordinal MAE "
+                  f"{metrics_dict.get('ordinal_mae', float('nan')):.3f}")
             fold_status[fold_id] = FOLD_CACHED
             record_fold(**registry_base, fold_id=fold_id, fold_index=i,
                         status=FOLD_CACHED, fold_description=fold_description,
@@ -707,33 +780,73 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
                         runtime_s=metrics_dict.get("fold_time_s"))
         else:
             fold_started = time.monotonic()
-            try:
-                metrics_dict, test_result = run_fold(fold_id, train_df, test_df, cfg, device,
-                                                     run_name, praat_table, frozen_embedding_table,
-                                                     fold_index=i, n_folds=n_folds,
-                                                     run_start_time=run_start_time,
-                                                     total_epochs_planned=total_epochs_planned,
-                                                     epochs_completed_before=epochs_completed_running,
-                                                     hard_deadline=hard_deadline)
-            except FoldInterrupted as exc:
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+            outcome = None
+            fold_cfg = cfg
+            for attempt in range(1 + max(0, cfg.fold_retries)):
+                # Workers sized to the memory free NOW, fold by fold: another
+                # application opened mid-run shrinks the pool (down to
+                # in-process loading) instead of pushing Windows into paging
+                # or "error 1455" mid-epoch.
+                worker_budget = dict(ram_per_worker_gb=config.DATALOADER_WORKER_RAM_GB,
+                                     commit_per_worker_gb=config.DATALOADER_WORKER_COMMIT_GB,
+                                     reserve_commit_gb=config.TRAINING_COMMIT_RESERVE_GB)
+                fold_cfg = replace(
+                    fold_cfg,
+                    num_workers=affordable_workers(fold_cfg.num_workers, **worker_budget),
+                    eval_num_workers=affordable_workers(fold_cfg.eval_num_workers,
+                                                        **worker_budget))
+                _warn_if_memory_low(fold_id)
+                try:
+                    metrics_dict, test_result = run_fold(
+                        fold_id, train_df, test_df, fold_cfg, device, run_name, praat_table,
+                        frozen_embedding_table, fold_index=i, n_folds=n_folds,
+                        run_start_time=run_start_time,
+                        total_epochs_planned=total_epochs_planned,
+                        epochs_completed_before=epochs_completed_running,
+                        hard_deadline=hard_deadline)
+                    outcome = "ok"
+                except FoldInterrupted as exc:
+                    outcome = ("deadline", str(exc))
+                except KeyboardInterrupt:
+                    outcome = ("user", None)
+                except Exception as exc:
+                    # One fold's failure should not abort a run that may have
+                    # spent hours on earlier folds: free what the attempt held,
+                    # adapt the configuration to the failure, and retry.
+                    outcome = "failed"
+                    fold_cfg, remedy = _adapt_after_failure(exc, fold_cfg, run_name, fold_id)
+                    log_path = _save_fold_traceback(run_name, fold_id, attempt + 1)
+                    print_status(f"Fold {fold_id} attempt {attempt + 1} failed: "
+                                 f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}  "
+                                 f"(traceback: {log_path.name})", ok=False)
+                finally:
+                    # Always stop this fold's DataLoader workers explicitly —
+                    # see src.training.data.shutdown_loaders for why waiting
+                    # for garbage collection exhausted RAM in a notebook.
+                    shutdown_loaders()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                if outcome != "failed":
+                    break
+                if attempt < cfg.fold_retries:
+                    print_note(f"Retrying fold {fold_id}: {remedy}")
+
+            if isinstance(outcome, tuple) and outcome[0] == "deadline":
                 skip_remaining(i, FOLD_INTERRUPTED,
-                               f"Hard deadline: {exc} Later folds are recorded as SKIPPED.")
+                               f"Hard deadline: {outcome[1]} Later folds are recorded as SKIPPED.")
                 break
-            except Exception:
-                # One fold's OOM/transient failure should not abort a run that
-                # may have already spent hours on earlier folds — log it, free
-                # whatever CUDA memory the failed attempt held, and move on.
-                print_status(f"Fold {fold_id} failed — skipping (see traceback below)", ok=False)
-                print(traceback.format_exc())
+            if isinstance(outcome, tuple) and outcome[0] == "user":
+                skip_remaining(i, FOLD_INTERRUPTED,
+                               f"Interrupted by the user during fold {fold_id}. Every finished "
+                               f"epoch is saved — re-run to resume this fold from its latest.pt "
+                               f"and continue with the remaining folds.")
+                break
+            if outcome == "failed":
+                print_status(f"Fold {fold_id} FAILED after {1 + cfg.fold_retries} attempts — "
+                             f"excluded from pooling; re-running the cell retries it.", ok=False)
                 fold_status[fold_id] = FOLD_FAILED
                 record_fold(**registry_base, fold_id=fold_id, fold_index=i,
                             status=FOLD_FAILED, fold_description=fold_description)
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-                fold_bar.update(1)
-                fold_bar.set_postfix_str(f"{fold_id} FAILED")
                 continue
             session_fold_times.append(time.monotonic() - fold_started)
             fold_status[fold_id] = FOLD_COMPLETED
@@ -744,13 +857,6 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
                         runtime_s=metrics_dict.get("fold_time_s"))
             y_true, y_pred, y_prob = test_result.y_true, test_result.y_pred, test_result.y_prob
             speakers = test_result.speaker_ids
-            # Each fold builds a fresh model/optimizer/scaler (run_fold) that goes
-            # out of scope here; without an explicit empty_cache(), the CUDA
-            # allocator's cached-but-unused blocks can fragment across sequential
-            # folds and quietly shrink the effective free memory a later fold
-            # sees, risking a late-run OOM hours into an unattended session.
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
         epochs_completed_running += metrics_dict.get("epochs_completed") or cfg.epochs
 
@@ -760,8 +866,6 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
         pooled_prob.append(y_prob)
         pooled_speakers.extend(speakers)
 
-        fold_bar.update(1)
-        fold_bar.set_postfix_str(f"{fold_id} acc={metrics_dict.get('accuracy', float('nan')):.3f}")
         remaining = [fid for fid, _, _ in fold_iter if fid not in fold_status]
         print_runtime_status(
             folds_done=len(fold_status), n_folds=n_folds, remaining_folds=len(remaining),
@@ -772,7 +876,6 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
             session_budget_s=session_budget_s,
             deadline_in_s=(deadline - time.monotonic()) if deadline is not None else None)
 
-    fold_bar.close()
     coverage = run_coverage([fid for fid, _, _ in fold_iter], fold_status)
     print_run_coverage(coverage, run_name)
     save_metrics(config.METRICS_DIR / run_name / "RUN_STATUS.json", coverage)
@@ -798,13 +901,21 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig,
     save_roc_curve(config.ROC_DIR / run_name / "ALL_FOLDS_pooled.png",
                    y_true, y_prob, cfg.task, title=f"{run_name} — all folds pooled")
 
-    print_header(f"Results — {run_name}  ({coverage['completed']}/{coverage['expected']} "
-                 f"fold(s), {len(y_true):,} held-out utterances, {coverage['status']})")
-    print_subheader("Per-fold mean +/- std (defined metrics only)")
-    print_table(summary.dropna(how="all").reset_index().rename(columns={"index": "metric"}))
-
+    # The detailed pooled tables are the notebook's Section 7 (read back from
+    # disk); here only the headline, so the training cell stays a compact log.
     pooled_report = print_pooled_evaluation(y_true, y_pred, y_prob, cfg.task, coverage,
-                                            speakers=pooled_speakers)
+                                            speakers=pooled_speakers, verbose=False)
+    headline = [f"accuracy {pooled_metrics['accuracy']:.3f}"]
+    for key, label in (("f1", "macro-F1"), ("balanced_accuracy", "balanced accuracy"),
+                       ("ordinal_mae", "ordinal MAE")):
+        value = pooled_metrics.get(key)
+        if value is not None and np.isfinite(value):
+            headline.append(f"{label} {value:.3f}")
+    speaker_level = pooled_report.get("speaker_level")
+    if speaker_level:
+        n_correct = sum(p["true"] == p["pred"] for p in speaker_level["predictions"].values())
+        headline.append(f"speakers correct {n_correct}/{len(speaker_level['predictions'])}")
+    print_kv(f"Pooled ({len(y_true):,} utterances)", " · ".join(headline))
     pooled_metrics.update({"run_status": coverage["status"],
                            "expected_folds": coverage["expected"],
                            "completed_folds": coverage["completed"]})
