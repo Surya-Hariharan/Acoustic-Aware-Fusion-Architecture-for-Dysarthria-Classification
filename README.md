@@ -206,10 +206,11 @@ Every utterance passes through one deterministic chain (`src/preprocessing.py`, 
 | Speaker adversarial | λ_speaker = 0.1, GRL strength 1.0 | `config.LAMBDA_SPEAKER`, `config.GRL_LAMBDA` |
 | Optimizer | AdamW — lr 1e-3 (head/branches/LoRA), 1e-4 (backbone), weight decay 1e-2 | `config.DEFAULT_LR_HEAD`, `DEFAULT_LR_BACKBONE` |
 | Schedule | `ReduceLROnPlateau`, early stopping patience 3 on validation ordinal loss | `config.DEFAULT_PATIENCE` |
-| Batch / epochs | Batch chosen per machine by `session.benchmark_batch_sizes` (32 default) / 12 max, gradient clipping 1.0, AMP on CUDA | `config.DEFAULT_BATCH_SIZE`, `DEFAULT_EPOCHS` |
+| Batch / epochs | 32 (fp16 AMP, gradient checkpointing off — measured on the training machine) / 12 max, gradient clipping 1.0 | `config.DEFAULT_BATCH_SIZE`, `DEFAULT_EPOCHS`, config *Local hardware profile* |
 | Validation | Speaker-disjoint: one speaker per severity class that keeps ≥ 2 training speakers (3–4 speakers per fold), seeded per fold | `data.speaker_disjoint_train_val_split` |
 | Seed | 42 | `config.DEFAULT_SEED` |
-| Compute budget | Whole Kaggle session ≤ 9 h (hard limit ~10 h). A fold starts only if its projected end fits the safe deadline; epochs stop at a hard deadline and resume from `latest.pt` | `run_training(deadline=, hard_deadline=)`, `session.benchmark_batch_sizes`, `project_runtime` |
+| Data / runtime | All three blocks (765 utterances per dysarthric speaker, 11,475 total), 15 LOSO folds, run locally from `notebooks/training.ipynb`. Resumable: finished folds load from disk, an interrupted fold resumes from `latest.pt` | `run_training`, `session.calibrate_throughput`, `project_runtime` |
+| Memory | One persistent training DataLoader worker; validation/test load in-process. On Windows every worker commits ~2 GB (it re-imports torch's CUDA DLLs), so worker and feature-store pools are sized fold by fold to the RAM and commit free at that moment. A fold that fails is retried with an adapted configuration (CUDA OOM: half batch x 2 accumulation; host-memory failure: no workers; divergence: restart in float32) | config *Local hardware profile*, `utils.affordable_workers`, `runner._adapt_after_failure` |
 
 > [!NOTE]
 > **Patience 3 / epoch ceiling 15 is a compute-budget-driven tightening, not an
