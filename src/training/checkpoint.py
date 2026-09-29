@@ -19,6 +19,7 @@ nothing here is a Keras model.
 """
 
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,23 @@ import torch
 # instead of ~386 MB, written after every epoch. The full-size files filled
 # 8.5 GB of Kaggle's ~20 GB /kaggle/working after 11 of 15 folds.
 COMPACT_STATE_SCOPE = "trainable_params_and_buffers"
+
+
+def replace_with_retry(temp_path: Path, path: Path, attempts: int = 12,
+                       delay_s: float = 0.5) -> None:
+    """os.replace, retried on PermissionError. On Windows a file another
+    process has open cannot be replaced — and this project lives under
+    OneDrive, which opens every freshly written checkpoint to upload it (as
+    does Defender, to scan it). Without the retry, the per-epoch latest.pt
+    save failed intermittently and took the whole fold down with it."""
+    for attempt in range(attempts):
+        try:
+            os.replace(temp_path, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay_s * (attempt + 1))
 
 
 def _frozen_parameter_names(model: torch.nn.Module) -> set:
@@ -65,7 +83,7 @@ def save_checkpoint(path: Path, model: torch.nn.Module, optimizer: torch.optim.O
         checkpoint.update(extra)
     temp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(checkpoint, temp_path)
-    os.replace(temp_path, path)
+    replace_with_retry(temp_path, path)
 
 
 def load_checkpoint(path: Path, model: torch.nn.Module,

@@ -8,6 +8,8 @@ train portion (carving out a validation slice) and turning DataFrames into
 PyTorch DataLoaders.
 """
 
+import gc
+import weakref
 import zlib
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -199,6 +201,34 @@ def _init_worker(worker_id: int) -> None:
     torch.set_num_threads(1)
 
 
+# Every DataLoader build_loaders has handed out, weakly — see shutdown_loaders.
+_LIVE_LOADERS: "weakref.WeakSet[DataLoader]" = weakref.WeakSet()
+
+
+def shutdown_loaders() -> int:
+    """Stop the worker processes of every DataLoader build_loaders created.
+
+    A persistent-worker DataLoader only stops its workers when its iterator is
+    garbage-collected. In a Jupyter kernel that is not prompt: progress-bar
+    widgets and exception tracebacks keep references alive, and a probe run
+    measured a finished fold's 3 training workers (1.9 GiB) still alive after
+    the next fold had started. Across folds they accumulate until Windows
+    refuses new shared memory — "Couldn't open shared file mapping ... error
+    code 1455" (commit limit reached), which killed fold 6 of a local run. So
+    run_training calls this after every fold, whatever its outcome, instead of
+    waiting for the collector. Returns how many loaders had live workers."""
+    stopped = 0
+    for loader in list(_LIVE_LOADERS):
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+            stopped += 1
+        loader._iterator = None
+    _LIVE_LOADERS.clear()
+    gc.collect()
+    return stopped
+
+
 def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame,
                   batch_size: int, num_workers: int, pin_memory: bool,
                   praat_table: Optional[pd.DataFrame] = None,
@@ -312,4 +342,6 @@ def build_loaders(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.Data
     test_loader = DataLoader(
         dataset(test_df, with_speaker_labels=False), batch_size=batch_size, shuffle=False,
         **loader_kwargs(test_num_workers, persistent=False))
+    for loader in (train_loader, val_loader, test_loader):
+        _LIVE_LOADERS.add(loader)
     return train_loader, val_loader, test_loader

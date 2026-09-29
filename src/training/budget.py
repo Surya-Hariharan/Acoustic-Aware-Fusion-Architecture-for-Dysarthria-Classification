@@ -345,7 +345,7 @@ def benchmark_batch_sizes(df: pd.DataFrame, task: str, model_name: str,
     prints the fastest one that did not OOM.
 
     config.DEFAULT_BATCH_SIZE=32 was previously a comment-documented guess
-    ("tuned for an 8GB RTX 4060 with AMP") rather than a measurement on the
+    ("tuned for an 8GB GPU with AMP") rather than a measurement on the
     GPU actually running a given session. Call this once before
     ExperimentBudgetManager.benchmark() and pass the chosen batch_size into
     every TrainingConfig for the primary sweep (see

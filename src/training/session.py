@@ -110,7 +110,8 @@ def _measure(train_slice: pd.DataFrame, eval_slice: pd.DataFrame, model_name: st
     iteration, and leaving that cold start inside the eval measurement once
     reported eval as SLOWER than training.
     """
-    from src.training.data import build_loaders, build_speaker_label_map, compute_class_weights
+    from src.training.data import (build_loaders, build_speaker_label_map, compute_class_weights,
+                                   shutdown_loaders)
     from src.training.engine import build_optimizer, run_epoch
     from src.training.models import build_model
     from src.training.utils import (configure_local_runtime, resolve_amp_dtype,
@@ -120,10 +121,12 @@ def _measure(train_slice: pd.DataFrame, eval_slice: pd.DataFrame, model_name: st
     device = resolve_device(None)
     configure_local_runtime(device)
     speaker_label_map = build_speaker_label_map(train_slice)
+    # The same loader layout training uses (config EVAL_NUM_WORKERS for the
+    # eval loader), so the measured eval rate is the one training will see.
     train_loader, eval_loader, _ = build_loaders(
         train_slice, eval_slice, eval_slice.iloc[:0], batch_size, num_workers,
         pin_memory=(device.type == "cuda"), model_name=model_name,
-        speaker_label_map=speaker_label_map)
+        speaker_label_map=speaker_label_map, eval_num_workers=config.EVAL_NUM_WORKERS)
 
     num_classes = config.NUM_CLASSES[task]
     model = build_model(model_name, num_classes, num_speakers=len(speaker_label_map),
@@ -165,6 +168,10 @@ def _measure(train_slice: pd.DataFrame, eval_slice: pd.DataFrame, model_name: st
         peak_mb = (torch.cuda.max_memory_allocated(device) / 1024 ** 2
                    if device.type == "cuda" else 0.0)
     finally:
+        # Stop the persistent workers now: left to the garbage collector they
+        # can outlive this call in a notebook kernel and still hold ~2 GB of
+        # commit each when training starts.
+        shutdown_loaders()
         del model, optimizer, train_loader, eval_loader
         if device.type == "cuda":
             try:
