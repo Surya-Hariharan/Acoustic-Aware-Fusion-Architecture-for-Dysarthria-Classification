@@ -210,6 +210,7 @@ def test_every_wav2vec2_ablation_builds_and_steps(name):
 def test_thermal_guard_pauses_when_hot_and_resumes_once_cool(monkeypatch):
     from src.training import utils
 
+    monkeypatch.setattr(config, "THERMAL_GUARD_ENABLED", True)
     readings = iter([config.GPU_TEMP_PAUSE_C + 2, config.GPU_TEMP_RESUME_C + 4,
                      config.GPU_TEMP_RESUME_C - 1])
     sleeps = []
@@ -228,9 +229,21 @@ def test_thermal_guard_pauses_when_hot_and_resumes_once_cool(monkeypatch):
 def test_thermal_guard_disables_itself_when_the_sensor_is_unreadable(monkeypatch):
     from src.training import utils
 
+    monkeypatch.setattr(config, "THERMAL_GUARD_ENABLED", True)
     monkeypatch.setattr(utils, "gpu_temperature", lambda index=0: None)
     monkeypatch.setattr(utils.torch.cuda, "is_available", lambda: True)
     guard = utils.ThermalGuard()
     guard.check(force=True)
     guard.check(force=True)
     assert guard.pauses == 0 and guard._disabled
+
+
+def test_thermal_guard_is_off_by_default(monkeypatch):
+    from src.training import utils
+
+    calls = []
+    monkeypatch.setattr(utils, "gpu_temperature", lambda index=0: calls.append(1) or 99)
+    guard = utils.ThermalGuard()
+    guard.check(force=True)
+    guard.cool_down(max_wait_s=60)
+    assert guard.pauses == 0 and not calls                 # never even reads the sensor

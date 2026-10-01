@@ -154,7 +154,8 @@ class ThermalGuard:
         self.paused_seconds = 0.0
 
     def check(self, force: bool = False) -> None:
-        if self._disabled or not torch.cuda.is_available() or config.GPU_TEMP_PAUSE_C <= 0:
+        if (not config.THERMAL_GUARD_ENABLED or self._disabled
+                or not torch.cuda.is_available() or config.GPU_TEMP_PAUSE_C <= 0):
             return
         now = time.monotonic()
         if not force and now - self._last_check < config.GPU_TEMP_CHECK_INTERVAL_S:
@@ -174,6 +175,8 @@ class ThermalGuard:
                   reason: str = "") -> None:
         """Wait (up to max_wait_s) until the GPU is at or below the resume
         temperature. Returns at once if it already is."""
+        if not config.THERMAL_GUARD_ENABLED:
+            return
         temperature = gpu_temperature() if temperature is None else temperature
         if temperature is None or temperature <= config.GPU_TEMP_RESUME_C or max_wait_s <= 0:
             return

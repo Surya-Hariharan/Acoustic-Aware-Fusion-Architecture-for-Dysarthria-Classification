@@ -399,8 +399,9 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig) -> Tuple[pd.DataFrame, D
                             else "float32"))
     print_kv("Memory free at start", f"{memory['ram_available']:.1f} GiB RAM, "
                                      f"{memory['commit_available']:.1f} GiB commit")
-    print_kv("Thermal guard", f"pause at {config.GPU_TEMP_PAUSE_C} C, resume at "
-                              f"{config.GPU_TEMP_RESUME_C} C")
+    if config.THERMAL_GUARD_ENABLED:
+        print_kv("Thermal guard", f"pause at {config.GPU_TEMP_PAUSE_C} C, resume at "
+                                  f"{config.GPU_TEMP_RESUME_C} C")
     if cfg.session_hours:
         print_kv("Session cap", f"{cfg.session_hours:g} h")
     if cfg.limit_samples is not None or n_folds < len(config.DYSARTHRIC_IDS):
@@ -432,7 +433,7 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig) -> Tuple[pd.DataFrame, D
                               "re-run to continue.")
                     break
                 wait_for_ac_power()
-                if fold_times and config.FOLD_COOLDOWN_S:
+                if fold_times and config.THERMAL_GUARD_ENABLED and config.FOLD_COOLDOWN_S:
                     THERMAL_GUARD.cool_down(max_wait_s=config.FOLD_COOLDOWN_S,
                                             reason="still warm from the previous fold")
                 fold_started = time.monotonic()

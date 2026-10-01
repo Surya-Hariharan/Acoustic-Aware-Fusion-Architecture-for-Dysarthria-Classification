@@ -207,16 +207,16 @@ CUDA_MEMORY_FRACTION = 0.90
 CUDNN_BENCHMARK = True                                 # fixed 4 s input -> autotuned kernels
 FEATURE_STORE_WORKERS = 8                              # upper bound, shrunk to free memory
 
-# Thermal guard (src.training.utils.ThermalGuard). Laptop GPUs throttle
-# themselves near 87 C; sustained operation there for hours is what shortens
-# their life. Training pauses between batches when the GPU reaches
-# GPU_TEMP_PAUSE_C and resumes once it has cooled to GPU_TEMP_RESUME_C.
+# Optional thermal guard (src.training.utils.ThermalGuard), OFF: training runs
+# without pausing and the GPU's own firmware throttles clocks if it gets hot.
+# True pauses between batches at GPU_TEMP_PAUSE_C until GPU_TEMP_RESUME_C, and
+# between folds for up to FOLD_COOLDOWN_S.
+THERMAL_GUARD_ENABLED = False
 GPU_TEMP_PAUSE_C = 83
 GPU_TEMP_RESUME_C = 72
 GPU_TEMP_CHECK_INTERVAL_S = 15.0
 GPU_COOLDOWN_MAX_WAIT_S = 600                          # resume anyway after this; the note says so
-# Pause between folds so the GPU starts each fold cool (0 disables).
-FOLD_COOLDOWN_S = 60
+FOLD_COOLDOWN_S = 60                                   # only with THERMAL_GUARD_ENABLED
 # Refuse to start training on battery power: the GPU drops to a fraction of
 # its clocks and a multi-hour run would drain the battery mid-fold.
 REQUIRE_AC_POWER = True

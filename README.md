@@ -142,7 +142,7 @@ A held-out speaker has a single true class, so per-fold macro-F1, balanced accur
 Everything runs from `notebooks/training.ipynb` (**Run All**), measured on an RTX 4060 Laptop (8 GB, 88 W) with 16 GB RAM under Windows 11.
 
 - **Measured, not assumed.** Section 6 times real training steps on this machine (~1 min) and projects the run time before the run starts.
-- **Thermal guard.** Between batches, training pauses when the GPU reaches **83 °C** and resumes at **72 °C**, and each fold starts cool (`config.GPU_TEMP_*`, `FOLD_COOLDOWN_S`). It reads the sensor through `nvidia-smi`; pauses change only *when* work happens, never *what* is computed.
+- **No thermal pauses.** Training runs straight through; the GPU's own firmware throttles clocks if it runs hot. An optional pause-and-resume guard exists behind `config.THERMAL_GUARD_ENABLED` (off).
 - **Power and sleep.** Training waits for the charger if the laptop is on battery, and keeps Windows awake while it runs. Lid closing still follows its own Windows setting — keep the lid open or set *When I close the lid → Do nothing* while plugged in.
 - **Memory.** On Windows every DataLoader worker is a spawned process costing ~2 GB of commit, so training uses one persistent worker and evaluates in-process; worker counts are re-sized to the memory free before every fold. PyTorch's VRAM share is capped at 90% so an overflow raises a clean OOM instead of silently spilling into system RAM (which slows training ~10×).
 - **Self-healing.** A failing fold is retried with an adapted configuration: CUDA OOM → half batch × 2 accumulation (same effective batch); host memory → no workers; divergence → restart in float32.
