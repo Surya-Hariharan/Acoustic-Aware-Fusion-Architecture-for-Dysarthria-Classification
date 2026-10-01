@@ -1,46 +1,16 @@
 """
-Voice activity detection: Silero VAD, replacing torchaudio.functional.vad.
+Voice activity detection with Silero VAD (torch.hub, pinned to the v6.2.1
+release so every machine resolves the same model).
 
-torchaudio.functional.vad() is a forward-only energy-ramp detector — it trims
-LEADING silence only, never trailing silence, and has no concept of "internal
-pause vs. trailing silence". Combined with load_and_preprocess()'s fixed 4s
-pad/truncate window (src/preprocessing.py), that left most of every clip a
-near-constant zero-padded tail after the (short, single-word) UA-Speech
-utterance — the artifact visible in MFCC plots.
+apply_vad() keeps the contiguous span from the first detected speech segment
+to the last (plus a margin), so leading and trailing non-speech are removed and
+internal pauses are preserved. It never raises and never returns an empty
+waveform: any failure falls back to the original waveform, recorded as
+fallback_used in the returned stats.
 
-Silero VAD is a small neural voice-activity model (github.com/snakers4/silero-vad,
-loaded once per process via torch.hub, run in eval() with no dropout — inference
-is deterministic given fixed weights). apply_vad() below:
-  - finds the speech span [first_segment.start - pad, last_segment.end + pad]
-    and slices to it, so LEADING and TRAILING non-speech are both removed but
-    any internal pause between detected segments is preserved (the slice is
-    contiguous, not a concatenation of only the speech segments);
-  - never raises and never returns an empty waveform: any failure (model load
-    error, zero detected segments, a trimmed span shorter than
-    config.VAD_MIN_SPEECH_MS) falls back to the ORIGINAL waveform unchanged,
-    with fallback_used=True recorded in the returned stats.
-
-Reproducibility note: torch.hub.load("snakers4/silero-vad", ...) resolves the
-repo's default branch unless pinned to a tag. VAD_REPO is pinned to the
-"v6.2.1" release tag (github.com/snakers4/silero-vad/releases/tag/v6.2.1) so
-that repeat runs across machines/dates resolve the same model code rather
-than silently tracking upstream's moving default branch.
-
-Concurrent-download note: torch.hub.load() downloads+extracts a repo zipball
-into a directory named "<owner>_<repo>_<ref>" under torch.hub.get_dir(), but
-GitHub's zipball extracts to "<owner>-<repo>-<short_commit_sha>" internally,
-so torch.hub renames the extracted folder after the fact. That
-download-extract-rename sequence is NOT process-safe: if several processes
-call torch.hub.load() for the same repo at the same moment (e.g. every
-ProcessPoolExecutor worker in precompute_framewise_feature_cache lazily
-loading VAD on its first file), they race on the same target directory,
-"Directory not empty" is raised mid-rename, and the cache is left with the
-commit-hash-named directory but no "<owner>_<repo>_<ref>/hubconf.py" — every
-later load in every worker then fails identically, forever, once per file.
-warmup_silero_vad() (called once, synchronously, in the main process before
-workers are spawned) exists specifically to populate the on-disk cache
-BEFORE any concurrency starts, so worker processes' own load_silero_vad()
-calls are local reads, not downloads.
+torch.hub's download-extract-rename is not process-safe, so
+warmup_silero_vad() loads and verifies the model once in the main process
+before any worker pool starts; workers then read the local cache.
 """
 
 import shutil
@@ -61,12 +31,7 @@ _UTILS = None
 # broken/unreachable torch.hub cache is retried once, not once per file (see
 # _ensure_loaded_or_disabled).
 _INIT_ERROR: Optional[str] = None
-# Set once warmup_silero_vad() has verified the model in this process. The
-# notebook's main process calls it from three separate call sites in one run
-# (precompute_vad_span_cache, verify_vad_span_cache,
-# precompute_framewise_feature_cache) — without this flag each one re-runs the
-# dummy-inference smoke test and reprints "initialized and verified", which is
-# redundant noise once the first call already proved the model works.
+# Set once warmup_silero_vad() has verified the model in this process.
 _WARMED_UP = False
 
 
@@ -111,7 +76,7 @@ def _clear_stale_silero_cache() -> None:
 def warmup_silero_vad() -> None:
     """Load Silero VAD once, synchronously, and verify it actually runs on a
     dummy waveform — call this ONCE in the main process, before handing work
-    to ProcessPoolExecutor workers (see precompute_framewise_feature_cache).
+    to a worker pool (see src.feature_store.build_feature_store).
 
     Populating the on-disk torch.hub cache here, before any worker process
     exists, is what prevents the multi-process download race described in

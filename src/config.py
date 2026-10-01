@@ -1,9 +1,11 @@
 """
-Central configuration for the UA-Speech Dysarthria Classification project.
+Central configuration: paths, speaker ground truth, label maps, preprocessing,
+architecture and training hyperparameters, and the local hardware profile.
 
-All paths, constants, speaker ground truth, and label mappings live here so
-every module (scanning, preprocessing, dataset, splits, models) reads from a
-single source of truth.
+Every module reads from here, so a value changed here is changed everywhere.
+Values that enter src.feature_store.store_signature() (VAD, MFCC, window,
+channel counts) also key the on-disk feature store: changing one invalidates
+it and the next run rebuilds it.
 """
 
 import os
@@ -19,98 +21,36 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-DATA_DIR     = PROJECT_ROOT / "data"            # root data folder
-ARCHIVE_DIR  = DATA_DIR / "raw"                 # place UASpeech .tgz files here
-AUDIO_DIR    = DATA_DIR / "extracted"           # extracted .wav files land here (audio/original only)
-CORPUS_DOCS_DIR = DATA_DIR / "uaspeech_corpus_docs"  # extracted doc/mlf/license/readme, kept out of AUDIO_DIR
-OUTPUT_DIR   = PROJECT_ROOT / "outputs"         # reports / CSVs
-FIGURE_DIR   = OUTPUT_DIR / "figures"           # saved plots
-ERROR_FIGURE_DIR = FIGURE_DIR / "errors"        # Phase 5: per-utterance error diagnostics
-MANIFEST_PATH = OUTPUT_DIR / "m6_manifest.csv"  # scanned+filtered+labeled M6 utterances
-PRAAT_FEATURES_PATH = OUTPUT_DIR / "praat_features.csv"  # Phase 4: per-utterance acoustic features
+DATA_DIR = PROJECT_ROOT / "data"
+ARCHIVE_DIR = DATA_DIR / "raw"                         # UA-Speech .tgz archives
+AUDIO_DIR = DATA_DIR / "extracted"                     # extracted .wav (audio/original only)
+CORPUS_DOCS_DIR = DATA_DIR / "uaspeech_corpus_docs"    # corpus docs/MLF/license, kept apart
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
+MANIFEST_PATH = OUTPUT_DIR / "m6_manifest.csv"
 
-# Disk-persisted cache for the three-branch model's per-frame Praat features
-# (framewise formants/HNR, framewise F0/voicing/intensity) — these run ~2,000
-# individual parselmouth calls per file, so an in-memory-only lru_cache (see
-# src/preprocessing.py) is cold on every process/worker restart and is the
-# single largest cost in training. This directory lets that cost be paid once.
+# Chunked feature store (src/feature_store.py): one compressed .npz per
+# (speaker, block) holding VAD spans + raw segmental (43ch) + suprasegmental
+# (3ch) features. FEATURE_STORE_EXTRA_DIRS are searched read-only after it
+# (also settable via the FEATURE_STORE_EXTRA_DIRS env var, os.pathsep-separated).
 FEATURE_CACHE_DIR = OUTPUT_DIR / "feature_cache"
-SEGMENTAL_EXTRA_CACHE_DIR = FEATURE_CACHE_DIR / "segmental_extra"
-SUPRASEGMENTAL_CACHE_DIR = FEATURE_CACHE_DIR / "suprasegmental"
-
-# Filename -> Silero VAD (start, end) sample spans, for BOTH preprocessing
-# profiles (speech-focused VAD_SPEECH_PAD_MS, temporal-preserving
-# SUPRA_VAD_SPEECH_PAD_MS). See src/vad_cache.py.
-#
-# apply_vad's only effect on the signal is waveform[:, start:end], so storing
-# those two integers and slicing from them is bit-identical to re-running the
-# model — with none of the cost. Without this, UASpeechDataset.__getitem__ ran
-# TWO Silero forward passes per utterance per epoch (~21,400 per epoch), which
-# measured as ~81% of per-item CPU time and left the GPU idle: a Kaggle T4 run
-# clocked a flat 8.5 samples/sec at batch sizes 16, 24 AND 32, using only
-# 4.2 GB of 15 GB.
-#
-# ~0.5 MB of parquet for the full 21,420-file M6 manifest — small enough to
-# commit and to ship inside a Kaggle dataset, which is the point.
-VAD_SPAN_CACHE_PATH = FEATURE_CACHE_DIR / "vad_spans.parquet"
-
-# Chunked, resumable feature store (src/feature_store.py): one compressed .npz
-# per (speaker, block) with VAD spans + raw segmental (43ch) + suprasegmental
-# (3ch) features. Consulted BEFORE the parquet span table and the per-file
-# .npy caches above, which remain as fallbacks. FEATURE_STORE_EXTRA_DIRS are
-# searched read-only after it — e.g. a previous Kaggle session's committed
-# output attached as a dataset (also settable via the FEATURE_STORE_EXTRA_DIRS
-# environment variable, os.pathsep-separated).
 FEATURE_STORE_DIR = FEATURE_CACHE_DIR / "store"
 FEATURE_STORE_EXTRA_DIRS: list = []
-# A chunk (255 utterances) takes a few minutes on one Kaggle vCPU; no chunk
-# finishing in 30 minutes means a stuck round, not a slow one.
+# No chunk (255 utterances) finishing in 30 minutes means a stuck build round.
 FEATURE_STORE_STALL_TIMEOUT_S = 1800
 
-# Three-branch severity architecture's figure/table/diagnostic subdirectories
-# (architecture plan Work Package C) — kept as separate named constants
-# rather than folded into FIGURE_DIR/ERROR_FIGURE_DIR so each analysis
-# module writes to an unambiguous, predictable location instead of every
-# figure type landing flat in FIGURE_DIR.
-SIGNAL_FIGURE_DIR         = FIGURE_DIR / "signals"          # waveform/spectrogram/MFCC/F0 panels
-REPRESENTATION_FIGURE_DIR = FIGURE_DIR / "representations"  # PCA/UMAP embedding maps
-EXPLAINABILITY_FIGURE_DIR = FIGURE_DIR / "explainability"   # SHAP, permutation importance
-ABLATION_FIGURE_DIR       = FIGURE_DIR / "ablation"         # branch ablation, gate analysis
-METRIC_FIGURE_DIR         = FIGURE_DIR / "metrics"          # confusion matrices, ROC/PR overlays
-TABLES_DIR                = OUTPUT_DIR / "tables"           # paper-ready CSV tables
-DIAGNOSTICS_DIR           = OUTPUT_DIR / "diagnostics"      # VAD stats, feature-audit dumps, etc.
-
-# Training pipeline outputs (train.py)
-CHECKPOINT_DIR       = OUTPUT_DIR / "checkpoints"
-LOG_DIR              = OUTPUT_DIR / "logs"
-PREDICTIONS_DIR      = OUTPUT_DIR / "predictions"
-METRICS_DIR          = OUTPUT_DIR / "metrics"
+# Per-run training artifacts, each under <dir>/<run_name>/.
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+LOG_DIR = OUTPUT_DIR / "logs"                          # TensorBoard + fold tracebacks
+PREDICTIONS_DIR = OUTPUT_DIR / "predictions"
+METRICS_DIR = OUTPUT_DIR / "metrics"
 CONFUSION_MATRIX_DIR = OUTPUT_DIR / "confusion_matrix"
-ROC_DIR              = OUTPUT_DIR / "roc"
-EMBEDDINGS_DIR       = OUTPUT_DIR / "embeddings"
+ROC_DIR = OUTPUT_DIR / "roc"
+EMBEDDINGS_DIR = OUTPUT_DIR / "embeddings"
+RESULTS_DIR = OUTPUT_DIR / "results"                   # frozen run configurations
 
-# Per-experiment output bundles (config/metrics/predictions/timing/checkpoint in one
-# folder) for the budget-managed primary-detection sweep — see src/training/reporting.py
-# ::save_experiment_bundle. Additive to the flat dirs above, which every run (old and
-# new) continues to use; nothing reads EXPERIMENTS_DIR except the new sweep's own
-# consumers (notebooks/03_training.ipynb, requirement-7 comparison table).
-EXPERIMENTS_DIR      = OUTPUT_DIR / "experiments"
-
-# Final reporting gate output (notebooks/06_results.ipynb). Holds only what
-# survived the eligibility filter in src/results.py, plus the excluded/
-# preliminary registers and the reproducibility manifest — the folder to hand
-# off when writing the paper. Distinct from OUTPUT_DIR/paper_exports, which is
-# a copy-and-format step; this is the gated source of truth.
-RESULTS_DIR          = OUTPUT_DIR / "results"
-
-# Filenames as actually distributed to this project (data/raw/) — the
-# corpus's "audio/original" release, not "audio/normalized" or
-# "audio/noisereduce" (both absent from these archives; see
-# src/extraction.py's module docstring for what that means for this
-# pipeline's preprocessing assumptions).
 ARCHIVE_FILES = [
-    "UASpeech_original_C.tgz",                  # healthy controls
-    "UASpeech_original_FM.tgz",                 # dysarthric speakers
+    "UASpeech_original_C.tgz",                         # healthy controls
+    "UASpeech_original_FM.tgz",                        # dysarthric speakers
 ]
 
 # ---------------------------------------------------------------------------
@@ -128,36 +68,9 @@ DYSARTHRIC_IDS = [
     "M09", "M10", "M11", "M12", "M14", "M16",
 ]
 
-def _interleave_by_class(controls, dysarthric):
-    """Alternate control and dysarthric speakers so that EVERY PREFIX of the
-    result contains both classes (from length 2 onward), with the longer list's
-    leftovers appended at the end.
+ALL_SPEAKERS = CONTROL_IDS + DYSARTHRIC_IDS
 
-    This is the order src.splits.iter_loso_folds walks, and therefore the order
-    a detection LOSO run evaluates speakers in. The previous plain
-    `CONTROL_IDS + DYSARTHRIC_IDS` put all 13 controls first, which meant any
-    run that stopped early — a time budget, a crash, an interrupted session —
-    had evaluated ONLY healthy controls. Since UA-Speech detection labels are
-    speaker-level, each of those folds was single-class, so precision, recall,
-    F1 and AUROC were all undefined for the entire partial run (see
-    src.training.metrics' module docstring). That is exactly what happened to
-    every truncated detection run in the pre-repair audit.
-
-    A COMPLETE LOSO sweep is order-independent: it visits all 28 speakers and
-    pools their predictions regardless of sequence, so no finished result
-    changes and this is a bug fix rather than a protocol change. What it buys
-    is that a PARTIAL run is now class-balanced, and therefore honestly
-    reportable as a partial result instead of a degenerate one.
-    """
-    interleaved = []
-    for pair in zip_longest(controls, dysarthric):
-        interleaved.extend(speaker for speaker in pair if speaker is not None)
-    return interleaved
-
-
-ALL_SPEAKERS = _interleave_by_class(CONTROL_IDS, DYSARTHRIC_IDS)
-
-# Severity mapping for the 15 dysarthric speakers (base-paper protocol)
+# Severity of the 15 dysarthric speakers (UA-Speech intelligibility groups).
 SEVERITY_MAP = {
     "M01": "Very Low", "M04": "Very Low", "F03": "Very Low", "M12": "Very Low",
     "M07": "Low",      "F02": "Low",      "M16": "Low",
@@ -166,386 +79,155 @@ SEVERITY_MAP = {
     "M08": "High",     "F05": "High",
 }
 
+SEVERITY_CLASS_NAMES = ["Very Low", "Low", "Mid", "High"]
+NUM_CLASSES = len(SEVERITY_CLASS_NAMES)
+SEVERITY_LABEL_MAP = {name: i for i, name in enumerate(SEVERITY_CLASS_NAMES)}
+SEVERITY_LABEL_MAP["N/A (Control)"] = -1
+
 
 def _interleave_by_severity(dysarthric_ids, severity_map):
-    """Round-robin the 15 dysarthric speakers across their four severity
-    classes (Very Low, Low, Mid, High), one speaker per class per round, so
-    that EVERY PREFIX of the result is as class-balanced as the remaining
-    pool allows — the same idea as _interleave_by_class above, applied to
-    four groups instead of two.
-
-    A COMPLETE 15-fold severity LOSO sweep is order-independent (see
-    src.splits.iter_severity_loso_folds's docstring: it pools all 15
-    speakers' predictions regardless of sequence), so this changes nothing
-    about the primary result. What it buys is that a budget-truncated run
-    (TrainingConfig.max_folds < 15, used when a Kaggle session cannot afford
-    all 15 folds) evaluates a representative slice of severity classes
-    instead of whichever speakers happen to sort first in DYSARTHRIC_IDS —
-    e.g. the current DYSARTHRIC_IDS order happens to front-load Very Low/Low
-    speakers, which is not a property anyone chose on purpose.
-    """
-    class_order = ("Very Low", "Low", "Mid", "High")
-    groups = [[s for s in dysarthric_ids if severity_map[s] == cls] for cls in class_order]
-    interleaved = []
-    for round_ in zip_longest(*groups):
-        interleaved.extend(speaker for speaker in round_ if speaker is not None)
-    return interleaved
+    """Round-robin the dysarthric speakers across the four severity classes,
+    so every prefix of the LOSO fold order is as class-balanced as possible.
+    A complete 15-fold sweep is order-independent; this only makes a partial
+    run (max_folds, or an interrupted session) cover every class early."""
+    groups = [[s for s in dysarthric_ids if severity_map[s] == cls]
+              for cls in SEVERITY_CLASS_NAMES]
+    return [speaker for round_ in zip_longest(*groups) for speaker in round_
+            if speaker is not None]
 
 
-# Traversal order for src.splits.iter_severity_loso_folds — a permutation of
-# DYSARTHRIC_IDS (same 15 speakers, same full-run result), reordered so a
-# TrainingConfig(max_folds=N) truncation stays class-representative. See
-# _interleave_by_severity's docstring.
 SEVERITY_LOSO_ORDER = _interleave_by_severity(DYSARTHRIC_IDS, SEVERITY_MAP)
 
-# SECONDARY-ANALYSIS ONLY. The three-branch severity architecture's PRIMARY
-# protocol (src.splits.iter_severity_loso_folds) is full-population Leave-
-# One-Speaker-Out across all 15 dysarthric speakers — it does NOT drop any
-# speaker. Discarding 3 of 15 speakers (20% of an already-small population)
-# to force a balanced 3-per-class split is a real statistical-power cost, and
-# the architecture handles class imbalance instead at the loss/metric level
-# (class-weighted CORAL loss, macro-F1, balanced accuracy, per-class recall).
-#
-# This list is kept only so the ORIGINAL base-paper-style protocol — 3-per-
-# class, leave-one-speaker-per-class-out (src.splits.build_severity_folds /
-# get_severity_split, 81 = 3^4 combinations) — remains available as an
-# explicitly-labeled, budget-capped SECONDARY sanity check, matching
-# Javanmardi et al., ICASSP 2023 (arXiv:2309.14107): "one male speaker from
-# 'very low' level of intelligibility and two male speakers from 'high'
-# level of intelligibility" were left out. The paper doesn't name which two
-# High speakers, so M08/M09 (both male, like the paper's excluded pair) is
-# still a choice, not a reproduction of an unpublished detail.
-#
-# NOTE ON DOCUMENTATION DRIFT: an earlier README revision listed this set as
-# ["M12", "M08", "F05"] — that dropped the female High speaker instead of a
-# second male one, contradicting the paper's own "two male speakers" wording.
-# The current value below is the corrected one; the README has been updated
-# to match (see "Severity — secondary balanced analysis").
-DROPPED_FOR_BALANCE = ["M12", "M08", "M09"]     # 1 Very Low, 2 High (all male)
-
-# Primary severity evaluation protocol for the one-shot three-branch run.
-# "full_loso": Leave-One-Speaker-Out across all 15 dysarthric speakers
-# (src.splits.iter_severity_loso_folds) — the default and the one used for
-# the reported result. "balanced_lopco": the legacy 3-per-class, 81-fold
-# leave-one-per-class-out protocol above, run only as a secondary check.
-SEVERITY_PRIMARY_PROTOCOL = "full_loso"
-
 # ---------------------------------------------------------------------------
-# Dataset protocol
+# Dataset protocol and audio preprocessing
 # ---------------------------------------------------------------------------
-TARGET_MIC        = "M6"                        # microphone channel used
-WORDS_PER_SPEAKER = 765                         # expected utterances / speaker
+TARGET_MIC = "M6"                                      # microphone channel used
+WORDS_PER_SPEAKER = 765                                # 3 blocks x 255 words
 
-# ---------------------------------------------------------------------------
-# Audio preprocessing
-# ---------------------------------------------------------------------------
-TARGET_SR    = 16_000                           # 16 kHz mono
-CLIP_SECONDS = 4.0                              # fixed analysis window
-MAX_SAMPLES  = int(TARGET_SR * CLIP_SECONDS)
+TARGET_SR = 16_000                                     # 16 kHz mono
+CLIP_SECONDS = 4.0                                     # fixed analysis window
+MAX_SAMPLES = int(TARGET_SR * CLIP_SECONDS)            # 64,000 samples -> 401 frames
 
-# MFCC settings: 13 coefficients (+ delta + delta-delta = 39-dim per frame)
-N_MFCC       = 13
-MEL_KWARGS   = {"n_fft": 400, "hop_length": 160, "n_mels": 40}
+N_MFCC = 13                                            # + delta + delta-delta = 39
+MEL_KWARGS = {"n_fft": 400, "hop_length": 160, "n_mels": 40}   # 25 ms / 10 ms
 
-# ---------------------------------------------------------------------------
-# Voice activity detection (Silero VAD, replacing torchaudio.functional.vad —
-# see src/vad.py). torchaudio's vad() only trims LEADING silence; trailing
-# silence and the fixed 4s pad/truncate window in load_and_preprocess() were
-# together the source of the large near-constant tail visible in MFCC plots.
-# ---------------------------------------------------------------------------
-VAD_ENABLED         = True    # False -> load_and_preprocess() skips VAD entirely
-                               # (only pad/truncate), for A/B comparison or if
-                               # torch.hub is unreachable in an offline session.
-VAD_THRESHOLD       = 0.5     # Silero speech-probability threshold (its own default)
-VAD_MIN_SPEECH_MS   = 100     # shorter detected segments are not "speech" — UA-Speech
-                               # utterances are short isolated words, so this is kept
-                               # low relative to Silero's usual 250ms conversational default
-VAD_MIN_SILENCE_MS  = 100     # internal gaps shorter than this stay merged into the
-                               # surrounding speech segment, preserving natural pauses
-VAD_SPEECH_PAD_MS   = 30      # padding added around the kept [first..last] speech span
-VAD_SAMPLE_RATE     = 16_000  # must match TARGET_SR — Silero only accepts 8k/16k
-VAD_STATS_PATH      = OUTPUT_DIR / "vad_stats.csv"   # per-utterance VAD stats (Stage 9)
+# Silero VAD (src/vad.py): trims leading/trailing non-speech to the contiguous
+# first..last speech span, so internal pauses are preserved.
+VAD_ENABLED = True
+VAD_THRESHOLD = 0.5                                    # Silero's own default
+VAD_MIN_SPEECH_MS = 100                                # isolated words: below Silero's 250 ms default
+VAD_MIN_SILENCE_MS = 100                               # shorter gaps stay inside the span
+VAD_SPEECH_PAD_MS = 30                                 # speech-focused profile (learned + segmental)
+SUPRA_VAD_SPEECH_PAD_MS = 150                          # temporal-preserving profile (suprasegmental)
+VAD_SAMPLE_RATE = 16_000                               # must equal TARGET_SR
 
-# Temporal-preserving profile, feeding ONLY the Suprasegmental branch. Same
-# Silero VAD trim as the speech-focused profile above (contiguous first-to-
-# last speech, internal pauses already preserved by design), but with a much
-# wider padding margin around the kept span, to protect the onset/offset
-# dynamics (breathiness ramp-in, voicing decay) that a prosodic/temporal
-# encoder needs and a 30ms margin can clip. Still pad/truncated to the same
-# MAX_SAMPLES window for batching (see src.preprocessing.load_and_preprocess_supra),
-# with valid_length propagated so padding is masked, not treated as silence.
-SUPRA_VAD_SPEECH_PAD_MS = 150
-
-# Per-(process, filepath) memoization cap for src.preprocessing's cached
-# loaders — see load_and_preprocess_cached / extract_mfcc_features_cached.
-# Every DataLoader worker process holds its own cache up to this many
-# utterances; ~256 KB/waveform + ~62 KB/MFCC at CLIP_SECONDS=4.0, so this is
-# roughly 160 MB per worker (x num_workers processes — see
-# TrainingConfig.num_workers). Set to 0 to disable caching entirely.
-#
-# 4000 -> 512: at 4000 the four workers reserved ~5 GB between them to
-# paper over a cache MISS that cost ~50 ms (two Silero VAD forward passes and
-# two file loads). Against a 9,639-utterance shuffled train split the LRU
-# thrashed anyway, so it bought little for that memory. With the VAD spans on
-# disk (VAD_SPAN_CACHE_PATH above) a miss costs ~10 ms, so the LRU stops being
-# load-bearing and the RAM is better spent on DataLoader prefetch depth.
-# 512 -> 64: with the feature store serving every engineered feature (as
-# shared memory maps), these LRUs only save a ~5 ms wav read per hit — not
-# worth ~200 MB in each of several spawned DataLoader worker processes on a
-# 16 GB machine.
+# Per-process LRU size for the preprocessing getters. The feature store serves
+# every engineered feature, so these only save a ~5 ms wav read per hit.
 PREPROCESS_CACHE_SIZE = 64
 
-# Recycle each precompute worker after this many tasks, in the one-time
-# VAD-span and Praat-feature precompute passes (src.vad_cache,
-# src.preprocessing) only — never in the DataLoader hot path. praat-parselmouth
-# and torch.hub's Silero both hold C-level state (Sound/Pitch/Formant objects,
-# CUDA/CPU tensors) that does not fully release back to the OS across tens of
-# thousands of calls in one long-lived process; a Kaggle run over the full
-# 21,420-utterance M6 manifest was observed slowing from ~22 files/s to
-# <1 file/s over the first 10 minutes of the Praat pass, then going silent —
-# textbook gradual worker RSS growth ending in an OOM kill with no Python
-# traceback.
-#
-# NOT passed to ProcessPoolExecutor's own max_tasks_per_child anymore. Three
-# independent Kaggle runs all stalled at EXACTLY n_workers * this value —
-# 4 * 200 = 800 completed tasks — which is ProcessPoolExecutor's own in-place
-# worker-respawn hanging in this environment (a CUDA-initialized main
-# process), not a slow file. src.parallel.resilient_process_map now bounds
-# per-worker task count itself, by processing items in batches of
-# n_workers * PRECOMPUTE_MAX_TASKS_PER_CHILD and fully tearing down and
-# recreating the pool between batches — see that module's docstring for the
-# full evidence trail.
-PRECOMPUTE_MAX_TASKS_PER_CHILD = 200
-
-# If no task in a precompute pass (src.vad_cache, src.preprocessing) completes
-# within this many seconds while work remains, the pass assumes the
-# outstanding task(s) are permanently stuck (a corrupt file, a decode hang —
-# see src.parallel.resilient_process_map) rather than merely slow, kills the
-# stalled worker process(es), logs which file(s) were skipped, and continues
-# with the rest instead of hanging silently forever.
-#
-# Now that the pool-recycling hang (see PRECOMPUTE_MAX_TASKS_PER_CHILD above)
-# is fixed at its actual source — batch teardown/recreate instead of
-# ProcessPoolExecutor's internal respawn — this watchdog reverts to guarding
-# against what it was originally meant for: a genuinely poisoned single file.
-# 180s is still >1000x the ~30-80 ms a single file normally costs.
-PRECOMPUTE_STALL_TIMEOUT_S = 180
-
 # ---------------------------------------------------------------------------
-# Label mappings
-# ---------------------------------------------------------------------------
-GROUP_LABEL_MAP = {
-    "Healthy Control":    0,
-    "Dysarthric Patient": 1,
-}
-
-SEVERITY_LABEL_MAP = {
-    "Very Low":        0,
-    "Low":             1,
-    "Mid":             2,
-    "High":            3,
-    "N/A (Control)":  -1,
-}
-
-# ---------------------------------------------------------------------------
-# Model / architecture (from the team spec)
+# Architecture (src/models/gated_fusion.py)
 # ---------------------------------------------------------------------------
 WAV2VEC_MODEL_NAME = "facebook/wav2vec2-base-960h"
-WAV2VEC_EMBED_DIM  = 768                        # latent embedding size
-
-# Read from the environment (`setx HF_TOKEN ...` / `$env:HF_TOKEN = ...`) rather
-# than hard-coded, so the token never lands in source control. Public models like
-# WAV2VEC_MODEL_NAME load fine without it; passing it when present just lifts the
-# unauthenticated-request rate limit and lets the same code load gated/private
-# checkpoints without a separate code path.
+WAV2VEC_EMBED_DIM = 768
+# Optional; lifts the Hugging Face rate limit. The checkpoint is public.
 HF_TOKEN = os.environ.get("HF_TOKEN")
-ACOUSTIC_EMBED_DIM = 128                        # 1D-CNN output embedding size
 
-LORA_RANK          = 8
-LORA_ALPHA         = 16
-LORA_DROPOUT       = 0.1
-# q/k/v self-attention projections in every Wav2Vec2 encoder layer. This is
-# the implemented LoRA scope for both the legacy variants and GatedFusionModel.
-LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj"]   # self-attention layers
+LORA_RANK = 8
+LORA_ALPHA = 16
+LORA_DROPOUT = 0.1
+LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj"]  # all 12 encoder layers
 
-# The selected CTC checkpoint has no ``masked_spec_embed`` weight, while
-# Transformers 5.5.4 would otherwise create a random one for training-time
-# SpecAugment. Keep the pretrained encoder path deterministic and entirely
-# pretrained by disabling that incompatible augmentation before model loading.
+# The CTC checkpoint has no pretrained masked_spec_embed; SpecAugment would
+# create a random one. Disabled before model construction (deep_pathway.py).
 WAV2VEC_APPLY_SPEC_AUGMENT = False
+# Recompute wav2vec2 activations in backward instead of storing them. Identical
+# gradients; measured on this machine: off = +32% throughput at 5.8 GB VRAM.
+WAV2VEC_GRADIENT_CHECKPOINTING = False
 
-# Recompute wav2vec2 activations in backward instead of storing them (see
-# src.models.deep_pathway). A pure speed/memory trade — identical gradients.
-# True keeps the historical behaviour; src.training.session.
-# benchmark_batch_sizes measures both settings so a run can turn it off when
-# the GPU has the memory to spare (the T4 run peaked at 3.6 of 15.6 GB).
-WAV2VEC_GRADIENT_CHECKPOINTING = False   # measured: +32% throughput, 5.8 GB peak VRAM at batch 32
+LEARNED_EMBED_DIM = 128                                # Z_learned (768 -> 128)
+SEGMENTAL_EMBED_DIM = 64                               # Z_segmental
+SUPRA_EMBED_DIM = 64                                   # Z_supra
+FUSED_EMBED_DIM = LEARNED_EMBED_DIM + SEGMENTAL_EMBED_DIM + SUPRA_EMBED_DIM   # 256
 
-# Phase 6: attention-based fusion. The 768-dim deep and 128-dim acoustic frame
-# sequences are projected into a shared FUSION_ATTN_DIM space so cross-attention
-# between them is well-defined (queries and keys must share a dimension).
-FUSION_ATTN_DIM     = 256
-FUSION_ATTN_HEADS   = 4          # 256 / 4 = 64 dims per head
-FUSION_ATTN_DROPOUT = 0.1
-PRAAT_EMBED_DIM     = 256        # Praat pathway (Model F): FEATURE_COLUMNS -> one token
+SEGMENTAL_CHANNELS = 3 * N_MFCC + 3 + 1                # MFCC+d+dd (39) + F1-F3 + HNR = 43
+SUPRA_CHANNELS = 3                                     # F0 semitones, voicing, intensity dB
 
-# ---------------------------------------------------------------------------
-# Three-branch gated-fusion severity architecture (src/models/gated_fusion.py)
-#
-# Every branch is bottlenecked to a small, fixed dimension BEFORE fusion —
-# the mechanism that forces each branch to keep only decision-relevant
-# information (see the architecture plan's Part 2, Component 7). Read from
-# here everywhere downstream (feature-audit printer, tests) rather than
-# hardcoded, so a change here is guaranteed to be reflected everywhere.
-# ---------------------------------------------------------------------------
-LEARNED_EMBED_DIM   = 128        # Z_learned: wav2vec2+LoRA, mean-pooled, projected 768->128
-SEGMENTAL_EMBED_DIM  = 64        # Z_segmental: MFCC+formant+HNR frame-CNN, projected 128->64
-SUPRA_EMBED_DIM      = 64        # Z_supra: F0/voicing/energy frame-CNN, projected ->64
-FUSED_EMBED_DIM       = SEGMENTAL_EMBED_DIM + SUPRA_EMBED_DIM + LEARNED_EMBED_DIM  # 256
-
-# Framewise segmental channels: 13 MFCC + 13 delta + 13 delta-delta (existing)
-# plus 3 framewise formants (F1-F3) and framewise HNR — see src.praat's
-# extract_formant_sequence / extract_hnr_sequence.
-SEGMENTAL_CHANNELS = 3 * N_MFCC + 3 + 1          # 43
-# Framewise suprasegmental channels: F0 (semitones on voiced frames and zero
-# elsewhere), a binary voicing mask (1 = real pitch estimate, 0 = unvoiced),
-# intensity/energy (dB) — see src.praat's extract_f0_sequence /
-# extract_intensity_sequence.
-SUPRA_CHANNELS = 3
-
-# Fixed BEFORE the one training run (see the plan's Part 2, Component 12) —
-# never swept or tuned against results from this run.
-LAMBDA_COMP    = 0.05    # complementarity (cross-branch redundancy) penalty weight
-LAMBDA_SPEAKER = 0.1     # speaker-invariance (gradient-reversal) loss weight
-GRL_LAMBDA     = 1.0     # gradient-reversal strength inside the GRL layer itself
+# Fixed before the run; never tuned against its results.
+LAMBDA_COMP = 0.05                                     # cross-branch redundancy penalty
+LAMBDA_SPEAKER = 0.1                                   # adversarial speaker loss
+GRL_LAMBDA = 1.0                                       # gradient-reversal strength
 
 # ---------------------------------------------------------------------------
-# Training (train.py)
+# Training
 # ---------------------------------------------------------------------------
-
-# Hard wall-clock ceiling for the primary severity one-shot run on the
-# target machine — not a second more. Enforced via
-# src.training.budget.ExperimentBudgetManager.deadline_for(), threaded into
-# run_training(..., deadline=...) in notebooks/03_training.ipynb's real-run
-# cell. A single named constant so every place that needs to know the cap
-# (the budget manager, any reporting that quotes it) reads the same number
-# rather than each hardcoding it independently. Raised from 10h to 30h after
-# moving to a substantially faster GPU.
-PRIMARY_SEVERITY_BUDGET_HOURS = 30.0
-
-NUM_CLASSES = {"detection": 2, "severity": 4}
-
-# The manifest carries text labels; these are the fixed class orderings used
-# for confusion matrices, ROC curves, and one-hot/softmax indexing.
-DETECTION_CLASS_NAMES = ["Healthy Control", "Dysarthric Patient"]
-SEVERITY_CLASS_NAMES  = ["Very Low", "Low", "Mid", "High"]
-
-# Epoch ceiling early stopping should trigger well before, not a target to
-# reach — set from the primary severity run's compute budget (hard 30h cap
-# for the 15-fold LOSO run — see src.training.budget.ExperimentBudgetManager
-# and notebooks/03_training.ipynb's COMPUTE BUDGET stage) together with
-# DEFAULT_PATIENCE below, not independently. 20 -> 15: still generous
-# headroom over what early stopping
-# on validation loss is expected to need on a 14-speaker training set per
-# fold; lower only trims the unused tail, it does not change what the model
-# learns before convergence.
-# 15 -> 12: the audited run's best epochs (7-15, mean 12.5) were selected on a
-# within-speaker validation split; under speaker-disjoint validation early
-# stopping is expected to fire earlier, and 12 keeps a 15-fold run inside a
-# ~9 h Kaggle session with margin (see notebooks/speech-processing.ipynb §5).
-DEFAULT_EPOCHS        = 12
-# 32, not 16: AMP is already on for every CUDA run (src/training/runner.py),
-# and LoRA fine-tuning only backpropagates through a few hundred-K adapter
-# params, not the frozen backbone — a smaller batch was leaving GPU
-# throughput unused without buying any regularization benefit worth the
-# slower 28/81-fold sweep. wav2vec2-base at CLIP_SECONDS=4.0 with AMP fits
-# batch 32 comfortably on an 8 GB card; drop to 16,
-# then 8, if a fold OOMs on a smaller GPU. Re-measure with
-# src.training.budget.benchmark_batch_sizes on the actual machine before
-# trusting this as more than a starting point — it has not been verified
-# against a live GPU in this checkout.
-DEFAULT_BATCH_SIZE    = 32
-DEFAULT_LR_HEAD       = 1e-3     # classifier head / acoustic pathway / LoRA adapters
-DEFAULT_LR_BACKBONE   = 1e-4     # wav2vec 2.0 backbone (only when fine-tuned)
-DEFAULT_WEIGHT_DECAY  = 1e-2
-# 5 -> 3: early stopping on validation loss is this architecture's primary
-# anti-overfitting gate (ties directly to "purely learnt, not overfitting"
-# taking priority over training accuracy) — a tighter patience stops compute
-# being spent past convergence on a 14-speaker per-fold training set, which
-# helps generalization, not just wall-clock cost. If a real run's fold-1
-# validation loss is still clearly decreasing when patience fires, loosen to
-# 4 for the remaining folds rather than trust this a priori number blindly
-# (see notebooks/03_training.ipynb's COMPUTE BUDGET, STEP 2 cell).
-DEFAULT_PATIENCE      = 3        # early stopping, in epochs without improvement
+DEFAULT_EPOCHS = 12                                    # ceiling; early stopping ends folds sooner
+DEFAULT_BATCH_SIZE = 32                                # measured: 76 samples/s, 5.8 GB peak VRAM
+# Two optimizer groups (src.training.engine.build_optimizer): LoRA adapters
+# train at DEFAULT_LR_LORA; the branch CNNs, projections, gate and heads at
+# DEFAULT_LR_HEAD. The wav2vec2 backbone itself is frozen.
+DEFAULT_LR_HEAD = 1e-3
+DEFAULT_LR_LORA = 1e-4
+DEFAULT_WEIGHT_DECAY = 1e-2
+DEFAULT_PATIENCE = 3                                   # epochs without val-loss improvement
 DEFAULT_GRAD_CLIP_NORM = 1.0
-DEFAULT_VAL_FRACTION  = 0.1      # held out from each fold's train split
-DEFAULT_SEED           = 42
+DEFAULT_SEED = 42
 
 # ---------------------------------------------------------------------------
-# Local hardware profile — 14-core/20-thread CPU, 16 GB RAM, 8 GB CUDA GPU,
-# NVMe SSD. Sized from this machine's measured benchmark (batch 32,
-# gradient checkpointing off: 76 train samples/s, 5.8 GB peak VRAM) and from
-# Windows' DataLoader model: every worker is a SPAWNED process that imports
-# torch (~0.4-0.6 GB RSS each), so worker count is bounded by RAM, not cores.
-# With the feature store serving all engineered features, one item costs
-# ~10 ms of CPU (a wav read + slice), so 4 training workers already supply
-# several times what the GPU consumes.
+# Local hardware profile — RTX 4060 Laptop (8 GB, 88 W), 16 GB RAM, Windows.
+#
+# On Windows every DataLoader worker is a spawned process that re-imports
+# torch's CUDA DLLs (~0.7 GB resident, ~2 GB commit), so worker count is
+# bounded by memory, not cores. With the feature store memory-mapped, one
+# worker supplies ~340 items/s against the ~76 items/s the GPU trains at.
 # ---------------------------------------------------------------------------
-# "float16" (with a live GradScaler) or "bfloat16" (Ampere+ only, no scaler).
-AMP_DTYPE = "float16"
-# Measured on this machine: every spawned DataLoader worker re-imports torch
-# with its CUDA DLLs and costs ~1.95 GB of COMMIT (~0.7 GB resident) whatever
-# it loads. The old 3 train + 2 val persistent workers put the training tree at
-# 13 GB of commit and left 0.3 GB of RAM free — the "error code 1455" /
-# paging-stall failure mode. Throughput does not need them: with the feature
-# store memory-mapped, one worker supplies ~340 items/s and the main process
-# alone ~230 items/s, against ~76 items/s the GPU trains at. So: one persistent
-# worker overlaps training-batch loading with the GPU step, and validation/test
-# load in the main process (the GPU is idle between batches there anyway).
-TRAIN_NUM_WORKERS = 1            # persistent, training loader
-EVAL_NUM_WORKERS = 0             # validation loader (0 = in the main process)
-TEST_NUM_WORKERS = 0             # test loader: one pass per fold, in-process
-DATALOADER_PREFETCH_FACTOR = 4   # batches queued per worker
-# Per-process memory cost used to size worker pools against what is free
-# right now (src.training.utils.affordable_workers), so a run adapts to other
-# applications being open instead of paging or failing mid-fold.
-DATALOADER_WORKER_RAM_GB = 0.75      # measured 0.67-0.71 GB resident
-DATALOADER_WORKER_COMMIT_GB = 2.0    # measured 1.94 GB committed
-FEATURE_STORE_WORKER_RAM_GB = 0.9    # torch + Silero + parselmouth per build worker
+AMP_DTYPE = "float16"                                  # "bfloat16" only on Ampere+ (no GradScaler)
+TRAIN_NUM_WORKERS = 1                                  # persistent, training loader
+EVAL_NUM_WORKERS = 0                                   # validation in the main process
+TEST_NUM_WORKERS = 0                                   # test in the main process
+DATALOADER_PREFETCH_FACTOR = 4
+
+# Per-process memory cost, used to size worker pools to what is free right now
+# (src.training.utils.affordable_workers).
+DATALOADER_WORKER_RAM_GB = 0.75
+DATALOADER_WORKER_COMMIT_GB = 2.0
+FEATURE_STORE_WORKER_RAM_GB = 0.9                      # torch + Silero + parselmouth
 FEATURE_STORE_WORKER_COMMIT_GB = 2.2
-# Kept free for the OS, the notebook front end and the process's own growth.
-RAM_RESERVE_GB = 2.0
+RAM_RESERVE_GB = 2.0                                   # left for the OS and the notebook
 COMMIT_RESERVE_GB = 4.0
-# Measured during a real fold: the training process commits ~10.4 GB — on
-# this Windows (WDDM) driver the ~6.3 GB of GPU memory PyTorch reserves is
-# charged to system commit as well. Worker counts are decided BEFORE a fold
-# reserves that, so training reserves room for it on top.
+# On WDDM the ~6.3 GB of VRAM PyTorch reserves is also charged to system
+# commit; worker counts are decided before a fold reserves it.
 TRAINING_COMMIT_RESERVE_GB = 8.0
-# Below this much free commit before a fold, a note asks to close applications:
-# ~6.5 GB GPU-backed commit + ~2 GB for the worker + margin.
-MIN_FREE_COMMIT_GB_PER_FOLD = 10.0
-# Cap PyTorch's share of VRAM. On Windows (WDDM) exceeding physical VRAM does
-# not raise OOM — it silently spills into system RAM and throughput collapses
-# ~10x (measured: batch 64 without checkpointing ran at 4 samples/s). A cap
-# turns that into a clean, catchable OOM and keeps ~0.8 GB for the display.
+MIN_FREE_COMMIT_GB_PER_FOLD = 10.0                     # below this, warn before a fold
+
+# Cap PyTorch's share of VRAM. On WDDM, exceeding physical VRAM does not raise
+# OOM — it spills into system RAM and throughput collapses ~10x. The cap turns
+# that into a clean, retryable OOM and leaves headroom for the display.
 CUDA_MEMORY_FRACTION = 0.90
-CUDNN_BENCHMARK = True           # fixed 4 s input shape -> autotuned conv kernels
-# Feature-store build: an UPPER bound. Each worker holds torch + Silero +
-# parselmouth, so the pool is shrunk to what free RAM and commit allow at
-# build time (src.training.utils.affordable_workers) — 8 fixed workers on a
-# 16 GB machine with other applications open is what stalled the last build.
-FEATURE_STORE_WORKERS = 8
-USE_TQDM = True                  # tqdm bars (False: throttled line log, for piped logs)
+CUDNN_BENCHMARK = True                                 # fixed 4 s input -> autotuned kernels
+FEATURE_STORE_WORKERS = 8                              # upper bound, shrunk to free memory
+
+# Thermal guard (src.training.utils.ThermalGuard). Laptop GPUs throttle
+# themselves near 87 C; sustained operation there for hours is what shortens
+# their life. Training pauses between batches when the GPU reaches
+# GPU_TEMP_PAUSE_C and resumes once it has cooled to GPU_TEMP_RESUME_C.
+GPU_TEMP_PAUSE_C = 83
+GPU_TEMP_RESUME_C = 72
+GPU_TEMP_CHECK_INTERVAL_S = 15.0
+GPU_COOLDOWN_MAX_WAIT_S = 600                          # resume anyway after this; the note says so
+# Pause between folds so the GPU starts each fold cool (0 disables).
+FOLD_COOLDOWN_S = 60
+# Refuse to start training on battery power: the GPU drops to a fraction of
+# its clocks and a multi-hour run would drain the battery mid-fold.
+REQUIRE_AC_POWER = True
+
+USE_TQDM = True                                        # False: throttled line log for piped output
 
 
 def ensure_directories() -> None:
-    """Create every project directory that the pipeline writes to or reads from."""
-    for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, CORPUS_DOCS_DIR, OUTPUT_DIR, FIGURE_DIR,
-                       ERROR_FIGURE_DIR, CHECKPOINT_DIR, LOG_DIR, PREDICTIONS_DIR,
-                       METRICS_DIR, CONFUSION_MATRIX_DIR, ROC_DIR, EMBEDDINGS_DIR,
-                       EXPERIMENTS_DIR, RESULTS_DIR,
-                       SIGNAL_FIGURE_DIR, REPRESENTATION_FIGURE_DIR, EXPLAINABILITY_FIGURE_DIR,
-                       ABLATION_FIGURE_DIR, METRIC_FIGURE_DIR, TABLES_DIR, DIAGNOSTICS_DIR,
-                       FEATURE_CACHE_DIR, SEGMENTAL_EXTRA_CACHE_DIR, SUPRASEGMENTAL_CACHE_DIR,
-                       FEATURE_STORE_DIR):
+    """Create every directory the pipeline writes to."""
+    for directory in (DATA_DIR, ARCHIVE_DIR, AUDIO_DIR, CORPUS_DOCS_DIR, OUTPUT_DIR,
+                      FEATURE_CACHE_DIR, FEATURE_STORE_DIR, CHECKPOINT_DIR, LOG_DIR,
+                      PREDICTIONS_DIR, METRICS_DIR, CONFUSION_MATRIX_DIR, ROC_DIR,
+                      EMBEDDINGS_DIR, RESULTS_DIR):
         directory.mkdir(parents=True, exist_ok=True)

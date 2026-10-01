@@ -1,12 +1,20 @@
-"""Small shared helpers: seeding and device resolution."""
+"""
+Runtime helpers: seeding, device and AMP selection, memory accounting, and the
+laptop safeguards — GPU thermal guard, sleep prevention, AC-power check.
+"""
 
+import contextlib
 import random
+import subprocess
+import sys
+import time
+from typing import Optional
 
 import numpy as np
 import torch
 
 from src import config
-from src.console import print_note
+from src.console import print_note, print_status
 
 
 def set_seed(seed: int) -> None:
@@ -16,12 +24,21 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def resolve_device(requested: Optional[str] = None) -> torch.device:
+    """cuda if available, else cpu — with a note, since CPU training of this
+    model is unusable and the usual cause is the wrong notebook kernel."""
+    if requested:
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    print_note("CUDA is not visible to this kernel — training would run on CPU. Select the "
+               "Python environment with the CUDA build of torch.")
+    return torch.device("cpu")
+
+
 def resolve_amp_dtype(device: torch.device) -> torch.dtype:
-    """AMP dtype from config.AMP_DTYPE. "bfloat16" is honoured only on GPUs
-    with NATIVE bf16 (compute capability >= 8.0) — torch.cuda.is_bf16_supported()
-    also says True where bf16 is emulated, which would trade the tensor-core
-    fp16 path for a slow software one; everything else runs float16 with a
-    live GradScaler (see run_fold)."""
+    """config.AMP_DTYPE; bfloat16 only where the GPU runs it natively (compute
+    capability >= 8.0), otherwise float16 with a GradScaler."""
     if (config.AMP_DTYPE == "bfloat16" and device.type == "cuda"
             and torch.cuda.get_device_capability(device)[0] >= 8):
         return torch.bfloat16
@@ -32,22 +49,10 @@ _RUNTIME_CONFIGURED = False
 
 
 def configure_local_runtime(device: torch.device) -> None:
-    """One-time, per-process CUDA settings for the local hardware profile
-    (config "Local hardware profile"):
-
-      * cudnn.benchmark — every input is the same fixed 4 s window, so
-        autotuning wav2vec2's conv feature encoder once pays off every step.
-        It changes kernel selection, not the model or data.
-      * a VRAM cap (config.CUDA_MEMORY_FRACTION) — on Windows/WDDM, running
-        past physical VRAM does not raise OOM but spills into system RAM and
-        collapses throughput ~10x; the cap turns that into a clean OOM and
-        leaves headroom for the display.
-
-    The cap is the smaller of that fraction and what is actually FREE on the
-    card now (less 0.3 GiB): VRAM another application holds (a browser, the
-    desktop compositor) is not available to training, and a cap above the
-    free amount would let the allocator spill instead of failing cleanly.
-    """
+    """Once per process: cuDNN autotuning (fixed input shape) and a VRAM cap —
+    the smaller of config.CUDA_MEMORY_FRACTION and what is free now. On
+    Windows/WDDM, running past physical VRAM spills into system RAM and
+    throughput collapses ~10x; the cap turns that into a clean, retryable OOM."""
     global _RUNTIME_CONFIGURED
     if _RUNTIME_CONFIGURED or device.type != "cuda":
         return
@@ -60,19 +65,17 @@ def configure_local_runtime(device: torch.device) -> None:
         if fraction < 0.75:
             print_note(f"Only {free / 2 ** 30:.1f} of {total / 2 ** 30:.1f} GiB of GPU memory is "
                        "free — another application is using the GPU. Training needs ~6 GiB at "
-                       "batch 32; close it (or restart the kernel) if a fold runs out of memory.")
+                       "batch 32; close it if a fold runs out of memory.")
     _RUNTIME_CONFIGURED = True
 
 
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
 def memory_status() -> dict:
-    """System memory right now, in GiB: available/total physical RAM and
-    available/limit COMMIT (RAM + page file).
-
-    Commit is what a Windows process actually runs out of — "The paging file
-    is too small" (error 1455) — and it is consumed far faster than RAM by
-    spawned workers (each maps torch's CUDA DLLs, ~2 GB committed). On
-    Windows it is read with GlobalMemoryStatusEx; elsewhere RAM + swap stands
-    in for it."""
+    """Free/total physical RAM and free/limit COMMIT (RAM + page file), GiB.
+    Commit is what Windows actually runs out of ("the paging file is too
+    small", error 1455), and spawned workers consume it far faster than RAM."""
     gib = 2 ** 30
     try:
         import ctypes
@@ -102,10 +105,10 @@ def memory_status() -> dict:
 
 
 def affordable_workers(requested: int, ram_per_worker_gb: float, commit_per_worker_gb: float,
-                       reserve_ram_gb: float = None, reserve_commit_gb: float = None) -> int:
-    """The largest worker count <= `requested` whose memory fits in what is
-    free right now after the reserves — 0 if not even one does. Workers are a
-    throughput aid, never a requirement: every caller also works in-process."""
+                       reserve_ram_gb: Optional[float] = None,
+                       reserve_commit_gb: Optional[float] = None) -> int:
+    """Largest worker count <= requested that fits in what is free now (0 if
+    none does — every caller also works in-process)."""
     reserve_ram_gb = config.RAM_RESERVE_GB if reserve_ram_gb is None else reserve_ram_gb
     reserve_commit_gb = config.COMMIT_RESERVE_GB if reserve_commit_gb is None else reserve_commit_gb
     status = memory_status()
@@ -114,26 +117,121 @@ def affordable_workers(requested: int, ram_per_worker_gb: float, commit_per_work
     return max(0, min(int(requested), by_ram, by_commit))
 
 
-def resolve_device(requested: str = None) -> torch.device:
-    """
-    cuda if available, else cpu — but say so explicitly rather than falling
-    back silently. A 28/81-fold LOSO sweep with wav2vec2 fine-tuning on CPU
-    is not "slow", it is unusable, and the most common cause is not this
-    function's logic but the *kernel a notebook happens to be running under*
-    not being the same Python environment `pip install`/`conda` targeted —
-    e.g. a fresh `pip install torch` (no CUDA index URL, see requirements.txt's
-    top comment) silently installs a CPU-only wheel with the same version
-    string, so `import torch; torch.__version__` alone won't reveal the
-    problem — only torch.cuda.is_available() does.
-    """
-    if requested:
-        return torch.device(requested)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    print_note("CUDA is not visible to this Python environment/kernel — training "
-              "will run on CPU. If a GPU is installed, this almost always means "
-              "the active notebook kernel is not the environment torch+CUDA was "
-              "installed into. Run `import torch; torch.cuda.is_available()` in "
-              "a cell to confirm, and switch the notebook's kernel if it prints "
-              "False despite the GPU being present.")
-    return torch.device("cpu")
+# ---------------------------------------------------------------------------
+# Laptop safeguards
+# ---------------------------------------------------------------------------
+def gpu_temperature(index: int = 0) -> Optional[int]:
+    """Core temperature in C via NVML when pynvml is installed, else
+    nvidia-smi; None if neither is available."""
+    try:
+        return int(torch.cuda.temperature(index))
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", f"--id={index}", "--query-gpu=temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return int(result.stdout.strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+class ThermalGuard:
+    """Pause training between batches while the GPU is too hot.
+
+    check() is cheap to call every batch: it reads the sensor at most every
+    config.GPU_TEMP_CHECK_INTERVAL_S. At or above GPU_TEMP_PAUSE_C it sleeps
+    until the GPU cools to GPU_TEMP_RESUME_C (or GPU_COOLDOWN_MAX_WAIT_S
+    passes). Sleeping between batches changes nothing about what is computed —
+    only when."""
+
+    def __init__(self):
+        self._last_check = 0.0
+        self._disabled = False
+        self.pauses = 0
+        self.paused_seconds = 0.0
+
+    def check(self, force: bool = False) -> None:
+        if self._disabled or not torch.cuda.is_available() or config.GPU_TEMP_PAUSE_C <= 0:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_check < config.GPU_TEMP_CHECK_INTERVAL_S:
+            return
+        self._last_check = now
+        temperature = gpu_temperature()
+        if temperature is None:
+            self._disabled = True
+            print_note("GPU temperature is unreadable (no nvidia-smi / pynvml) — the thermal "
+                       "guard is off; watch temperatures with another tool.")
+            return
+        if temperature >= config.GPU_TEMP_PAUSE_C:
+            self.cool_down(temperature, max_wait_s=config.GPU_COOLDOWN_MAX_WAIT_S,
+                           reason=f"reached {temperature} C")
+
+    def cool_down(self, temperature: Optional[int] = None, max_wait_s: float = 0.0,
+                  reason: str = "") -> None:
+        """Wait (up to max_wait_s) until the GPU is at or below the resume
+        temperature. Returns at once if it already is."""
+        temperature = gpu_temperature() if temperature is None else temperature
+        if temperature is None or temperature <= config.GPU_TEMP_RESUME_C or max_wait_s <= 0:
+            return
+        start = time.monotonic()
+        print_note(f"GPU {reason or f'at {temperature} C'} — pausing until it cools to "
+                   f"{config.GPU_TEMP_RESUME_C} C (at most {max_wait_s / 60:.0f} min).")
+        while temperature is not None and temperature > config.GPU_TEMP_RESUME_C:
+            if time.monotonic() - start >= max_wait_s:
+                print_note(f"GPU still at {temperature} C after {max_wait_s / 60:.0f} min — "
+                           "resuming. Improve airflow (raise the laptop's rear, clean the vents).")
+                break
+            time.sleep(5)
+            temperature = gpu_temperature()
+        waited = time.monotonic() - start
+        self.pauses += 1
+        self.paused_seconds += waited
+        self._last_check = time.monotonic()
+        print_status(f"GPU at {temperature} C after a {waited:.0f} s pause — resuming.", ok=True)
+
+
+THERMAL_GUARD = ThermalGuard()
+
+
+@contextlib.contextmanager
+def prevent_sleep():
+    """Keep Windows from sleeping while training runs (the display may still
+    turn off). Closing the lid follows its own power setting — set "When I
+    close the lid: Do nothing" for plugged-in, or keep the lid open."""
+    if sys.platform != "win32":
+        yield
+        return
+    import ctypes
+    es_continuous, es_system_required = 0x80000000, 0x00000001
+    ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | es_system_required)
+    try:
+        yield
+    finally:
+        ctypes.windll.kernel32.SetThreadExecutionState(es_continuous)
+
+
+def on_battery() -> bool:
+    """True when the machine has a battery and is not plugged in."""
+    try:
+        import psutil
+        battery = psutil.sensors_battery()
+    except Exception:
+        return False
+    return battery is not None and not battery.power_plugged
+
+
+def wait_for_ac_power() -> None:
+    """Block until the charger is connected (config.REQUIRE_AC_POWER). On
+    battery the GPU runs at a fraction of its clocks and a fold would drain
+    the battery before it finished."""
+    if not config.REQUIRE_AC_POWER or not on_battery():
+        return
+    print_note("Running on battery — waiting for the charger before training continues "
+               "(set config.REQUIRE_AC_POWER = False to override).")
+    while on_battery():
+        time.sleep(10)
+    print_status("Charger connected — continuing.", ok=True)

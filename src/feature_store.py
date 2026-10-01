@@ -1,54 +1,26 @@
 """
 Persistent, chunked, resumable store of every per-utterance model input
-except the waveform itself — the cache that keeps preprocessing out of
-training entirely.
+except the waveform — the cache that keeps Silero and Praat out of training.
 
-WHY THIS EXISTS
----------------
-The audited Kaggle run cached 800 of 21,420 utterances before its precompute
-pool stalled (see src.parallel), so training fell back to live Silero VAD and
-live Praat for the rest: ~3 min epochs against a calibrated ~1m45s, and a
-7-12 minute gap before EVERY fold while build_loaders' standardizer passes
-re-derived features one file at a time on the main thread. Two properties of
-the old caches made that failure expensive: a single-file parquet span table
-written only at the very end of its pass (an interrupted pass kept nothing),
-and ~43,000 per-file .npy features with no MFCC among them.
+One compressed .npz CHUNK per UA-Speech (speaker, block), e.g. "M05_B1",
+holding for each of its utterances:
 
-WHAT IS STORED
---------------
-One compressed .npz CHUNK per UA-Speech (speaker, block) — e.g. "M05_B1" —
-holding, for each of that recording block's utterances:
+    num_samples and both profiles' VAD spans (+ fallback flags);
+    segmental  (43, T) float32   MFCC + delta + delta-delta + F1-F3 + HNR;
+    supra      (3, T)  float32   F0 semitones, voicing, intensity dB.
 
-    num_samples, speech/supra VAD spans (+ fallback flags)   exactly the
-        src.vad_cache span-table columns;
-    segmental  (43, T) float32   MFCC + delta + delta-delta + F1-F3 + HNR
-        (src.preprocessing.extract_segmental_features_cached's output);
-    supra      (3, T)  float32   F0 semitones, voicing, intensity dB
-        (extract_suprasegmental_features_cached's output).
+Values are raw; fold-scoped standardization happens at __getitem__ time.
 
-Raw (pre-normalization) values: fold-level standardization still happens at
-__getitem__ time from each fold's TRAIN split only, exactly as before.
-
-Chunking by (speaker, block) is what makes it resumable and shareable:
-  * a chunk is written atomically (temp file + rename) the moment it is
-    finished, so an interrupted session keeps every completed chunk and the
-    next one computes only the missing ones — never a completed chunk twice;
-  * the partition does not depend on which subset a run uses — a B1 severity
-    run needs the 15 "<dysarthric speaker>_B1" chunks, a later B1+B2 run adds
-    15 more, and none are rebuilt;
-  * 84 chunk files for the whole M6 corpus — easy to commit as a Kaggle
-    dataset and attach read-only to the next session (config.
-    FEATURE_STORE_EXTRA_DIRS / the FEATURE_STORE_EXTRA_DIRS env var).
-
-CORRECTNESS CONTRACT
---------------------
-The store is an optimization, never a precondition: every read returns None
-on a miss and callers fall through to the original live computation. A chunk
-built under a different configuration (store_signature) is ignored, loudly.
-verify_feature_store recomputes a random sample through the ORIGINAL live
-code path (Silero via src.vad.apply_vad, no span table, no store) and
-requires bit-exact equality; src.vad_cache.verify_vad_span_cache (the 300-
-sample span check) runs unchanged against the spans served from here.
+  * Resumable: each chunk is written atomically the moment it finishes, so an
+    interrupted build keeps every finished chunk and the next call computes
+    only the missing ones.
+  * Shared across processes: at read time each chunk's arrays are decompressed
+    once to memory-mapped .npy files, so the main process and every DataLoader
+    worker share one copy in the OS page cache.
+  * Safe: every read returns None on a miss and callers compute live. A chunk
+    built under a different store_signature() is ignored. verify_feature_store
+    recomputes a sample through the original live path (live Silero, no store)
+    and requires bit-exact equality.
 """
 
 import json
@@ -127,8 +99,8 @@ def chunk_key(filename_or_path: str) -> str:
 
 
 def store_dirs() -> List[Path]:
-    """Writable store first, then read-only extra locations (e.g. a previous
-    Kaggle session's output attached as a dataset). The env var
+    """Writable store first, then read-only extra locations (e.g. a store
+    copied from another machine). The env var
     FEATURE_STORE_EXTRA_DIRS (os.pathsep-separated) adds to the config list —
     read at call time so a notebook can set it after import."""
     extra = list(config.FEATURE_STORE_EXTRA_DIRS)
@@ -293,7 +265,7 @@ def span_table() -> Dict[str, Tuple[int, int, int, int, int]]:
 # ---------------------------------------------------------------------------
 def _worker_init() -> None:
     """Single intra-op thread per worker (n_workers processes already use
-    every core; see src.parallel._worker_thread_init) and no library chatter."""
+    every core) and no library chatter."""
     import warnings
     import torch
     torch.set_num_threads(1)
@@ -421,18 +393,15 @@ def build_feature_store(df: pd.DataFrame, n_workers: Optional[int] = None,
                         time_budget_s: Optional[float] = None,
                         stall_timeout_s: float = None) -> Dict[str, object]:
     """Compute every chunk of df that is not already in the store — and only
-    those. Resumable by construction: re-running after an interruption (or in
-    a new Kaggle session with the previous output attached) skips every
-    finished chunk.
+    those. Resumable by construction: re-running after an interruption skips
+    every finished chunk.
 
     Chunks run in rounds of n_workers * chunks_per_worker_per_round on a
     FRESH 'spawn' process pool per round. 'spawn', not the Linux default
     'fork': the parent is a Jupyter kernel with a CUDA context and several
-    threads, and forking such a process is not safe. Fresh pools rather than
-    ProcessPoolExecutor(max_tasks_per_child=...): with every task submitted up
-    front, the executor retires workers at the limit without replacing them —
-    the audited run stopped at exactly 4 workers x 200 tasks = 800 files (see
-    src.parallel). A round also bounds how long one worker process lives.
+    threads, and forking such a process is not safe. A fresh pool per round
+    also bounds how long a worker lives, so parselmouth's C++ state cannot
+    accumulate across thousands of files.
 
     time_budget_s, if given, stops starting new rounds once the next round is
     projected (from the rounds so far) to overrun it; the chunks it did not

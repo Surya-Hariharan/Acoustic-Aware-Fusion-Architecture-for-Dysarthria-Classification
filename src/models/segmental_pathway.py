@@ -1,20 +1,11 @@
 """
-Segmental branch of the three-branch gated-fusion severity architecture.
+Segmental branch: short-time articulatory and voice-quality behaviour.
 
-Local, short-time acoustic-articulatory behavior: MFCC + delta + delta-delta
-(the existing 39-dim/frame Acoustic Pathway input) concatenated with
-framewise formants F1-F3 (resonance/articulation) and framewise HNR (voice
-quality) — config.SEGMENTAL_CHANNELS = 43 channels/frame total. Deliberately
-excludes F0/energy/duration (those belong to the Suprasegmental branch) and
-jitter/shimmer/CPPS (kept as utterance-level SHAP-surrogate features only —
-framewise glottal-pulse-based measures do not have a natural per-frame
-value the way a spectral envelope does).
-
-Same 3-layer 1D-CNN + masked-mean-pool architecture as
-src.models.acoustic_pathway.AcousticPathway (same kernel/stride, so the
-pooling arithmetic is identical and directly reused), plus a final
-Linear bottleneck down to config.SEGMENTAL_EMBED_DIM (64) — see the
-architecture plan's Part 2, Component 5 for why a bottleneck matters here.
+Input is MFCC + delta + delta-delta (39) with framewise F1-F3 and HNR (4) —
+config.SEGMENTAL_CHANNELS = 43 per 10 ms frame, on the speech-focused profile.
+F0, voicing and intensity belong to the suprasegmental branch instead.
+A 3-layer 1D-CNN, a mean-pool over real frames only, and a linear bottleneck
+to config.SEGMENTAL_EMBED_DIM (64).
 """
 
 from typing import Optional
@@ -26,12 +17,10 @@ from src import config
 
 
 class SegmentalPathway(nn.Module):
-    """1D-CNN: (batch, 43, frames) segmental input -> (batch, 64) embedding."""
+    """(batch, 43, frames) -> (batch, 64)."""
 
-    def __init__(self,
-                 in_channels: int = config.SEGMENTAL_CHANNELS,     # 43
-                 hidden_dim: int = 128,
-                 embed_dim: int = config.SEGMENTAL_EMBED_DIM):     # 64
+    def __init__(self, in_channels: int = config.SEGMENTAL_CHANNELS, hidden_dim: int = 128,
+                 embed_dim: int = config.SEGMENTAL_EMBED_DIM):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(in_channels, 64, kernel_size=5, padding=2),
@@ -52,44 +41,25 @@ class SegmentalPathway(nn.Module):
 
     @staticmethod
     def _pool_frames(num_frames):
-        """Same two stride-2, kernel-2 MaxPool1d layers as
-        AcousticPathway._pool_frames — identical conv geometry, so the same
-        length formula applies (kept as a local copy rather than a shared
-        import so this module has no dependency on the Acoustic Pathway)."""
+        """Frame count after the two kernel-2, stride-2 max-pools."""
         pooled = (num_frames - 2) // 2 + 1
         return (pooled - 2) // 2 + 1
 
     def valid_frame_count(self, waveform_attention_mask: torch.Tensor) -> torch.Tensor:
-        """Sample-level mask -> pooled valid-frame count. Segmental input
-        shares the MFCC frame grid (both derived from the speech-focused
-        profile's mfcc_frame_count), so this mirrors
-        AcousticPathway.valid_frame_count exactly."""
+        """Sample-level mask -> real frames left after pooling (at least 1)."""
         from src.preprocessing import mfcc_frame_count
-        valid_samples = waveform_attention_mask.sum(dim=1)
-        mfcc_frames = mfcc_frame_count(valid_samples)
+        mfcc_frames = mfcc_frame_count(waveform_attention_mask.sum(dim=1))
         return self._pool_frames(mfcc_frames).clamp(min=1)
 
     def forward(self, segmental_features: torch.Tensor,
-               attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            segmental_features: (batch, 43, frames) — MFCC+delta+delta-delta
-                concatenated with framewise formants+HNR along the channel
-                axis (see src.training.data.build_segmental_features).
-            attention_mask: (batch, samples) sample-level waveform mask, same
-                convention as AcousticPathway.forward — excludes frames drawn
-                from the fixed window's zero-padded tail from the pool.
-        Returns:
-            (batch, 64) segmental embedding, Z_segmental.
-        """
-        features = self.conv(segmental_features)              # (B, hidden_dim, T)
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """attention_mask: (batch, samples) waveform mask; frames derived from
+        the zero-padded tail are excluded from the pool."""
+        features = self.conv(segmental_features)
         if attention_mask is None:
-            pooled = features.mean(dim=-1)
-        else:
-            valid_frames = self.valid_frame_count(attention_mask)      # (B,)
-            frame_idx = torch.arange(features.shape[-1], device=features.device)[None, :]
-            frame_mask = (frame_idx < valid_frames[:, None]).unsqueeze(1).to(features.dtype)
-            summed = (features * frame_mask).sum(dim=-1)
-            counts = frame_mask.sum(dim=-1).clamp(min=1.0)
-            pooled = summed / counts
+            return self.bottleneck(features.mean(dim=-1))
+        valid = self.valid_frame_count(attention_mask)
+        frame_idx = torch.arange(features.shape[-1], device=features.device)[None, :]
+        mask = (frame_idx < valid[:, None]).unsqueeze(1).to(features.dtype)
+        pooled = (features * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1.0)
         return self.bottleneck(pooled)

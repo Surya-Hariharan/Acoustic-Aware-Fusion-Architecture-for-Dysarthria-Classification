@@ -11,7 +11,7 @@ bookkeeping — easy to unit-test in isolation (see tests/test_ordinal.py,
 tests/test_complementarity_loss.py).
 """
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -141,8 +141,7 @@ def coral_rank_from_class_probs(class_probs: torch.Tensor) -> torch.Tensor:
 # Chosen over a discriminator/contrastive scheme specifically because it is
 # stable at small batch sizes, needs no negative sampling, and is a single,
 # well-understood mechanism appropriate for a one-shot run with no room to
-# debug a fragile adversarial term (see the architecture plan's Part 2,
-# Component 8).
+# debug a fragile adversarial term.
 # ---------------------------------------------------------------------------
 def redundancy_penalty(z_a: torch.Tensor, z_b: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """
@@ -160,7 +159,7 @@ def redundancy_penalty(z_a: torch.Tensor, z_b: torch.Tensor, eps: float = 1e-5) 
         MEAN, not the raw Barlow-Twins/VICReg sum, deliberately: this
         penalty is summed over three branch PAIRS of different
         dimensionality (128x64, 128x64, 64x64 — see
-        total_complementarity_penalty) and combined with a single fixed
+        complementarity_penalty) and combined with a single fixed
         λ_comp. A sum-of-squared-entries penalty scales with d_a * d_b
         regardless of true redundancy — even literally independent
         embeddings produce a "noise floor" proportional to d_a * d_b / batch
@@ -182,14 +181,15 @@ def redundancy_penalty(z_a: torch.Tensor, z_b: torch.Tensor, eps: float = 1e-5) 
     return (cross_corr ** 2).mean()
 
 
-def total_complementarity_penalty(z_learned: torch.Tensor, z_segmental: torch.Tensor,
-                                  z_supra: torch.Tensor) -> torch.Tensor:
-    """Sum of the redundancy penalty over all three branch pairs
-    (learned-segmental, learned-supra, segmental-supra) — L_comp in the
-    architecture plan's total loss."""
-    return (redundancy_penalty(z_learned, z_segmental)
-            + redundancy_penalty(z_learned, z_supra)
-            + redundancy_penalty(z_segmental, z_supra))
+def complementarity_penalty(embeddings: Sequence[torch.Tensor]) -> torch.Tensor:
+    """L_comp: the redundancy penalty summed over every pair of branch
+    embeddings (all three pairs for the full model, one for a two-branch
+    ablation)."""
+    total = embeddings[0].new_zeros(())
+    for i in range(len(embeddings)):
+        for j in range(i + 1, len(embeddings)):
+            total = total + redundancy_penalty(embeddings[i], embeddings[j])
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +199,7 @@ def total_complementarity_penalty(z_learned: torch.Tensor, z_segmental: torch.Te
 # loss while every layer UPSTREAM of it is pushed to make the input harder
 # for that classifier to solve. Used here to make the fused representation
 # harder to attribute to a speaker (see gated_fusion.py) — the single,
-# well-established speaker-invariance mechanism chosen for this one-shot run
-# (architecture plan Part 2, Component 10).
+# well-established speaker-invariance mechanism chosen for this one-shot run.
 # ---------------------------------------------------------------------------
 class _GradientReversalFunction(torch.autograd.Function):
     @staticmethod

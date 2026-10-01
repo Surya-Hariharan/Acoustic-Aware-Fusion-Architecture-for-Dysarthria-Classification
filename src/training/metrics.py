@@ -1,30 +1,14 @@
 """
-Metric computation for one evaluation pass (validation epoch or fold test set).
+Severity metrics for one evaluation pass (a validation epoch, a fold's test
+set, or every fold pooled).
 
-Detection is binary (positive class = Dysarthric Patient); severity is
-4-class, averaged macro so each severity class counts equally regardless of
-how many utterances it contributed. Both report accuracy, precision,
-recall (= sensitivity), specificity, F1, and ROC-AUC, matching the metric
-set Phase 3's ablation table needs.
-
-UNDEFINED IS NOT ZERO
-Every LOSO detection fold holds out ONE speaker, and UA-Speech detection
-labels are speaker-level — so that speaker is entirely Healthy or entirely
-Dysarthric and the fold's y_true is single-valued. Class-sensitive metrics
-(precision, recall, F1, specificity, AUROC) are then *undefined*, not zero:
-there is no positive class to have found or missed. Reporting 0.0 for them
-produced the pipeline's most misleading artifact — a held-out control
-speaker scoring "99.7% accuracy, F1 = 0.0", which reads as a catastrophic
-model but actually means "this fold carries no evidence about detection at
-all". compute_metrics() therefore returns float("nan") for each metric that
-is undefined on the given labels, and reports n_classes_present so callers
-can tell the two situations apart without re-deriving it. Aggregation with
-pandas (.mean(), .agg) skips NaN by default, so a partially-valid set of
-folds averages only over the folds where the metric existed.
-
-Pooling across folds is what makes detection metrics meaningful again — see
-src.training.runner.run_training, which concatenates every fold's predictions
-before scoring. A pooled set covering both classes has all metrics defined.
+UNDEFINED IS NOT ZERO. A severity LOSO fold holds out one speaker, and labels
+are speaker-level, so a fold's y_true has a single class. Macro-F1, balanced
+accuracy, precision, recall, specificity and AUROC are then undefined — they
+are returned as NaN (shown as N/A), never as 0.0, and n_classes_present says
+why. Macro averages run over the classes present in y_true, so a partial run
+is not dragged down by a fabricated F1 of 0 for a class it never saw. Pooling
+every fold's predictions is what makes these metrics meaningful.
 """
 
 import warnings
@@ -36,140 +20,59 @@ from sklearn.metrics import (accuracy_score, balanced_accuracy_score, confusion_
 
 from src import config
 
-
-def _binary_specificity(cm: np.ndarray) -> float:
-    """TN / (TN + FP). NaN when this fold held out no negative-class sample —
-    there were no true negatives to correctly reject, so specificity has no
-    value (as opposed to a value of zero). See the module docstring."""
-    tn, fp, _fn, _tp = cm.ravel()
-    return float(tn / (tn + fp)) if (tn + fp) > 0 else float("nan")
+LABELS = list(range(config.NUM_CLASSES))
 
 
 def _macro_specificity(cm: np.ndarray) -> float:
-    """Mean one-vs-rest specificity across classes, for multiclass confusion
-    matrices. Classes with no negative samples contribute NaN and are skipped
-    by the nanmean rather than dragging the macro average toward zero; if no
-    class is defined at all, the result is NaN."""
+    """Mean one-vs-rest specificity over classes where it is defined."""
     total = cm.sum()
-    specificities = []
+    values = []
     for i in range(cm.shape[0]):
-        tp = cm[i, i]
-        fn = cm[i, :].sum() - tp
-        fp = cm[:, i].sum() - tp
+        tp, fn, fp = cm[i, i], cm[i, :].sum() - cm[i, i], cm[:, i].sum() - cm[i, i]
         tn = total - tp - fn - fp
-        specificities.append(tn / (tn + fp) if (tn + fp) > 0 else float("nan"))
-    if np.all(np.isnan(specificities)):
-        return float("nan")
-    return float(np.nanmean(specificities))
+        values.append(tn / (tn + fp) if (tn + fp) > 0 else float("nan"))
+    return float("nan") if np.all(np.isnan(values)) else float(np.nanmean(values))
 
 
-def ordinal_mae(y_true: np.ndarray, y_pred: np.ndarray, task: str) -> float:
-    """
-    Mean absolute rank error: mean(|y_true - y_pred|), treating class index
-    as ordinal rank. Meaningful only for severity (config.SEVERITY_LABEL_MAP
-    is 0=Very Low .. 3=High, already rank-encoded in label order) — NaN for
-    detection, where class indices carry no ordering.
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
+    """y_true/y_pred: (N,) class indices; y_prob: (N, 4) class probabilities.
 
-    This is generic to ANY severity model's predictions (not CORAL-specific):
-    src.models.gated_fusion.GatedFusionModel's y_pred is
-    argmax(coral_class_probs(...)), a valid ordinal point-estimate (the
-    "mode" decoding), so no separate rank-decoding path is needed here — see
-    src.losses.coral_class_probs's docstring for why this y_pred already IS
-    an ordinal-aware prediction, not a plain nominal argmax.
-    """
-    if task != "severity" or len(y_true) == 0:
-        return float("nan")
-    return float(np.mean(np.abs(y_true.astype(np.int64) - y_pred.astype(np.int64))))
-
-
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
-                    task: str) -> Dict[str, float]:
-    """See _compute_metrics. sklearn's UndefinedMetricWarning / "y_pred
-    contains classes not in y_true" are silenced here: they fire every epoch
-    on a validation set that lacks a class (e.g. no Low speaker can be spared
-    for validation in a Low-speaker fold), and every such metric is already
-    returned as NaN — reported as N/A — by design (see the module docstring)."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)      # UndefinedMetricWarning subclasses it
-        return _compute_metrics(y_true, y_pred, y_prob, task)
-
-
-def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray,
-                     task: str) -> Dict[str, float]:
-    """
-    Args:
-        y_true: (N,) int labels.
-        y_pred: (N,) int predicted labels (argmax).
-        y_prob: (N,) positive-class probability for detection, or
-                (N, num_classes) softmax probabilities for severity.
-        task: "detection" or "severity".
-    Returns:
-        Dict of scalar metrics: accuracy, balanced_accuracy, precision,
-        recall, specificity, f1 (macro/binary), f1_weighted, ordinal_mae,
-        auroc — each NaN where undefined on these labels (see the module
-        docstring) — plus n_classes_present and n_samples, so a caller can
-        distinguish "not measurable on this fold" from "measured as zero"
-        without re-deriving it from the labels.
-    """
-    num_classes = config.NUM_CLASSES[task]
-    labels = list(range(num_classes))
-    average = "binary" if task == "detection" else "macro"
-
-    classes_present = np.unique(y_true)
-    n_classes_present = int(len(classes_present))
-
-    accuracy = accuracy_score(y_true, y_pred)
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-
-    # Accuracy is always defined (it needs no positive class); everything below
-    # it is class-sensitive and undefined on a single-class fold. zero_division
-    # is left at 0 only because the branch below never reads those values when
-    # they would be undefined — see the module docstring on why 0.0 is the
-    # wrong answer here.
-    if n_classes_present < 2:
-        precision = recall = f1 = f1_weighted = specificity = auroc = float("nan")
-        balanced_accuracy = float("nan")
-    else:
-        # Macro averages run over the classes PRESENT in y_true: a class with
-        # no true samples has no recall, so including it would add a
-        # fabricated F1 of 0 (e.g. a partial LOSO run whose completed folds
-        # cover only two severity classes, or a validation set with no Low
-        # speaker). With every class present — a complete severity LOSO run —
-        # this is exactly the all-labels macro average.
-        macro_labels = labels if task == "detection" else sorted(int(c) for c in classes_present)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            y_true, y_pred, labels=macro_labels, average=average, zero_division=0)
-        _, _, f1_weighted, _ = precision_recall_fscore_support(
-            y_true, y_pred, labels=labels, average="weighted", zero_division=0)
-        balanced_accuracy = float(balanced_accuracy_score(y_true, y_pred))
-        specificity = (_binary_specificity(cm) if task == "detection"
-                       else _macro_specificity(cm))
-        try:
-            if task == "detection":
-                auroc = roc_auc_score(y_true, y_prob)
-            else:
-                auroc = roc_auc_score(y_true, y_prob, labels=labels,
-                                      multi_class="ovr", average="macro")
-        except ValueError:
-            # Multiclass: individual classes can still be absent even though
-            # more than one is present overall — undefined, not zero.
-            auroc = float("nan")
-
-    return {
-        "accuracy": float(accuracy),
-        "balanced_accuracy": balanced_accuracy,
-        "precision": float(precision),
-        "recall": float(recall),          # sensitivity
-        "specificity": float(specificity),
-        "f1": float(f1),                  # macro (severity) / binary (detection)
-        "f1_weighted": float(f1_weighted),
-        "ordinal_mae": ordinal_mae(y_true, y_pred, task),
-        "auroc": float(auroc),
-        "n_classes_present": n_classes_present,
-        "n_samples": int(len(y_true)),
+    accuracy and ordinal MAE (mean |true rank - predicted rank|) are always
+    defined; every class-sensitive metric is NaN when fewer than two classes
+    are present."""
+    n_classes_present = int(len(np.unique(y_true)))
+    nan = float("nan")
+    metrics = {
+        "accuracy": float(accuracy_score(y_true, y_pred)) if len(y_true) else nan,
+        "ordinal_mae": (float(np.mean(np.abs(y_true.astype(np.int64) - y_pred.astype(np.int64))))
+                        if len(y_true) else nan),
+        "balanced_accuracy": nan, "precision": nan, "recall": nan, "specificity": nan,
+        "f1": nan, "f1_weighted": nan, "auroc": nan,
+        "n_classes_present": n_classes_present, "n_samples": int(len(y_true)),
     }
+    if n_classes_present < 2:
+        return metrics
+
+    present = sorted(int(c) for c in np.unique(y_true))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)        # UndefinedMetricWarning
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, labels=present, average="macro", zero_division=0)
+        _, _, f1_weighted, _ = precision_recall_fscore_support(
+            y_true, y_pred, labels=LABELS, average="weighted", zero_division=0)
+        metrics.update({
+            "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+            "precision": float(precision), "recall": float(recall), "f1": float(f1),
+            "f1_weighted": float(f1_weighted),
+            "specificity": _macro_specificity(confusion_matrix(y_true, y_pred, labels=LABELS)),
+        })
+        try:
+            metrics["auroc"] = float(roc_auc_score(y_true, y_prob, labels=LABELS,
+                                                   multi_class="ovr", average="macro"))
+        except ValueError:                                   # a class absent: undefined
+            pass
+    return metrics
 
 
-def compute_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, task: str) -> np.ndarray:
-    num_classes = config.NUM_CLASSES[task]
-    return confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+def compute_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    return confusion_matrix(y_true, y_pred, labels=LABELS)

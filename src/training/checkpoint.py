@@ -1,21 +1,11 @@
 """
-Checkpoint save/load — one function pair per model family, since a PyTorch
-module and an sklearn estimator serialize completely differently and forcing
-both through one format would make one of them non-idiomatic:
+Fold checkpoints: atomic, compact, resumable.
 
-  PyTorch  (Deep/Acoustic/Fusion pathways)  -> save_checkpoint/load_checkpoint,
-             torch.save() of a state_dict + optimizer/scheduler/scaler state
-             (.pt) - the standard PyTorch format; NOT raw pickle of the whole
-             module, which is what makes a checkpoint load safely across
-             torch versions and lets load_checkpoint restore optimizer state
-             for resumed training, not just inference.
-  sklearn  (Phase 2 SVM baseline, SHAP RandomForest surrogate) ->
-             save_sklearn_model/load_sklearn_model, joblib (.pkl) - the
-             standard scikit-learn format, and more efficient than stdlib
-             pickle for the numpy arrays inside a fitted estimator.
-
-.h5 (Keras/TensorFlow's format) is not used anywhere in this project since
-nothing here is a Keras model.
+Only trainable parameters and buffers are stored — the frozen wav2vec2
+backbone is reloaded from its pretrained checkpoint when the model is built —
+so a checkpoint is ~9 MB instead of ~386 MB. Writes go to a temp file and are
+renamed into place (retried while OneDrive or Defender holds the old copy), so
+a session killed mid-save never leaves a truncated checkpoint.
 """
 
 import os
@@ -23,17 +13,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import joblib
 import torch
 
 
-# "model_state" holds every trainable parameter plus every buffer, but NOT
-# the frozen parameters — i.e. the frozen wav2vec2 backbone, which is
-# reloaded from its pretrained checkpoint whenever the model is built. For
-# the three-branch model that is ~0.75M of ~95M parameters: a ~9 MB file (weights
-# plus AdamW state)
-# instead of ~386 MB, written after every epoch. The full-size files filled
-# 8.5 GB of Kaggle's ~20 GB /kaggle/working after 11 of 15 folds.
 COMPACT_STATE_SCOPE = "trainable_params_and_buffers"
 
 
@@ -112,17 +94,3 @@ def load_checkpoint(path: Path, model: torch.nn.Module,
     if scaler is not None:
         scaler.load_state_dict(checkpoint["scaler_state"])
     return checkpoint
-
-
-def save_sklearn_model(path: Path, model) -> None:
-    """Persist a fitted sklearn estimator (LinearSVC/CalibratedClassifierCV,
-    RandomForestClassifier, ...) via joblib. Used for Phase 2's per-fold SVM
-    baseline and the SHAP surrogate models — neither was saved anywhere
-    before, so refitting was the only way to reuse either one."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, path)
-
-
-def load_sklearn_model(path: Path):
-    """Inverse of save_sklearn_model — returns the fitted estimator as-is."""
-    return joblib.load(path)

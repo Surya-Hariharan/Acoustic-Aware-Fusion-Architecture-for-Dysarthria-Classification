@@ -1,233 +1,56 @@
 """
-Model factory for train.py.
+Model registry: the primary three-branch model and its controlled ablations.
 
-Every model exposes the same calling convention — forward(waveform, mfcc, praat)
-and forward_features(waveform, mfcc, praat) — so the training engine never needs
-to know which pathway(s) a given model actually uses. This lines up all six
-ablation variants as a single --model switch instead of six bespoke scripts:
-
-    acoustic                A  MFCC 1D-CNN only
-    deep_frozen             B  frozen wav2vec 2.0 + MLP head
-    deep_lora               C  wav2vec 2.0 + LoRA + MLP head
-    fusion_frozen            frozen wav2vec + MFCC CNN, concatenated (LoRA-off
-                             counterpart of Model D, for the LoRA-vs-frozen
-                             fusion ablation — see src/training/budget.py's
-                             primary-detection sweep)
-    fusion                  D  LoRA wav2vec + MFCC CNN, concatenated
-    attention_fusion        E  LoRA wav2vec + MFCC CNN, cross-attended (Phase 6)
-    attention_fusion_praat  F  Model E + Praat features as a third pathway
-
-Every argument is optional and models ignore what they do not use — `praat` is
-supplied by the DataLoader only for Model F, so it arrives as None everywhere
-else. Widening the signature (rather than special-casing Model F in the engine)
-is what keeps run_epoch free of any per-model branching.
+Every entry is a GatedFusionModel with the same encoders, CORAL head, data,
+folds, validation protocol and optimizer; only the listed switches differ.
+Unlisted switches take the ablation baseline — gated fusion, no
+complementarity penalty, no speaker adversary — so ab7/ab8 each add exactly
+one regularizer to ab6, and SEVERITY_MODEL_NAME (both) is the full model.
 """
 
 from typing import Dict, Optional
 
-import torch
 import torch.nn as nn
 
 from src import config
-from src.models.acoustic_pathway import AcousticPathway
-from src.models.attention_fusion import (AttentionFusionModel,
-                                         AttentionFusionPraatModel)
-from src.models.deep_pathway import DeepPathway
-from src.models.concat_fusion import FusionModel
-from src.models.gated_fusion import GatedFusionModel
+from src.models.gated_fusion import BRANCH_NAMES, GatedFusionModel
 
-MODEL_NAMES = ("acoustic", "deep_frozen", "deep_lora", "fusion_frozen", "fusion",
-               "attention_fusion", "attention_fusion_praat")
-
-# The one-shot three-branch severity architecture (architecture plan, all of
-# Part 2) — a separate registry from MODEL_NAMES above, which lists the
-# seven legacy detection/severity ablation variants kept intact but not run
-# in this pass (see src.splits.iter_severity_loso_folds / the plan's scope
-# decision to train only this model for this run).
 SEVERITY_MODEL_NAME = "gated_fusion_three_branch"
 
-# One-line description per variant, used in the run banner and the ablation
-# table so a reader never has to decode a bare model string.
-MODEL_DESCRIPTIONS = {
-    "acoustic": "Model A — MFCC 1D-CNN (cepstral features only)",
-    "deep_frozen": "Model B — frozen wav2vec 2.0 + MLP head",
-    "deep_lora": "Model C — wav2vec 2.0 + LoRA adapters + MLP head",
-    "fusion_frozen": "frozen wav2vec + MFCC CNN, concatenated (LoRA-off Model D)",
-    "fusion": "Model D — LoRA wav2vec + MFCC CNN, concatenated",
-    "attention_fusion": "Model E — LoRA wav2vec + MFCC CNN, cross-attended",
-    "attention_fusion_praat": "Model F — Model E + Praat features (third pathway)",
-    SEVERITY_MODEL_NAME: ("Three-branch gated fusion — Learned (wav2vec2+LoRA, 128D) + "
-                          "Segmental (MFCC+formant+HNR CNN, 64D) + Suprasegmental "
-                          "(F0/voicing/energy CNN, 64D), gated fusion, CORAL ordinal head, "
-                          "cross-branch complementarity + speaker-invariance regularization"),
-}
-
-# Controlled ablations of SEVERITY_MODEL_NAME — every one is a
-# GatedFusionModel with the same encoders, CORAL head, data, folds,
-# validation protocol, optimizer and epochs; only the listed switches differ
-# (see GatedFusionModel's docstring). Unlisted switches take the ablation
-# baseline: gated fusion, no complementarity loss, no speaker adversary — so
-# ab7/ab8 each add exactly ONE regularizer to ab6, and SEVERITY_MODEL_NAME
-# itself (both regularizers) is the "full + comp + GRL" row of the table.
-#
-# ab3 "wav2vec2 + acoustic" is read as the plain-fusion baseline: all three
-# encoders, embeddings simply concatenated (no gate), so ab3 vs ab6 isolates
-# what the learned gate adds.
-_ALL_BRANCHES = ("learned", "segmental", "supra")
 SEVERITY_ABLATIONS = {
     "ab1_wav2vec2_only": dict(branches=("learned",)),
     "ab2_acoustic_only": dict(branches=("segmental", "supra")),
-    "ab3_wav2vec2_acoustic_concat": dict(branches=_ALL_BRANCHES, fusion="concat"),
+    "ab3_wav2vec2_acoustic_concat": dict(branches=BRANCH_NAMES, fusion="concat"),
     "ab4_wav2vec2_segmental": dict(branches=("learned", "segmental")),
     "ab5_wav2vec2_suprasegmental": dict(branches=("learned", "supra")),
-    "ab6_full_fusion": dict(branches=_ALL_BRANCHES),
-    "ab7_full_complementarity": dict(branches=_ALL_BRANCHES, use_complementarity=True),
-    "ab8_full_speaker_grl": dict(branches=_ALL_BRANCHES, use_speaker_adversary=True),
+    "ab6_full_fusion": dict(branches=BRANCH_NAMES),
+    "ab7_full_complementarity": dict(branches=BRANCH_NAMES, use_complementarity=True),
+    "ab8_full_speaker_grl": dict(branches=BRANCH_NAMES, use_speaker_adversary=True),
 }
-_ABLATION_DEFAULTS = dict(fusion="gated", use_complementarity=False, use_speaker_adversary=False)
-
-for _name, _switches in SEVERITY_ABLATIONS.items():
-    MODEL_DESCRIPTIONS[_name] = "Severity ablation — " + ", ".join(
-        f"{key}={value}" for key, value in {**_ABLATION_DEFAULTS, **_switches}.items())
-
-# Every model built as a GatedFusionModel — the ones whose Dataset needs the
-# segmental/suprasegmental tensors (src.training.data.MODELS_WITH_THREE_BRANCH).
-GATED_FUSION_MODELS = frozenset({SEVERITY_MODEL_NAME, *SEVERITY_ABLATIONS})
-
-# Models whose DataLoader must also carry Phase 4's Praat feature vector.
-# src.training.runner reads this to decide whether to load praat_features.csv.
-MODELS_REQUIRING_PRAAT = frozenset({"attention_fusion_praat"})
-
-# Models whose Deep Pathway is frozen (use_lora=False) and only ever consumed
-# through DeepPathway.forward()'s pooled 768-dim vector (never
-# forward_sequence — attention_fusion/attention_fusion_praat always run with
-# use_lora=True). That embedding is identical across every fold/epoch since
-# the frozen backbone never updates, so src.training.runner precomputes it
-# once via src.training.baseline.extract_frozen_embeddings_masked instead of
-# recomputing the same forward pass on every batch of every epoch of every
-# fold — the single most expensive step these two variants would otherwise
-# repeat for no reason.
-MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING = frozenset({"deep_frozen", "fusion_frozen"})
+ABLATION_DEFAULTS = dict(fusion="gated", use_complementarity=False, use_speaker_adversary=False)
+MODEL_NAMES = (SEVERITY_MODEL_NAME, *SEVERITY_ABLATIONS)
 
 
-class AcousticClassifier(nn.Module):
-    """Acoustic Pathway (MFCC 1D-CNN) + classification head. Ablation Model A."""
-
-    def __init__(self, num_classes: int):
-        super().__init__()
-        self.acoustic_pathway = AcousticPathway()
-        self.classifier = nn.Sequential(
-            nn.Linear(config.ACOUSTIC_EMBED_DIM, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward_features(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                         praat: torch.Tensor = None,
-                         attention_mask: Optional[torch.Tensor] = None,
-                         deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.acoustic_pathway(mfcc, attention_mask=attention_mask)
-
-    def forward(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                praat: torch.Tensor = None,
-                attention_mask: Optional[torch.Tensor] = None,
-                deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.classifier(self.forward_features(waveform, mfcc, praat, attention_mask))
-
-
-class DeepClassifier(nn.Module):
-    """Deep Pathway (wav2vec 2.0) + classification head.
-
-    use_lora=True  -> ablation Model C (LoRA wav2vec).
-    use_lora=False -> ablation Model B (frozen wav2vec, base-paper style
-                       feature extractor, but with an MLP head trained on
-                       top instead of the paper's SVM — see Phase 2 for the
-                       literal SVM reproduction).
-    """
-
-    def __init__(self, num_classes: int, use_lora: bool = True):
-        super().__init__()
-        self.deep_pathway = DeepPathway(use_lora=use_lora)
-        self.classifier = nn.Sequential(
-            nn.Linear(config.WAV2VEC_EMBED_DIM, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward_features(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                         praat: torch.Tensor = None,
-                         attention_mask: Optional[torch.Tensor] = None,
-                         deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # deep_embedding, when given, is the precomputed frozen wav2vec2
-        # vector for this batch (see MODELS_WITH_CACHEABLE_FROZEN_EMBEDDING) —
-        # use it directly instead of running the backbone again. Only ever
-        # populated for use_lora=False, where the backbone has no gradients
-        # to contribute anyway, so skipping its forward pass changes no
-        # result, only how many times an identical computation repeats.
-        if deep_embedding is not None:
-            return deep_embedding
-        return self.deep_pathway(waveform, attention_mask=attention_mask)
-
-    def forward(self, waveform: torch.Tensor = None, mfcc: torch.Tensor = None,
-                praat: torch.Tensor = None,
-                attention_mask: Optional[torch.Tensor] = None,
-                deep_embedding: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.classifier(self.forward_features(
-            waveform, mfcc, praat, attention_mask, deep_embedding))
-
-
-def build_model(model_name: str, num_classes: int, num_speakers: int = 1,
-                gradient_checkpointing: Optional[bool] = None) -> nn.Module:
-    """Instantiate one of the seven legacy ablation variants, the
-    three-branch severity architecture, or one of its SEVERITY_ABLATIONS, by
-    name.
-
-    num_speakers: only consumed by the GatedFusionModel family (sizes its
-    adversarial speaker head to the current fold's training-speaker count —
-    see src.models.gated_fusion.GatedFusionModel); ignored by every other
-    model. gradient_checkpointing likewise (None = config default).
-    """
-    if model_name in SEVERITY_ABLATIONS:
-        return GatedFusionModel(num_classes=num_classes, num_speakers=num_speakers,
-                                gradient_checkpointing=gradient_checkpointing,
-                                **{**_ABLATION_DEFAULTS, **SEVERITY_ABLATIONS[model_name]})
-    if model_name == "acoustic":
-        return AcousticClassifier(num_classes=num_classes)
-    if model_name == "deep_frozen":
-        return DeepClassifier(num_classes=num_classes, use_lora=False)
-    if model_name == "deep_lora":
-        return DeepClassifier(num_classes=num_classes, use_lora=True)
-    if model_name == "fusion_frozen":
-        return FusionModel(num_classes=num_classes, use_lora=False)
-    if model_name == "fusion":
-        return FusionModel(num_classes=num_classes, use_lora=True)
-    if model_name == "attention_fusion":
-        return AttentionFusionModel(num_classes=num_classes)
-    if model_name == "attention_fusion_praat":
-        return AttentionFusionPraatModel(num_classes=num_classes)
+def model_switches(model_name: str) -> Dict[str, object]:
+    """The GatedFusionModel constructor switches for a registry name."""
     if model_name == SEVERITY_MODEL_NAME:
-        return GatedFusionModel(num_classes=num_classes, num_speakers=num_speakers,
-                                gradient_checkpointing=gradient_checkpointing)
-    raise ValueError(f"Unknown model '{model_name}'. Choose from "
-                     f"{MODEL_NAMES + (SEVERITY_MODEL_NAME,) + tuple(SEVERITY_ABLATIONS)}.")
+        return {}
+    if model_name not in SEVERITY_ABLATIONS:
+        raise ValueError(f"Unknown model {model_name!r}. Choose from {MODEL_NAMES}.")
+    return {**ABLATION_DEFAULTS, **SEVERITY_ABLATIONS[model_name]}
+
+
+def build_model(model_name: str, num_speakers: int = 1,
+                gradient_checkpointing: Optional[bool] = None) -> GatedFusionModel:
+    """num_speakers sizes the adversarial speaker head (this fold's training
+    speakers); it does not affect the severity path."""
+    return GatedFusionModel(num_classes=config.NUM_CLASSES, num_speakers=num_speakers,
+                            gradient_checkpointing=gradient_checkpointing,
+                            **model_switches(model_name))
 
 
 def parameter_counts(model: nn.Module) -> Dict[str, float]:
-    """Trainable / total parameter counts and trainable percentage for any of
-    the six ablation variants — generalizes DeepPathway.trainable_parameter_summary()
-    (which only counts the wav2vec submodule) to the whole model, so a model with
-    an always-trainable MFCC CNN or classifier head (e.g. "acoustic", "deep_frozen")
-    reports its true trainable/total split, not just its backbone's.
-
-    Used by the requirement-7 comparison table (trainable param count / % columns)
-    and by src/training/reporting.py::save_experiment_bundle's config.json.
-    """
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    return {
-        "trainable_params": trainable,
-        "total_params": total,
-        "trainable_pct": 100 * trainable / total if total else 0.0,
-    }
+    return {"trainable_params": trainable, "total_params": total,
+            "trainable_pct": 100 * trainable / total if total else 0.0}

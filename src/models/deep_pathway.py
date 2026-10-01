@@ -1,12 +1,8 @@
 """
-Deep Pathway (Role 1): wav2vec 2.0 + LoRA adapters.
-
-Loads a pre-trained wav2vec 2.0 backbone and injects LoRA adapters into the
-self-attention layers so the model can adapt to pathological speech traits
-without full fine-tuning. Forward pass outputs the 768-dimensional latent
-embedding consumed by the fusion head.
-
-Requires: transformers, peft
+Learned branch backbone: wav2vec 2.0 (facebook/wav2vec2-base-960h) with LoRA
+adapters on the self-attention q/k/v projections of all 12 encoder layers. The
+backbone weights stay frozen; only the adapters train. Output is the
+768-dimensional hidden state, mean-pooled over real (unpadded) frames.
 """
 
 import warnings
@@ -19,269 +15,75 @@ from transformers import Wav2Vec2Config, Wav2Vec2Model
 
 from src import config
 
-# The public model card needs no auth; this notice ("set HF_TOKEN for higher
-# rate limits") fires once per process on the first from_pretrained() call
-# and is not actionable in a fixed CI/notebook run — filtered here rather than
-# left to print itself into every notebook that touches the Deep Pathway.
+# "Set HF_TOKEN for higher rate limits" fires on every first load of a public
+# checkpoint and is not actionable here.
 warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
 
 
 class DeepPathway(nn.Module):
-    """wav2vec 2.0, mean-pooled to a 768-dim vector.
+    """(batch, samples) raw 16 kHz audio -> (batch, 768)."""
 
-    use_lora=True  (default) injects LoRA adapters into the self-attention
-                   projections and leaves the rest of the backbone frozen —
-                   the team spec's adaptable Deep Pathway.
-    use_lora=False loads the plain backbone with every parameter frozen —
-                   reproduces the base paper's frozen wav2vec 2.0 feature
-                   extractor, used as an ablation baseline.
-    normalize_input=False (default) feeds the waveform to wav2vec2 exactly
-                   as src.preprocessing hands it over (unchanged behavior
-                   for every existing caller — the legacy fusion/concat/
-                   attention models in src/training/models.py and the
-                   frozen-embedding baseline in src/training/baseline.py).
-    normalize_input=True applies the checkpoint-compatible zero-mean/unit-
-                   variance normalization facebook/wav2vec2-base-960h's own
-                   Wav2Vec2FeatureExtractor performs (do_normalize=True) —
-                   per utterance, over that utterance's own valid samples
-                   only, so it carries no cross-utterance/fold statistics
-                   and cannot leak held-out-speaker information. Used by
-                   src.models.gated_fusion.GatedFusionModel only.
-    """
-
-    def __init__(self, use_lora: bool = True, normalize_input: bool = False,
-                 gradient_checkpointing: Optional[bool] = None):
+    def __init__(self, gradient_checkpointing: Optional[bool] = None):
         super().__init__()
         if gradient_checkpointing is None:
             gradient_checkpointing = config.WAV2VEC_GRADIENT_CHECKPOINTING
-        self.use_lora = use_lora
-        self.normalize_input = normalize_input
-        backbone_config = Wav2Vec2Config.from_pretrained(
-            config.WAV2VEC_MODEL_NAME, token=config.HF_TOKEN)
+        backbone_config = Wav2Vec2Config.from_pretrained(config.WAV2VEC_MODEL_NAME,
+                                                         token=config.HF_TOKEN)
         if not config.WAV2VEC_APPLY_SPEC_AUGMENT:
-            # facebook/wav2vec2-base-960h is a CTC checkpoint whose weights
-            # omit masked_spec_embed. In Transformers 5.5.4, positive masking
-            # probabilities would instantiate that parameter randomly and use
-            # it during model.train(). Set both flags before construction so
-            # the learned branch contains no unpretrained masking component.
+            # The CTC checkpoint has no pretrained masked_spec_embed; with a
+            # positive masking probability Transformers would create a random
+            # one and use it in training. Disable before construction.
             backbone_config.apply_spec_augment = False
             backbone_config.mask_time_prob = 0.0
             backbone_config.mask_feature_prob = 0.0
-        backbone = Wav2Vec2Model.from_pretrained(
-            config.WAV2VEC_MODEL_NAME, config=backbone_config, token=config.HF_TOKEN)
-        # Kept as a direct reference to the (unwrapped) backbone so the
-        # sample-length -> feature-length conversion below still works after
-        # get_peft_model wraps it — get_peft_model wraps this same nn.Module
-        # in place rather than copying it, so the bound method stays valid
-        # and correct (it's a pure function of conv strides, unaffected by
-        # LoRA adapters) even when self.wav2vec becomes a PeftModel.
+        backbone = Wav2Vec2Model.from_pretrained(config.WAV2VEC_MODEL_NAME, config=backbone_config,
+                                                 token=config.HF_TOKEN)
+        # A pure function of the conv strides; still valid after peft wraps
+        # the backbone in place.
         self._feat_extract_output_lengths = backbone._get_feat_extract_output_lengths
 
-        if use_lora:
-            lora_config = LoraConfig(
-                r=config.LORA_RANK,
-                lora_alpha=config.LORA_ALPHA,
-                lora_dropout=config.LORA_DROPOUT,
-                target_modules=config.LORA_TARGET_MODULES,
-                bias="none",
-            )
-            self.wav2vec = get_peft_model(backbone, lora_config)
-            # use_reentrant=False recomputes activations during backward instead
-            # of storing them for every transformer layer - the standard ~20-30%
-            # compute / ~40% activation-memory trade-off. Only meaningful with
-            # LoRA: a frozen backbone never builds a backward graph at all.
-            #
-            # Enabled AFTER get_peft_model, on the same backbone module (peft
-            # wraps it in place). Enabling it BEFORE makes PeftModel.__init__
-            # call enable_input_require_grads(), which raises
-            # NotImplementedError on Transformers 4.x because Wav2Vec2Model has
-            # no input embeddings (it takes raw audio). The reentrant-free
-            # checkpoint only needs a trainable param inside each segment (the
-            # LoRA adapters), not a grad-requiring input, so the order changes
-            # nothing numerically.
-            #
-            # Switchable (config.WAV2VEC_GRADIENT_CHECKPOINTING): the Kaggle
-            # T4 run peaked at 3.6 of 15.6 GB, so memory is not the binding
-            # constraint there and the recompute may be pure overhead — see
-            # src.training.session.benchmark_batch_sizes, which measures both.
-            if gradient_checkpointing:
-                backbone.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": False})
-        else:
-            for param in backbone.parameters():
-                param.requires_grad = False
-            backbone.eval()
-            self.wav2vec = backbone
-
-    def train(self, mode: bool = True):
-        """
-        Keep the frozen backbone (use_lora=False) in eval mode even when the
-        engine calls model.train() for a training epoch — engine.run_epoch
-        toggles the whole model with one model.train(mode=train) call, which
-        would otherwise re-enable the backbone's internal dropout layers
-        despite every backbone param having requires_grad=False. Frozen
-        should mean deterministic, not "no weight updates but still noisy."
-        """
-        super().train(mode)
-        if not self.use_lora:
-            self.wav2vec.eval()
-        return self
-
-    def forward_sequence(self, waveform: torch.Tensor,
-                        attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        The per-frame hidden states, *before* the mean-pool that forward() applies.
-
-        Phase 6's attention fusion needs these: cross-attention over a single
-        mean-pooled vector is a no-op (a softmax over one key is always 1.0), so
-        attending to wav2vec's evidence requires the frames it is pooled from.
-
-        Args:
-            waveform: (batch, samples) raw 16 kHz audio, right-padded with
-                zeros past each row's true length.
-            attention_mask: (batch, samples) bool/long, True/1 for real audio,
-                False/0 for padding — passed straight to Wav2Vec2Model, which
-                natively converts a sample-level mask to its internal
-                feature-level one. None (default) attends over every sample,
-                including padding — only safe when the caller already knows
-                there is no padding (e.g. a single un-batched utterance).
-        Returns:
-            (batch, frames, 768) — ~199 frames for a 4-second clip.
-        """
-        if self.normalize_input:
-            waveform = self._zero_mean_unit_var_norm(waveform, attention_mask)
-        return self.wav2vec(waveform, attention_mask=attention_mask).last_hidden_state
+        self.wav2vec = get_peft_model(backbone, LoraConfig(
+            r=config.LORA_RANK, lora_alpha=config.LORA_ALPHA, lora_dropout=config.LORA_DROPOUT,
+            target_modules=config.LORA_TARGET_MODULES, bias="none"))
+        # After get_peft_model: enabling it first makes peft call
+        # enable_input_require_grads(), which Wav2Vec2Model (raw-audio input,
+        # no input embeddings) does not implement.
+        if gradient_checkpointing:
+            backbone.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
 
     @staticmethod
     def _zero_mean_unit_var_norm(waveform: torch.Tensor,
                                  attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        Per-utterance zero-mean/unit-variance waveform normalization, exactly
-        matching transformers.Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm
-        (the preprocessing facebook/wav2vec2-base-960h's own feature extractor
-        applies, do_normalize=True — verified against the live HF checkpoint
-        config). Statistics are computed from EACH utterance's own valid
-        (pre-padding) samples only: this is per-example, not a fold-level or
-        dataset-level statistic, so it carries no cross-utterance information
-        and cannot leak a held-out speaker's distribution into anything.
-
-        attention_mask (batch, samples), True/1 = real audio: when given, the
-        padded tail of the normalized waveform is forced back to exact zero
-        (matching HF's own convention) rather than left as an arbitrary
-        normalized padding value. None (single known-unpadded utterance)
-        normalizes over the whole tensor.
-        """
+        """Per-utterance zero-mean / unit-variance over each row's valid
+        samples — what the checkpoint's own Wav2Vec2FeatureExtractor does
+        (do_normalize=True). Padding is forced back to exact zero. Purely
+        per-example, so it cannot leak statistics across speakers or folds."""
         if attention_mask is None:
             mean = waveform.mean(dim=-1, keepdim=True)
             var = waveform.var(dim=-1, unbiased=False, keepdim=True)
             return (waveform - mean) / torch.sqrt(var + 1e-7)
+        mask = attention_mask.to(waveform.dtype)
+        count = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        mean = (waveform * mask).sum(dim=-1, keepdim=True) / count
+        var = (((waveform - mean) * mask) ** 2).sum(dim=-1, keepdim=True) / count
+        return (waveform - mean) / torch.sqrt(var + 1e-7) * mask
 
-        lengths = attention_mask.sum(dim=1)
-        normalized = waveform.clone()
-        for i in range(waveform.shape[0]):
-            length = int(lengths[i].item())
-            if length <= 0:
-                continue
-            valid = waveform[i, :length]
-            mean = valid.mean()
-            var = valid.var(unbiased=False)
-            normalized[i, :length] = (valid - mean) / torch.sqrt(var + 1e-7)
-            if length < waveform.shape[1]:
-                normalized[i, length:] = 0.0
-        return normalized
-
-    def sequence_key_padding_mask(self, waveform: torch.Tensor,
-                                  attention_mask: torch.Tensor) -> torch.Tensor:
-        """
-        The frame-level padding mask matching forward_sequence's output, in
-        nn.MultiheadAttention's key_padding_mask convention (True = ignore
-        this position). Derived from the same sample lengths so the frame
-        count lines up exactly with what forward_sequence actually returns
-        for this waveform's shape.
-        """
-        num_frames = self._num_frames(waveform)
-        lengths = attention_mask.sum(dim=1)
-        feat_lengths = self._feat_extract_output_lengths(lengths)
-        frame_idx = torch.arange(num_frames, device=waveform.device)[None, :]
-        return frame_idx >= feat_lengths[:, None]           # True where padded
-
-    def _num_frames(self, waveform: torch.Tensor) -> int:
-        result = self._feat_extract_output_lengths(waveform.shape[1])
-        return int(result.item()) if torch.is_tensor(result) else int(result)
+    def frame_padding_mask(self, num_samples: int, attention_mask: torch.Tensor) -> torch.Tensor:
+        """(batch, frames) True where a wav2vec2 output frame is padding."""
+        num_frames = int(self._feat_extract_output_lengths(num_samples))
+        feat_lengths = self._feat_extract_output_lengths(attention_mask.sum(dim=1))
+        frame_idx = torch.arange(num_frames, device=attention_mask.device)[None, :]
+        return frame_idx >= feat_lengths[:, None]
 
     def forward(self, waveform: torch.Tensor,
-               attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            waveform: (batch, samples) raw 16 kHz audio.
-            attention_mask: see forward_sequence. When given, the mean-pool
-                below also excludes padded frames — otherwise every padded
-                utterance's embedding is diluted by however much silence was
-                appended to reach the fixed MAX_SAMPLES window.
-        Returns:
-            (batch, 768) latent embedding, mean-pooled over real frames only.
-        """
-        hidden = self.forward_sequence(waveform, attention_mask)
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """attention_mask: (batch, samples), True for real audio. The
+        transformer ignores padded frames and the mean-pool excludes them."""
+        waveform = self._zero_mean_unit_var_norm(waveform, attention_mask)
+        hidden = self.wav2vec(waveform, attention_mask=attention_mask).last_hidden_state
         if attention_mask is None:
             return hidden.mean(dim=1)
-
-        key_padding_mask = self.sequence_key_padding_mask(waveform, attention_mask)
-        frame_mask = (~key_padding_mask).unsqueeze(-1).to(hidden.dtype)  # (B, T, 1)
-        summed = (hidden * frame_mask).sum(dim=1)
-        counts = frame_mask.sum(dim=1).clamp(min=1.0)
-        return summed / counts
-
-    def forward_all_layers(self, waveform: torch.Tensor,
-                           attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Every hidden-state layer (CNN feature-extractor output + all 12
-        transformer layers), each mean-pooled over time — the base paper
-        (Javanmardi et al., ICASSP 2023) sweeps per-layer embeddings and
-        finds different layers win for detection (layer 1) vs. severity
-        (layer 13/final), so forward()'s final-layer-only pooling can't
-        reproduce that comparison. Only meaningful with use_lora=False,
-        since LoRA fine-tunes the backbone that produces these layers.
-
-        Args:
-            waveform: (batch, samples) raw 16 kHz audio.
-            attention_mask: (batch, samples) bool/long, True/1 for real audio.
-                When given, the per-layer mean-pool excludes padded frames,
-                exactly as forward() does.
-
-                This matters more here than anywhere else in the project.
-                Utterances are pad/truncated to a fixed 4-second window and the
-                median padding fraction of that window is ~86% (measured in
-                notebooks/01_data_pipeline.ipynb Stage 9), so an UNMASKED mean
-                is dominated by silence — roughly six parts padding to one part
-                speech. Leaving the mask off was how the Phase 2 SVM layer sweep
-                was originally computed, and it is the leading candidate
-                explanation for that reproduction landing at 82.25% against the
-                paper's 93.95%. Both variants are kept available so the
-                difference can be REPORTED as a diagnostic rather than silently
-                corrected — see src.training.baseline.
-
-                None (the default) preserves the original unmasked behaviour so
-                previously cached sweeps stay reproducible.
-        Returns:
-            (batch, 13, 768) mean-pooled embedding per layer.
-        """
-        outputs = self.wav2vec(waveform, attention_mask=attention_mask,
-                               output_hidden_states=True)
-        hidden_states = torch.stack(outputs.hidden_states, dim=1)  # (B, 13, T, 768)
-        if attention_mask is None:
-            return hidden_states.mean(dim=2)
-
-        # One frame mask, broadcast across all 13 layers — every layer shares
-        # the same time axis, so the padded positions are identical throughout.
-        key_padding_mask = self.sequence_key_padding_mask(waveform, attention_mask)
-        frame_mask = (~key_padding_mask)[:, None, :, None].to(hidden_states.dtype)
-        summed = (hidden_states * frame_mask).sum(dim=2)           # (B, 13, 768)
-        counts = frame_mask.sum(dim=2).clamp(min=1.0)              # (B, 1, 1)
-        return summed / counts
-
-    def trainable_parameter_summary(self) -> str:
-        """Human-readable count of trainable (LoRA) vs frozen parameters."""
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.parameters())
-        return (f"trainable: {trainable:,} / total: {total:,} "
-                f"({100 * trainable / total:.2f}%)")
+        keep = (~self.frame_padding_mask(waveform.shape[1], attention_mask)).unsqueeze(-1)
+        keep = keep.to(hidden.dtype)
+        return (hidden * keep).sum(dim=1) / keep.sum(dim=1).clamp(min=1.0)

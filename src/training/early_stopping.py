@@ -1,35 +1,36 @@
-"""Early stopping on a monitored validation metric."""
+"""Early stopping on a monitored validation value."""
 
 
 class EarlyStopping:
-    """Tracks the best value of a monitored metric and signals when to stop.
+    """Tracks the best value and signals a stop after `patience` epochs
+    without improvement. mode="min" for a loss, "max" for a score."""
 
-    mode="min" for a loss (lower is better), mode="max" for a score like F1.
-    """
-
-    def __init__(self, patience: int = 5, mode: str = "min", min_delta: float = 0.0):
+    def __init__(self, patience: int = 3, mode: str = "min", min_delta: float = 0.0):
         if mode not in ("min", "max"):
             raise ValueError(f"mode must be 'min' or 'max', got {mode!r}")
         self.patience = patience
         self.mode = mode
         self.min_delta = min_delta
-        self.best: float = float("inf") if mode == "min" else float("-inf")
+        self.best = float("inf") if mode == "min" else float("-inf")
         self.num_bad_epochs = 0
         self.should_stop = False
 
-    def _is_improvement(self, value: float) -> bool:
-        if self.mode == "min":
-            return value < self.best - self.min_delta
-        return value > self.best + self.min_delta
-
     def step(self, value: float) -> bool:
-        """Update state with the latest epoch's value. Returns True if it's a new best."""
-        if self._is_improvement(value):
-            self.best = value
-            self.num_bad_epochs = 0
+        """Record one epoch's value; True if it is a new best. NaN never is."""
+        improved = (value < self.best - self.min_delta if self.mode == "min"
+                    else value > self.best + self.min_delta)
+        if improved:
+            self.best, self.num_bad_epochs = value, 0
             return True
-
         self.num_bad_epochs += 1
-        if self.num_bad_epochs >= self.patience:
-            self.should_stop = True
+        self.should_stop = self.num_bad_epochs >= self.patience
         return False
+
+    def state_dict(self) -> dict:
+        return {"best": self.best, "num_bad_epochs": self.num_bad_epochs,
+                "should_stop": self.should_stop}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.best = state.get("best", self.best)
+        self.num_bad_epochs = state.get("num_bad_epochs", 0)
+        self.should_stop = state.get("should_stop", False)

@@ -35,7 +35,7 @@ sessions in a way audio/normalized would have controlled for, and this
 pipeline applies no corpus-level loudness normalization of its own
 (src/preprocessing.py resamples and VAD-trims but never rescales
 amplitude). This is a real, documented limitation, not an oversight — see
-src.results.LIMITATIONS and README "Preprocessing" — and is specifically
+README "Limitations and open questions" — and is specifically
 relevant to the suprasegmental branch's intensity/energy input channel,
 which reads raw per-utterance loudness.
 
