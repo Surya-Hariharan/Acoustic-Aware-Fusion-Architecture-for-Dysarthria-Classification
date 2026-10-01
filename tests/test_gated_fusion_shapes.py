@@ -39,7 +39,7 @@ def _dummy_batch(batch_size=4, device="cpu"):
 
 
 def test_branch_bottleneck_dimensions_match_config():
-    model = GatedFusionModel(num_classes=4, num_speakers=3, use_lora=True).eval()
+    model = GatedFusionModel(num_classes=4, num_speakers=3).eval()
     backbone = model.deep_pathway.wav2vec.base_model.model
     assert not backbone.config.apply_spec_augment
     assert backbone.config.mask_time_prob == backbone.config.mask_feature_prob == 0.0
@@ -53,7 +53,7 @@ def test_branch_bottleneck_dimensions_match_config():
 
 
 def test_fused_dimension_is_256_and_gates_sum_to_one():
-    model = GatedFusionModel(num_classes=4, num_speakers=3, use_lora=True).eval()
+    model = GatedFusionModel(num_classes=4, num_speakers=3).eval()
     waveform, mfcc, supra, attention_mask, supra_valid_frames, _ = _dummy_batch()
     with torch.no_grad():
         z_l, z_s, z_p = model.encode_branches(waveform, mfcc, supra, attention_mask, supra_valid_frames)
@@ -65,10 +65,10 @@ def test_fused_dimension_is_256_and_gates_sum_to_one():
 
 
 def test_forward_produces_valid_class_probabilities():
-    model = GatedFusionModel(num_classes=4, num_speakers=3, use_lora=True).eval()
+    model = GatedFusionModel(num_classes=4, num_speakers=3).eval()
     waveform, mfcc, supra, attention_mask, supra_valid_frames, _ = _dummy_batch()
     with torch.no_grad():
-        logits = model(waveform=waveform, mfcc=mfcc, attention_mask=attention_mask,
+        logits = model(waveform=waveform, segmental=mfcc, attention_mask=attention_mask,
                        supra=supra, supra_valid_frames=supra_valid_frames)
     assert logits.shape == (4, 4)
     assert torch.isfinite(logits).all()
@@ -76,21 +76,20 @@ def test_forward_produces_valid_class_probabilities():
     assert torch.allclose(probs.sum(dim=1), torch.ones(4), atol=1e-4)
 
 
-def test_forward_features_plus_classifier_matches_forward():
-    model = GatedFusionModel(num_classes=4, num_speakers=3, use_lora=True).eval()
+def test_fuse_plus_classifier_matches_forward():
+    model = GatedFusionModel(num_classes=4, num_speakers=3).eval()
     waveform, mfcc, supra, attention_mask, supra_valid_frames, _ = _dummy_batch()
     with torch.no_grad():
-        logits = model(waveform=waveform, mfcc=mfcc, attention_mask=attention_mask,
+        logits = model(waveform=waveform, segmental=mfcc, attention_mask=attention_mask,
                        supra=supra, supra_valid_frames=supra_valid_frames)
-        features = model.forward_features(waveform=waveform, mfcc=mfcc, attention_mask=attention_mask,
-                                          supra=supra, supra_valid_frames=supra_valid_frames)
-        logits_via_classifier = model.classifier(features)
-    assert features.shape == (4, config.FUSED_EMBED_DIM)
-    assert torch.allclose(logits, logits_via_classifier, atol=1e-5)
+        fused, _ = model.fuse(*model.encode_branches(waveform, mfcc, supra, attention_mask,
+                                                     supra_valid_frames))
+    assert fused.shape == (4, config.FUSED_EMBED_DIM)
+    assert torch.allclose(logits, model.classifier(fused), atol=1e-5)
 
 
 def test_training_step_backward_pass_reaches_lora_adapters():
-    model = GatedFusionModel(num_classes=4, num_speakers=5, use_lora=True)
+    model = GatedFusionModel(num_classes=4, num_speakers=5)
     model.train()
     waveform, mfcc, supra, attention_mask, supra_valid_frames, _ = _dummy_batch(batch_size=6)
     labels = torch.tensor([0, 1, 2, 3, 0, 1])
@@ -98,7 +97,7 @@ def test_training_step_backward_pass_reaches_lora_adapters():
     class_weights = torch.ones(4)
 
     logits, loss, extras = model.training_step(
-        waveform=waveform, mfcc=mfcc, supra=supra, attention_mask=attention_mask,
+        waveform=waveform, segmental=mfcc, supra=supra, attention_mask=attention_mask,
         labels=labels, supra_valid_frames=supra_valid_frames, speaker_index=speaker_index,
         class_weights=class_weights)
 
@@ -117,13 +116,13 @@ def test_training_step_backward_pass_reaches_lora_adapters():
 
 
 def test_ablate_each_branch_changes_the_output():
-    model = GatedFusionModel(num_classes=4, num_speakers=3, use_lora=True).eval()
+    model = GatedFusionModel(num_classes=4, num_speakers=3).eval()
     waveform, mfcc, supra, attention_mask, supra_valid_frames, _ = _dummy_batch()
     with torch.no_grad():
-        full = model(waveform=waveform, mfcc=mfcc, attention_mask=attention_mask,
+        full = model(waveform=waveform, segmental=mfcc, attention_mask=attention_mask,
                      supra=supra, supra_valid_frames=supra_valid_frames)
         for branch in ("learned", "segmental", "supra"):
-            ablated = model.ablate(waveform=waveform, mfcc=mfcc, attention_mask=attention_mask,
+            ablated = model.ablate(waveform=waveform, segmental=mfcc, attention_mask=attention_mask,
                                    supra=supra, supra_valid_frames=supra_valid_frames,
                                    drop_branch=branch)
             assert ablated.shape == full.shape
@@ -131,10 +130,10 @@ def test_ablate_each_branch_changes_the_output():
 
 
 def test_ablate_invalid_branch_name_raises():
-    model = GatedFusionModel(num_classes=4, num_speakers=3, use_lora=True).eval()
+    model = GatedFusionModel(num_classes=4, num_speakers=3).eval()
     waveform, mfcc, supra, attention_mask, supra_valid_frames, _ = _dummy_batch()
     try:
-        model.ablate(waveform=waveform, mfcc=mfcc, attention_mask=attention_mask,
+        model.ablate(waveform=waveform, segmental=mfcc, attention_mask=attention_mask,
                      supra=supra, supra_valid_frames=supra_valid_frames,
                      drop_branch="not_a_real_branch")
         assert False, "expected ValueError on an unknown branch name"
@@ -146,7 +145,7 @@ if __name__ == "__main__":
     test_branch_bottleneck_dimensions_match_config()
     test_fused_dimension_is_256_and_gates_sum_to_one()
     test_forward_produces_valid_class_probabilities()
-    test_forward_features_plus_classifier_matches_forward()
+    test_fuse_plus_classifier_matches_forward()
     test_training_step_backward_pass_reaches_lora_adapters()
     test_ablate_each_branch_changes_the_output()
     test_ablate_invalid_branch_name_raises()

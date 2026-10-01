@@ -1,32 +1,11 @@
 """
-Integration coverage for the real UASpeechDataset -> DataLoader -> training
-engine -> GatedFusionModel data path (src/dataset.py, src/training/data.py,
-src/training/engine.py, src/models/gated_fusion.py).
+Integration over the real data path: UASpeechDataset -> build_loaders ->
+run_epoch -> GatedFusionModel, on a small slice of real UA-Speech utterances,
+plus the fold-scoped normalization and the wav2vec2 input normalization.
 
-This is deliberately NOT a shape-only unit test like test_gated_fusion_shapes.py
-(whose _dummy_batch() hand-builds a correctly-shaped 43-channel `mfcc` tensor
-directly, bypassing the real dataset/engine wiring entirely). It exists
-because that bypass is exactly what let a real wiring bug slip past every
-other test: src/training/engine.py used to read batch["mfcc"] (the legacy
-39-channel Acoustic Pathway tensor) and hand it to GatedFusionModel's
-Segmental branch, which needs the 43-channel batch["segmental"] tensor
-instead — a mismatch invisible to any test that never builds a real batch
-from a real UASpeechDataset.
-
-Also covers the fold-scoped, leakage-safe normalization added alongside that
-fix (src.preprocessing.segmental_standardizer / suprasegmental_standardizer /
-normalize_segmental / normalize_suprasegmental) and the checkpoint-compatible
-Wav2Vec2 waveform normalization (src.models.deep_pathway.DeepPathway.
-_zero_mean_unit_var_norm).
-
-Requires the real M6 manifest + extracted audio (data/extracted/, per
-config.MANIFEST_PATH) — skipped entirely if that data is not present on this
-machine, since it is not checked into the repository.
-
-Run with: pytest tests/test_three_branch_integration.py -v
+Requires the real M6 manifest and extracted audio; skipped otherwise.
 """
 
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -35,137 +14,70 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from src import config
 from src.dataset import UASpeechDataset
 from src.models.deep_pathway import DeepPathway
-from src.models.gated_fusion import GatedFusionModel
-from src.models.segmental_pathway import SegmentalPathway
-from src.preprocessing import (normalize_segmental, normalize_suprasegmental,
-                               segmental_standardizer, suprasegmental_standardizer)
-from src.training.data import build_speaker_label_map
+from src.preprocessing import (normalize_segmental, segmental_standardizer,
+                               suprasegmental_standardizer)
+from src.training.data import build_loaders, build_speaker_label_map, shutdown_loaders
+from src.training.engine import build_optimizer, run_epoch
+from src.training.models import build_model
 
 pytestmark = pytest.mark.skipif(
     not Path(config.MANIFEST_PATH).exists(),
-    reason="Requires the real M6 manifest + extracted UA-Speech audio "
-           "(notebooks/01_data_pipeline.ipynb); not present on this machine.")
+    reason="Requires the real M6 manifest + extracted UA-Speech audio.")
 
 
 def _small_fold(held_out_speaker="M08", utterances_per_speaker=2):
-    """A tiny, real LOSO-shaped fold: a handful of utterances per training
-    speaker, plus a few held-out utterances from a speaker never in
-    train_df — enough to exercise the real pipeline without pulling in the
-    full ~21k-utterance manifest on every test run."""
+    """A tiny real LOSO-shaped fold: a few utterances per training speaker and
+    a few from a held-out speaker never in train_df."""
     df = pd.read_csv(config.MANIFEST_PATH)
     dysarthric = df[df["Severity"] != "N/A (Control)"]
     train_df = (dysarthric[dysarthric["Speaker_ID"] != held_out_speaker]
                 .groupby("Speaker_ID").head(utterances_per_speaker).reset_index(drop=True))
     test_df = (dysarthric[dysarthric["Speaker_ID"] == held_out_speaker]
-              .head(utterances_per_speaker).reset_index(drop=True))
-    assert len(train_df) > 0 and len(test_df) > 0, "fixture manifest slice came back empty"
-    assert held_out_speaker not in set(train_df["Speaker_ID"])
+               .head(utterances_per_speaker).reset_index(drop=True))
+    assert len(train_df) > 0 and len(test_df) > 0
     return train_df, test_df
 
 
-def test_dataset_produces_43x401_segmental_and_3x401_supra():
+def test_dataset_items_carry_the_three_branch_inputs():
     train_df, _ = _small_fold()
-    ds = UASpeechDataset(train_df, include_three_branch=True)
-    item = ds[0]
+    item = UASpeechDataset(train_df, speaker_label_map=build_speaker_label_map(train_df))[0]
+    assert tuple(item["waveform"].shape) == (1, config.MAX_SAMPLES)
     assert tuple(item["segmental"].shape) == (config.SEGMENTAL_CHANNELS, 401) == (43, 401)
     assert tuple(item["supra"].shape) == (config.SUPRA_CHANNELS, 401) == (3, 401)
-    assert not torch.isnan(item["segmental"]).any()
-    assert not torch.isinf(item["segmental"]).any()
+    assert torch.isfinite(item["segmental"]).all() and torch.isfinite(item["supra"]).all()
+    assert 0 < int(item["supra_valid_frames"]) <= 401
+    assert {"severity_label", "speaker_index", "speaker_id", "filename"} <= set(item)
 
 
-def test_training_batch_contains_the_three_model_inputs_with_expected_shapes():
-    train_df, _ = _small_fold()
+def test_a_real_fold_trains_and_evaluates_through_the_engine():
+    """build_loaders -> run_epoch(train) -> run_epoch(test, embeddings): the
+    exact path run_fold takes, on real utterances."""
+    train_df, test_df = _small_fold()
     speaker_map = build_speaker_label_map(train_df)
-    ds = UASpeechDataset(train_df, include_three_branch=True, speaker_label_map=speaker_map)
-    loader = DataLoader(ds, batch_size=len(train_df), shuffle=False)
-    batch = next(iter(loader))
+    train_loader, _, test_loader = build_loaders(
+        train_df, test_df.iloc[:0], test_df, batch_size=8, pin_memory=False,
+        speaker_label_map=speaker_map, num_workers=0)
+    model = build_model("gated_fusion_three_branch", num_speakers=len(speaker_map))
+    optimizer = build_optimizer(model, 1e-3, 1e-4, 1e-2)
+    device = torch.device("cpu")
+    lora_before = {n: p.detach().clone() for n, p in model.named_parameters() if "lora_B" in n}
+    try:
+        train = run_epoch(model, train_loader, device, optimizer=optimizer, amp_enabled=False)
+        test = run_epoch(model, test_loader, device, amp_enabled=False, collect_embeddings=True)
+    finally:
+        shutdown_loaders()
 
-    for key in ("waveform", "mfcc", "segmental", "supra", "supra_valid_frames", "speaker_index"):
-        assert key in batch, f"expected '{key}' in a three-branch batch"
-
-    batch_size = len(train_df)
-    assert tuple(batch["segmental"].shape) == (batch_size, 43, 401)
-    assert tuple(batch["supra"].shape) == (batch_size, 3, 401)
-    # The legacy 39-channel tensor (still present for AcousticPathway/other
-    # models) must NOT be what reaches SegmentalPathway — see the engine.py
-    # wiring test below.
-    assert batch["mfcc"].shape[-2] == 39
-
-
-def test_segmental_pathway_receives_43_channels_from_a_real_batch():
-    """Reproduces src/training/engine.py's actual batch handling: the tensor
-    fed to SegmentalPathway must be batch["segmental"] (43ch), not
-    batch["mfcc"] (39ch, plus a leading dim SegmentalPathway never squeezes)."""
-    train_df, _ = _small_fold()
-    ds = UASpeechDataset(train_df, include_three_branch=True)
-    loader = DataLoader(ds, batch_size=len(train_df), shuffle=False)
-    batch = next(iter(loader))
-
-    segmental_pathway_input = batch["segmental"] if "segmental" in batch else batch["mfcc"]
-    model = SegmentalPathway()
-    out = model(segmental_pathway_input)
-    assert out.shape == (len(train_df), config.SEGMENTAL_EMBED_DIM)
-
-    with pytest.raises(RuntimeError):
-        model(batch["mfcc"])   # the old (buggy) wiring must still fail loudly
-
-
-def test_gated_fusion_model_full_forward_on_a_real_dataset_batch():
-    train_df, _ = _small_fold()
-    speaker_map = build_speaker_label_map(train_df)
-    ds = UASpeechDataset(train_df, include_three_branch=True, speaker_label_map=speaker_map)
-    loader = DataLoader(ds, batch_size=len(train_df), shuffle=False)
-    batch = next(iter(loader))
-
-    waveform = batch["waveform"].squeeze(1)
-    waveform_length = batch["waveform_length"]
-    attention_mask = (torch.arange(waveform.shape[1])[None, :] < waveform_length[:, None])
-    segmental_pathway_input = batch["segmental"] if "segmental" in batch else batch["mfcc"]
-
-    model = GatedFusionModel(num_classes=4, num_speakers=len(speaker_map), use_lora=True).eval()
-    with torch.no_grad():
-        logits = model(waveform=waveform, mfcc=segmental_pathway_input, attention_mask=attention_mask,
-                      supra=batch["supra"], supra_valid_frames=batch["supra_valid_frames"])
-    assert logits.shape == (len(train_df), 4)
-    assert torch.isfinite(logits).all()
-
-
-def test_training_step_forward_and_backward_on_a_real_dataset_batch():
-    """The complete training path (src/training/engine.py's real wiring,
-    reproduced here): a real dataset batch through GatedFusionModel.
-    training_step, with a backward pass reaching the LoRA adapters."""
-    train_df, _ = _small_fold()
-    speaker_map = build_speaker_label_map(train_df)
-    ds = UASpeechDataset(train_df, include_three_branch=True, speaker_label_map=speaker_map)
-    loader = DataLoader(ds, batch_size=len(train_df), shuffle=False)
-    batch = next(iter(loader))
-
-    waveform = batch["waveform"].squeeze(1)
-    waveform_length = batch["waveform_length"]
-    attention_mask = (torch.arange(waveform.shape[1])[None, :] < waveform_length[:, None])
-    segmental_pathway_input = batch["segmental"] if "segmental" in batch else batch["mfcc"]
-
-    model = GatedFusionModel(num_classes=4, num_speakers=len(speaker_map), use_lora=True)
-    model.train()
-    logits, loss, extras = model.training_step(
-        waveform=waveform, mfcc=segmental_pathway_input, supra=batch["supra"],
-        attention_mask=attention_mask, labels=batch["severity_label"],
-        supra_valid_frames=batch["supra_valid_frames"], speaker_index=batch["speaker_index"],
-        class_weights=torch.ones(4))
-
-    assert logits.shape == (len(train_df), 4)
-    assert torch.isfinite(loss)
-    loss.backward()
-
-    lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
-    assert len(lora_params) > 0
-    assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
-              for p in lora_params), "no LoRA adapter received a nonzero gradient"
+    assert np.isfinite(train.loss) and np.isfinite(train.extras["speaker_loss"])
+    assert any(not torch.equal(p, lora_before[n]) for n, p in model.named_parameters()
+               if "lora_B" in n), "no LoRA adapter was updated"
+    assert len(test.y_pred) == len(test_df) and set(test.speaker_ids) == {"M08"}
+    assert np.isnan(test.extras["speaker_loss"])             # no speaker labels at test time
+    assert test.embeddings["fused"].shape == (len(test_df), config.FUSED_EMBED_DIM)
+    assert np.allclose(test.embeddings["gates"].sum(axis=1), 1.0, atol=1e-5)
+    assert {"learned", "segmental", "supra"} <= set(test.embeddings)
 
 
 def test_normalization_statistics_never_touch_the_held_out_speaker():
@@ -214,8 +126,8 @@ def test_normalization_statistics_derived_only_from_the_training_partition():
 def test_suprasegmental_normalization_preserves_the_voicing_mask():
     train_df, _ = _small_fold()
     supra_stats = suprasegmental_standardizer(train_df["Filepath"])
-    ds_raw = UASpeechDataset(train_df, include_three_branch=True)
-    ds_norm = UASpeechDataset(train_df, include_three_branch=True, supra_stats=supra_stats)
+    ds_raw = UASpeechDataset(train_df)
+    ds_norm = UASpeechDataset(train_df, supra_stats=supra_stats)
 
     raw_voicing = ds_raw[0]["supra"][1]
     normalized_voicing = ds_norm[0]["supra"][1]
@@ -236,8 +148,8 @@ def test_suprasegmental_normalization_does_not_fabricate_pitch_on_unvoiced_frame
     supra_stats = suprasegmental_standardizer(train_df["Filepath"])
     mean, _ = supra_stats
 
-    ds_raw = UASpeechDataset(train_df, include_three_branch=True)
-    ds_norm = UASpeechDataset(train_df, include_three_branch=True, supra_stats=supra_stats)
+    ds_raw = UASpeechDataset(train_df)
+    ds_norm = UASpeechDataset(train_df, supra_stats=supra_stats)
 
     found_unvoiced_frame = False
     for i in range(len(train_df)):
@@ -289,7 +201,7 @@ def test_segmental_normalization_matches_manual_zscore_on_valid_frames():
 
 
 def test_wav2vec2_receives_checkpoint_compatible_normalized_waveform():
-    """DeepPathway's normalize_input=True path must reproduce
+    """DeepPathway's input normalization must reproduce
     facebook/wav2vec2-base-960h's own Wav2Vec2FeatureExtractor
     (do_normalize=True) semantics: per-utterance zero-mean/unit-variance
     over the valid prefix, padded tail forced to exact zero."""
@@ -309,23 +221,3 @@ def test_wav2vec2_receives_checkpoint_compatible_normalized_waveform():
         assert torch.allclose(normalized[i, :length], expected, atol=1e-4)
         if length < samples:
             assert torch.equal(normalized[i, length:], torch.zeros(samples - length))
-
-    # GatedFusionModel opts its own DeepPathway instance into this path;
-    # every other consumer (legacy fusion models, the frozen-embedding
-    # baseline) keeps the default off, unchanged.
-    assert GatedFusionModel(num_classes=4, num_speakers=1).deep_pathway.normalize_input is True
-    assert DeepPathway(use_lora=True).normalize_input is False
-
-
-if __name__ == "__main__":
-    test_dataset_produces_43x401_segmental_and_3x401_supra()
-    test_training_batch_contains_the_three_model_inputs_with_expected_shapes()
-    test_segmental_pathway_receives_43_channels_from_a_real_batch()
-    test_gated_fusion_model_full_forward_on_a_real_dataset_batch()
-    test_training_step_forward_and_backward_on_a_real_dataset_batch()
-    test_normalization_statistics_never_touch_the_held_out_speaker()
-    test_normalization_statistics_derived_only_from_the_training_partition()
-    test_suprasegmental_normalization_preserves_the_voicing_mask()
-    test_segmental_normalization_matches_manual_zscore_on_valid_frames()
-    test_wav2vec2_receives_checkpoint_compatible_normalized_waveform()
-    print("All three-branch integration tests passed.")

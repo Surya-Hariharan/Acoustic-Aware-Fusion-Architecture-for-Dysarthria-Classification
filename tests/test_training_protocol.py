@@ -8,6 +8,7 @@ Kaggle run exposed:
     argmax starves the middle classes when thresholds are close;
   * fold coverage is derived from the configured folds, never hard-coded;
   * compact checkpoints round-trip every trainable weight;
+  * LoRA adapters, and only they, train at the LoRA learning rate;
   * every named ablation builds and trains a step.
 """
 
@@ -40,7 +41,7 @@ def test_validation_is_speaker_disjoint_in_every_severity_fold():
     df = _severity_manifest()
     for fold_id, train_df, test_df in iter_severity_loso_folds(df):
         fold_train, fold_val = speaker_disjoint_train_val_split(
-            train_df, "Severity", seed=config.DEFAULT_SEED, fold_id=fold_id)
+            train_df, seed=config.DEFAULT_SEED, fold_id=fold_id)
         train_spk, val_spk = set(fold_train["Speaker_ID"]), set(fold_val["Speaker_ID"])
         test_spk = set(test_df["Speaker_ID"])
         assert not train_spk & val_spk, f"{fold_id}: val speakers also in train"
@@ -56,8 +57,8 @@ def test_validation_is_speaker_disjoint_in_every_severity_fold():
 def test_validation_split_is_deterministic_per_fold():
     df = _severity_manifest()
     _, train_df, _ = next(iter(iter_severity_loso_folds(df)))
-    a = speaker_disjoint_train_val_split(train_df, "Severity", seed=42, fold_id="M01")[1]
-    b = speaker_disjoint_train_val_split(train_df, "Severity", seed=42, fold_id="M01")[1]
+    a = speaker_disjoint_train_val_split(train_df, seed=42, fold_id="M01")[1]
+    b = speaker_disjoint_train_val_split(train_df, seed=42, fold_id="M01")[1]
     assert sorted(a["Speaker_ID"].unique()) == sorted(b["Speaker_ID"].unique())
 
 
@@ -135,13 +136,32 @@ def test_compact_checkpoint_round_trips_trainable_weights(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Optimizer groups
+# ---------------------------------------------------------------------------
+def test_lora_adapters_and_only_they_use_the_lora_learning_rate():
+    from src.training.engine import build_optimizer
+    from src.training.models import build_model
+
+    model = build_model("ab1_wav2vec2_only", num_speakers=2)
+    optimizer = build_optimizer(model, lr_head=1e-3, lr_lora=1e-4, weight_decay=0.0)
+    groups = {group["name"]: group for group in optimizer.param_groups}
+    assert groups["lora"]["lr"] == 1e-4 and groups["head"]["lr"] == 1e-3
+    lora_ids = {id(p) for p in groups["lora"]["params"]}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            assert (id(param) in lora_ids) == ("lora_" in name), name
+        else:
+            assert "wav2vec" in name, f"{name} is frozen but outside the backbone"
+
+
+# ---------------------------------------------------------------------------
 # Ablations
 # ---------------------------------------------------------------------------
 def _dummy_batch(batch_size: int = 4):
     frames = 401
     return dict(
         waveform=torch.randn(batch_size, config.MAX_SAMPLES) * 0.1,
-        mfcc=torch.randn(batch_size, config.SEGMENTAL_CHANNELS, frames),
+        segmental=torch.randn(batch_size, config.SEGMENTAL_CHANNELS, frames),
         supra=torch.randn(batch_size, config.SUPRA_CHANNELS, frames),
         attention_mask=torch.ones(batch_size, config.MAX_SAMPLES, dtype=torch.bool),
         labels=torch.tensor([0, 1, 2, 3])[:batch_size],
@@ -152,13 +172,13 @@ def _dummy_batch(batch_size: int = 4):
 def test_acoustic_only_ablation_never_builds_wav2vec2_and_trains():
     from src.training.models import build_model
 
-    model = build_model("ab2_acoustic_only", num_classes=4, num_speakers=2)
+    model = build_model("ab2_acoustic_only", num_speakers=2)
     assert model.deep_pathway is None and model.speaker_head is None
     logits, loss, extras = model.training_step(**_dummy_batch())
     loss.backward()
     assert logits.shape == (4, 4) and torch.isfinite(loss)
-    assert extras["gate_learned"] == 0.0
-    assert np.isfinite(extras["complementarity_penalty"])         # reported, not optimized
+    assert float(extras["gate_learned"]) == 0.0
+    assert np.isfinite(float(extras["complementarity_penalty"]))         # reported, not optimized
     preds = model.predict_labels(logits)
     assert preds.shape == (4,) and preds.min() >= 0 and preds.max() <= 3
 
@@ -170,7 +190,7 @@ def test_acoustic_only_ablation_never_builds_wav2vec2_and_trains():
 def test_every_wav2vec2_ablation_builds_and_steps(name):
     from src.training.models import SEVERITY_ABLATIONS, build_model
 
-    model = build_model(name, num_classes=4, num_speakers=2)
+    model = build_model(name, num_speakers=2)
     switches = SEVERITY_ABLATIONS[name]
     assert model.branches == tuple(b for b in ("learned", "segmental", "supra")
                                    if b in switches["branches"])
@@ -179,6 +199,38 @@ def test_every_wav2vec2_ablation_builds_and_steps(name):
     loss.backward()
     assert torch.isfinite(loss)
     if switches.get("use_speaker_adversary"):
-        assert np.isfinite(extras["speaker_loss"])
+        assert np.isfinite(float(extras["speaker_loss"]))
     else:
-        assert np.isnan(extras["speaker_loss"])
+        assert np.isnan(float(extras["speaker_loss"]))
+
+
+# ---------------------------------------------------------------------------
+# Laptop safeguards
+# ---------------------------------------------------------------------------
+def test_thermal_guard_pauses_when_hot_and_resumes_once_cool(monkeypatch):
+    from src.training import utils
+
+    readings = iter([config.GPU_TEMP_PAUSE_C + 2, config.GPU_TEMP_RESUME_C + 4,
+                     config.GPU_TEMP_RESUME_C - 1])
+    sleeps = []
+    monkeypatch.setattr(utils, "gpu_temperature", lambda index=0: next(readings))
+    monkeypatch.setattr(utils.time, "sleep", sleeps.append)
+    monkeypatch.setattr(utils.torch.cuda, "is_available", lambda: True)
+    guard = utils.ThermalGuard()
+    guard.check(force=True)
+    assert guard.pauses == 1 and len(sleeps) == 2          # waited until <= resume temperature
+
+    monkeypatch.setattr(utils, "gpu_temperature", lambda index=0: config.GPU_TEMP_PAUSE_C - 10)
+    guard.check(force=True)
+    assert guard.pauses == 1                                # below the pause threshold: no pause
+
+
+def test_thermal_guard_disables_itself_when_the_sensor_is_unreadable(monkeypatch):
+    from src.training import utils
+
+    monkeypatch.setattr(utils, "gpu_temperature", lambda index=0: None)
+    monkeypatch.setattr(utils.torch.cuda, "is_available", lambda: True)
+    guard = utils.ThermalGuard()
+    guard.check(force=True)
+    guard.check(force=True)
+    assert guard.pauses == 0 and guard._disabled

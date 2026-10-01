@@ -4,8 +4,7 @@ Resumability and equality gate for the chunked feature store
 
 Synthetic audio written to tmp_path, named like UA-Speech files
 (<Speaker>_<Block>_<Word>_<Mic>.wav) under a speaker prefix that cannot
-collide with the real corpus — see tests/test_vad_span_cache.py's
-SYNTHETIC_SPEAKER_PREFIX for why that matters.
+collide with the real corpus (the store keys on basenames).
 
 What is asserted:
   * a build computes every missing chunk, and a second build computes none;
@@ -105,16 +104,12 @@ def test_stored_features_match_the_live_pipeline_and_are_served(store_env):
     for filepath in df["Filepath"]:
         live_segmental, live_supra = feature_store._live_reference(filepath)
         for fn in (preprocessing.extract_segmental_features_cached,
-                   preprocessing.extract_suprasegmental_features_cached,
-                   preprocessing.extract_mfcc_features_cached):
+                   preprocessing.extract_suprasegmental_features_cached):
             fn.cache_clear()
         assert np.array_equal(
             preprocessing.extract_segmental_features_cached(filepath).numpy(), live_segmental)
         assert np.array_equal(
             preprocessing.extract_suprasegmental_features_cached(filepath).numpy(), live_supra)
-        assert np.array_equal(
-            preprocessing.extract_mfcc_features_cached(filepath).squeeze(0).numpy(),
-            live_segmental[:3 * config.N_MFCC])
         # Spans reach the VAD span table (the 300-sample verification's source).
         name = filepath.split("\\")[-1].split("/")[-1]
         assert name in vad_cache._span_table()

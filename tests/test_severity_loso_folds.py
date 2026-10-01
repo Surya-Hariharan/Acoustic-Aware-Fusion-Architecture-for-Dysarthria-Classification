@@ -40,19 +40,6 @@ def test_every_dysarthric_speaker_is_held_out_exactly_once():
     assert len(held_out) == len(set(held_out)) == 15
 
 
-def test_no_speaker_is_dropped_unlike_the_balanced_protocol():
-    # The full-population protocol must NOT exclude config.DROPPED_FOR_BALANCE
-    # speakers — that exclusion is specific to the legacy balanced/3-per-class
-    # protocol (src.splits.build_severity_folds), not this one.
-    df = _synthetic_manifest()
-    held_out = {speaker for speaker, _, _ in iter_severity_loso_folds(df)}
-    for dropped_speaker in config.DROPPED_FOR_BALANCE:
-        assert dropped_speaker in held_out, (
-            f"{dropped_speaker} was excluded from the full-population LOSO "
-            "protocol — it should only be excluded from the secondary "
-            "balanced/3-per-class protocol")
-
-
 def test_train_and_test_never_share_a_speaker():
     df = _synthetic_manifest()
     for speaker, train_df, test_df in iter_severity_loso_folds(df):
@@ -93,7 +80,6 @@ def test_get_severity_loso_split_matches_iteration():
 
 if __name__ == "__main__":
     test_every_dysarthric_speaker_is_held_out_exactly_once()
-    test_no_speaker_is_dropped_unlike_the_balanced_protocol()
     test_train_and_test_never_share_a_speaker()
     test_every_fold_train_split_excludes_control_speakers()
     test_every_severity_class_is_covered_across_the_full_sweep()

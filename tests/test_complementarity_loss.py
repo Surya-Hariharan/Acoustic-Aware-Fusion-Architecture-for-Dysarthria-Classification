@@ -14,7 +14,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.losses import redundancy_penalty, total_complementarity_penalty
+from src.losses import complementarity_penalty, redundancy_penalty
 
 
 def test_redundancy_penalty_is_near_zero_for_independent_gaussian_noise():
@@ -65,12 +65,12 @@ def test_redundancy_penalty_zero_for_batch_size_one():
     assert penalty.item() == 0.0
 
 
-def test_total_complementarity_penalty_sums_the_three_pairs():
+def test_complementarity_penalty_sums_every_pair():
     torch.manual_seed(3)
     z_l = torch.randn(32, 128)
     z_s = torch.randn(32, 64)
     z_p = torch.randn(32, 64)
-    total = total_complementarity_penalty(z_l, z_s, z_p)
+    total = complementarity_penalty([z_l, z_s, z_p])
     manual_sum = (redundancy_penalty(z_l, z_s) + redundancy_penalty(z_l, z_p)
                  + redundancy_penalty(z_s, z_p))
     assert torch.isclose(total, manual_sum, atol=1e-4)
@@ -140,7 +140,7 @@ def test_complementarity_penalty_stable_at_realistic_branch_dims():
     z_l = torch.randn(batch, d_l)
     z_s = torch.randn(batch, d_s)
     z_p = torch.randn(batch, d_p)
-    weighted_random = total_complementarity_penalty(z_l, z_s, z_p) * config.LAMBDA_COMP
+    weighted_random = complementarity_penalty([z_l, z_s, z_p]) * config.LAMBDA_COMP
     assert torch.isfinite(weighted_random)
     # Nowhere near dominating a typical ~1-3 magnitude CORAL loss (see
     # src.losses.coral_loss / the GatedFusionModel smoke test that motivated
@@ -154,7 +154,7 @@ def test_complementarity_penalty_stable_at_realistic_branch_dims():
     z_l_adv = shared @ torch.randn(32, d_l)
     z_s_adv = shared @ torch.randn(32, d_s)
     z_p_adv = shared @ torch.randn(32, d_p)
-    weighted_adv = total_complementarity_penalty(z_l_adv, z_s_adv, z_p_adv) * config.LAMBDA_COMP
+    weighted_adv = complementarity_penalty([z_l_adv, z_s_adv, z_p_adv]) * config.LAMBDA_COMP
     assert torch.isfinite(weighted_adv)
     # Even in the worst case, the weighted penalty must stay within a modest
     # multiple of a typical ordinal-loss scale, not explode — this is what
@@ -167,7 +167,7 @@ if __name__ == "__main__":
     test_redundancy_penalty_is_large_for_identical_linear_structure()
     test_redundancy_penalty_is_symmetric()
     test_redundancy_penalty_zero_for_batch_size_one()
-    test_total_complementarity_penalty_sums_the_three_pairs()
+    test_complementarity_penalty_sums_every_pair()
     test_redundancy_penalty_is_differentiable()
     test_redundancy_penalty_normalizes_by_da_times_db()
     test_complementarity_penalty_stable_at_realistic_branch_dims()
