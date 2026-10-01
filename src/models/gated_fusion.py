@@ -41,12 +41,13 @@ class CoralHead(nn.Module):
 
     def __init__(self, in_dim: int, num_classes: int):
         super().__init__()
+        self.dropout = nn.Dropout(config.HEAD_DROPOUT)
         self.shared = nn.Linear(in_dim, 1, bias=False)
         self.thresholds = nn.Parameter(torch.zeros(num_classes - 1))
 
     def threshold_logits(self, z: torch.Tensor) -> torch.Tensor:
         """(B, K-1) raw logits of P(rank > k), for coral_loss."""
-        return self.shared(z) + self.thresholds
+        return self.shared(self.dropout(z)) + self.thresholds
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """(B, K) log class probabilities; softmax of this returns them exactly."""
@@ -63,7 +64,9 @@ class GateNetwork(nn.Module):
                                  nn.Linear(hidden, len(dims)))
 
     def forward(self, *embeddings: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(self.net(torch.cat(embeddings, dim=1)), dim=1)
+        weights = torch.softmax(self.net(torch.cat(embeddings, dim=1)), dim=1)
+        floor = config.GATE_UNIFORM_FLOOR
+        return floor / weights.shape[1] + (1.0 - floor) * weights
 
 
 class SpeakerHead(nn.Module):
@@ -146,6 +149,10 @@ class GatedFusionModel(nn.Module):
         by_name = {"learned": z_learned, "segmental": z_segmental, "supra": z_supra}
         present = [by_name[b] for b in self.branches]
         batch = present[0].shape[0]
+        if self.training and len(present) > 1 and config.BRANCH_DROPOUT > 0:
+            keep = torch.rand(batch, len(present), device=present[0].device) >= config.BRANCH_DROPOUT
+            keep[torch.arange(batch), torch.randint(len(present), (batch,), device=keep.device)] = True
+            present = [z * keep[:, i:i + 1].to(z.dtype) for i, z in enumerate(present)]
         weights = (self.gate(*present) if self.gate is not None
                    else present[0].new_ones(batch, len(present)))
         z_unified = torch.cat([weights[:, i:i + 1] * z for i, z in enumerate(present)], dim=1)

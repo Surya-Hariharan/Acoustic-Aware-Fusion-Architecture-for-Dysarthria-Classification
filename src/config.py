@@ -145,7 +145,17 @@ WAV2VEC_APPLY_SPEC_AUGMENT = False
 # gradients; measured on this machine: off = +32% throughput at 5.8 GB VRAM.
 WAV2VEC_GRADIENT_CHECKPOINTING = False
 
-LEARNED_EMBED_DIM = 128                                # Z_learned (768 -> 128)
+# Minimum total share the softmax gate leaves to uniform weighting. Without it
+# the gate collapsed onto the fastest-fitting branch (segmental CNN, gate
+# 0.64-0.98 on the first four folds) and the other branches got ~0 gradient.
+GATE_UNIFORM_FLOOR = 0.3
+# Training-only regularizers against fitting the few training speakers: dropout
+# on the fused embedding before the CORAL head, and per-utterance dropout of
+# whole branch embeddings (at least one branch always survives).
+HEAD_DROPOUT = 0.3
+BRANCH_DROPOUT = 0.15
+
+LEARNED_EMBED_DIM = 128                               # Z_learned (768 -> 128)
 SEGMENTAL_EMBED_DIM = 64                               # Z_segmental
 SUPRA_EMBED_DIM = 64                                   # Z_supra
 FUSED_EMBED_DIM = LEARNED_EMBED_DIM + SEGMENTAL_EMBED_DIM + SUPRA_EMBED_DIM   # 256
@@ -166,10 +176,17 @@ DEFAULT_BATCH_SIZE = 32                                # measured: 76 samples/s,
 # Two optimizer groups (src.training.engine.build_optimizer): LoRA adapters
 # train at DEFAULT_LR_LORA; the branch CNNs, projections, gate and heads at
 # DEFAULT_LR_HEAD. The wav2vec2 backbone itself is frozen.
-DEFAULT_LR_HEAD = 1e-3
+DEFAULT_LR_HEAD = 3e-4                                 # 1e-3 overfit the training speakers within one epoch
 DEFAULT_LR_LORA = 1e-4
 DEFAULT_WEIGHT_DECAY = 1e-2
-DEFAULT_PATIENCE = 3                                   # epochs without val-loss improvement
+DEFAULT_PATIENCE = 3                                   # epochs without validation improvement
+# Validate this many times per training epoch: with the best model at epoch 1,
+# once-per-epoch validation skipped the checkpoints that mattered. Patience is
+# counted in epochs (scaled to evaluations internally).
+DEFAULT_EVALS_PER_EPOCH = 2
+# Early-stopping/checkpoint metric: "ordinal_mae" (robust to the confident-wrong
+# loss spikes seen on the 3-4 validation speakers) or "ordinal_loss".
+DEFAULT_MONITOR = "ordinal_mae"
 DEFAULT_GRAD_CLIP_NORM = 1.0
 DEFAULT_SEED = 42
 
