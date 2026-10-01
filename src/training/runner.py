@@ -57,7 +57,9 @@ class TrainingConfig:
     lr_head: float = config.DEFAULT_LR_HEAD
     lr_lora: float = config.DEFAULT_LR_LORA
     weight_decay: float = config.DEFAULT_WEIGHT_DECAY
-    patience: int = config.DEFAULT_PATIENCE
+    patience: int = config.DEFAULT_PATIENCE         # in epochs
+    evals_per_epoch: int = config.DEFAULT_EVALS_PER_EPOCH
+    monitor: str = config.DEFAULT_MONITOR           # "ordinal_mae" | "ordinal_loss"
     grad_clip: float = config.DEFAULT_GRAD_CLIP_NORM
     grad_accum_steps: int = 1                       # >1: same effective batch, less VRAM
     seed: int = config.DEFAULT_SEED
@@ -158,7 +160,7 @@ def _adapt_after_failure(exc: BaseException, cfg: TrainingConfig, fold_id: str
     return cfg, "resuming from the last saved epoch."
 
 
-EPOCH_HEADER = (f"  {'epoch':<7}{'train loss':>11}{'val loss':>10}{'val ordinal':>13}"
+EPOCH_HEADER = (f"  {'epoch':<9}{'train loss':>11}{'val loss':>10}{'val ordinal':>13}"
                 f"{'val acc':>9}{'val F1':>9}{'val MAE':>9}{'time':>8}")
 
 
@@ -166,11 +168,42 @@ def _cell(value: float) -> str:
     return f"{value:>9.3f}" if np.isfinite(value) else f"{'n/a':>9}"
 
 
-def _monitored(result: EpochResult) -> float:
-    """Validation ORDINAL loss — comparable across ablations with and without
-    the complementarity term — falling back to the total loss."""
+def _monitored(result: EpochResult, monitor: str = "ordinal_loss") -> float:
+    """The value early stopping and checkpoint selection minimize: validation
+    ordinal MAE, or validation ORDINAL loss (comparable across ablations with
+    and without the complementarity term). Non-finite falls back to the loss."""
+    if monitor == "ordinal_mae":
+        mae = result.metrics.get("ordinal_mae")
+        if mae is not None and np.isfinite(mae):
+            return float(mae)
+    elif monitor != "ordinal_loss":
+        raise ValueError(f"monitor must be 'ordinal_mae' or 'ordinal_loss', got {monitor!r}")
     value = result.extras.get("ordinal_loss")
     return float(value) if value is not None and np.isfinite(value) else float(result.loss)
+
+
+class _TrainingChunks:
+    """One epoch of a shuffled training loader served as `evals_per_epoch`
+    consecutive chunks, so validation can run between them. Chunks continue
+    one shared pass over the loader; it restarts when the pass ends."""
+
+    def __init__(self, loader, parts: int):
+        self.loader, self.parts = loader, max(1, parts)
+        self.steps = max(1, -(-len(loader) // self.parts))
+        self._iterator = None
+
+    def __len__(self) -> int:
+        return self.steps
+
+    def __iter__(self):
+        for _ in range(self.steps):
+            if self._iterator is None:
+                self._iterator = iter(self.loader)
+            try:
+                yield next(self._iterator)
+            except StopIteration:
+                self._iterator = iter(self.loader)
+                yield next(self._iterator)
 
 
 def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: TrainingConfig,
@@ -201,14 +234,18 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
     model = build_model(cfg.model, num_speakers=len(speaker_label_map),
                         gradient_checkpointing=cfg.gradient_checkpointing).to(device)
     optimizer = build_optimizer(model, cfg.lr_head, cfg.lr_lora, cfg.weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=max(1, cfg.patience // 2))
+    evals = max(1, cfg.evals_per_epoch)
+    total_rounds, patience_rounds = cfg.epochs * evals, cfg.patience * evals
+    train_chunks = _TrainingChunks(train_loader, evals)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5,
+                                  patience=max(1, patience_rounds // 2))
     class_weights = compute_class_weights(train_df).to(device)
     use_amp = cfg.amp if cfg.amp is not None else device.type == "cuda"
     amp_dtype = resolve_amp_dtype(device)
     scaler = torch.amp.GradScaler(device=device.type, enabled=use_amp and amp_dtype == torch.float16)
     common = dict(device=device, class_weights=class_weights, amp_dtype=amp_dtype,
                   amp_enabled=use_amp)
-    early_stopping = EarlyStopping(patience=cfg.patience, mode="min")
+    early_stopping = EarlyStopping(patience=patience_rounds, mode="min")
 
     fold_dir = config.CHECKPOINT_DIR / cfg.run_name / fold_id
     best_path, latest_path = fold_dir / "best.pt", fold_dir / "latest.pt"
@@ -233,28 +270,28 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
         early_stopping.load_state_dict(state.get("early_stopping") or {})
         best_epoch, best_monitored = state.get("best_epoch"), state.get("best_monitored")
         slowest_epoch_s = float(state.get("slowest_epoch_s") or 0.0)
-        print(f"  Resumed from {latest_path.name}: {start_epoch} epoch(s) done "
-              f"(best so far: epoch {best_epoch}).")
+        print(f"  Resumed from {latest_path.name}: {start_epoch} evaluation round(s) done "
+              f"(best so far: evaluation {best_epoch}).")
 
     epochs_completed = start_epoch
     try:
-        if not early_stopping.should_stop and start_epoch < cfg.epochs:
+        if not early_stopping.should_stop and start_epoch < total_rounds:
             print(EPOCH_HEADER)
-        for epoch in range(start_epoch, cfg.epochs):
+        for epoch in range(start_epoch, total_rounds):
             if early_stopping.should_stop:
                 break
             if deadline is not None and slowest_epoch_s and time.monotonic() + slowest_epoch_s > deadline:
                 raise FoldInterrupted(f"fold {fold_id}: epoch {epoch + 1} would end past the session "
                                       f"cap; {latest_path.name} resumes it next session.")
             epoch_start = time.monotonic()
-            label = f"epoch {epoch + 1}/{cfg.epochs}" if cfg.show_batch_progress else ""
-            train_result = run_epoch(model, train_loader, optimizer=optimizer, scaler=scaler,
+            label = f"epoch {(epoch + 1) / evals:.1f}/{cfg.epochs}" if cfg.show_batch_progress else ""
+            train_result = run_epoch(model, train_chunks, optimizer=optimizer, scaler=scaler,
                                      grad_clip_norm=cfg.grad_clip,
                                      grad_accum_steps=cfg.grad_accum_steps,
                                      description=label and f"{label} train", **common)
             val_result = run_epoch(model, val_loader, description=label and f"{label} val",
                                    **common)
-            monitored = _monitored(val_result)
+            monitored = _monitored(val_result, cfg.monitor)
             scheduler.step(monitored)
 
             for name, value in (("Loss/train", train_result.loss), ("Loss/val", val_result.loss),
@@ -280,14 +317,15 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
                                    "slowest_epoch_s": slowest_epoch_s, "fold_id": fold_id})
 
             m = val_result.metrics
-            print(f"  {epoch + 1:>3}/{cfg.epochs:<3}{train_result.loss:>11.4f}{val_result.loss:>10.4f}"
+            print(f"  {(epoch + 1) / evals:>5.1f}/{cfg.epochs:<3}{train_result.loss:>11.4f}{val_result.loss:>10.4f}"
                   f"{monitored:>13.4f}{m['accuracy']:>9.3f}{_cell(m['f1'])}{_cell(m['ordinal_mae'])}"
                   f"{epoch_s / 60:>7.1f}m" + ("   * best" if is_best else ""))
             if not (np.isfinite(train_result.loss) and np.isfinite(monitored)):
                 print_note(f"Non-finite loss in epoch {epoch + 1} — it cannot become the best checkpoint.")
             if early_stopping.should_stop:
+                best_at = f"{best_epoch / evals:.1f}" if best_epoch else "n/a"
                 print(f"  Early stop: no validation improvement for {cfg.patience} epochs "
-                      f"(best epoch {best_epoch}).")
+                      f"(best at epoch {best_at}).")
 
         if not best_path.exists():
             raise FoldDiverged(f"fold {fold_id}: no epoch produced a finite validation loss.")
@@ -308,7 +346,9 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
                                       np.bincount(test.y_pred, minlength=config.NUM_CLASSES).tolist())),
         "argmax_pred_distribution": dict(zip(config.SEVERITY_CLASS_NAMES, np.bincount(
             test.y_pred_argmax, minlength=config.NUM_CLASSES).tolist())),
-        "epochs_completed": epochs_completed, "best_epoch": best_epoch,
+        "epochs_completed": round(epochs_completed / evals, 2),
+        "best_epoch": round(best_epoch / evals, 2) if best_epoch else None,
+        "evaluations_completed": epochs_completed, "best_evaluation": best_epoch,
         "best_val_monitored": best_monitored, "val_speakers": ";".join(val_speakers),
         "n_train_speakers": len(speaker_label_map), "n_train": len(train_df), "n_val": len(val_df),
         "batch_size": cfg.batch_size, "grad_accum_steps": cfg.grad_accum_steps,
