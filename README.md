@@ -4,85 +4,66 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.5.1-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![Transformers](https://img.shields.io/badge/Transformers-5.5.4-FFD21E?logo=huggingface&logoColor=black)](https://huggingface.co/docs/transformers)
+[![Transformers](https://img.shields.io/badge/Transformers-4.49.0-FFD21E?logo=huggingface&logoColor=black)](https://huggingface.co/docs/transformers)
 [![PEFT](https://img.shields.io/badge/PEFT%20(LoRA)-0.19.1-6F42C1)](https://huggingface.co/docs/peft)
-[![Tests](https://img.shields.io/badge/tests-107%20passing-4c1)](tests/)
-[![Architecture](https://img.shields.io/badge/architecture-frozen-informational)](#current-status)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
 ## Research overview
 
-Dysarthria is a motor speech disorder whose acoustic signature spans several distinct levels of the speech signal at once: *articulatory precision* (consonant blurring, vowel-space centralization), *phonatory and prosodic control* (monopitch, reduced loudness variation, irregular voicing), and *higher-level contextual structure* that a purely handcrafted descriptor set does not capture.
+Dysarthria is a motor speech disorder whose acoustic signature spans several levels of the speech signal at once: *articulatory precision* (consonant blurring, vowel-space centralization), *phonatory and prosodic control* (monopitch, reduced loudness variation, irregular voicing), and *higher-level contextual structure* that a handcrafted descriptor set does not capture.
 
-This repository implements and evaluates a **three-branch gated-fusion architecture** built on the premise that these levels carry *complementary* information, and that a model given access to all three under an explicit anti-redundancy objective should be better grounded than one reasoning solely inside a learned latent space.
-
-The scientific claim under test is deliberately narrow: **whether combining the three representations outperforms any subset of them.** That claim is not yet settled — see [Current status](#current-status).
+This repository implements and evaluates a **three-branch gated-fusion architecture** built on the premise that these levels carry *complementary* information. The claim under test is deliberately narrow: **whether combining the three representations outperforms any subset of them.** It is not yet settled — see [Current status](#current-status).
 
 ## Key idea
 
-A single self-supervised encoder (wav2vec 2.0) is a strong but opaque representation: it is not expressible in terms a speech pathologist uses by name, and it cannot be related back to a specific impairment. Conversely, classical acoustic descriptors (MFCC, formants, F0, intensity, HNR) are clinically interpretable but individually weaker.
+A self-supervised encoder (wav2vec 2.0) is strong but opaque; classical descriptors (MFCC, formants, F0, intensity, HNR) are clinically interpretable but individually weaker. Rather than choosing between them or concatenating them flatly, this architecture:
 
-Rather than choosing between them or concatenating them flatly, this architecture:
-
-1. **Bottlenecks each branch before fusion**, forcing every branch to retain only decision-relevant information;
-2. **Fuses with a learned softmax gate** whose weights are logged per batch, so branch reliance is *inspectable* rather than assumed;
-3. **Penalizes cross-branch redundancy** with a Barlow-Twins-style cross-covariance term, discouraging the three branches from re-encoding the same signal;
-4. **Suppresses speaker identity** in the fused representation via a gradient-reversal adversarial head — critical when the corpus has only 15 dysarthric speakers;
-5. **Treats severity as ordinal**, not nominal, using a CORAL head, since Very Low < Low < Mid < High is a real ordering a softmax discards.
+1. **Bottlenecks each branch before fusion**, so every branch keeps only decision-relevant information;
+2. **Fuses with a learned softmax gate** whose weights are saved per utterance, so branch reliance is *inspectable* rather than assumed;
+3. **Penalizes cross-branch redundancy** with a Barlow-Twins-style cross-correlation term;
+4. **Suppresses speaker identity** in the fused representation with a gradient-reversal adversarial head;
+5. **Treats severity as ordinal** with a CORAL head, since Very Low < Low < Mid < High is a real ordering.
 
 ## Architecture
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#1f2937", "primaryTextColor": "#f5f5f5", "primaryBorderColor": "#9aa0a6", "lineColor": "#9aa0a6", "fontSize": "14px"}}}%%
 flowchart TD
-    UA["UA-Speech corpus<br/>audio/original variant"]
-    MIC["Microphone channel M6 only<br/>28 speakers · 765 words each · 21,420 utterances"]
-    RS["Resample → 16 kHz mono"]
-    VAD["Silero VAD<br/>leading / trailing non-speech trimmed<br/>internal pauses preserved<br/>fallback to original waveform on failure"]
-
-    UA --> MIC --> RS --> VAD
-
-    P1["Speech-focused profile<br/>30 ms pad margin"]
-    P2["Temporal-preserving profile<br/>150 ms pad margin"]
+    UA["UA-Speech, audio/original<br/>microphone M6 · 15 dysarthric speakers · 765 words each"]
+    VAD["16 kHz mono → Silero VAD trim (internal pauses kept)"]
+    UA --> VAD
+    P1["Speech-focused profile<br/>30 ms margin → 4 s window"]
+    P2["Temporal-preserving profile<br/>150 ms margin → 4 s window"]
     VAD --> P1
     VAD --> P2
 
-    W1["Fixed window 4.0 s<br/>64,000 samples → 401 frames @ 10 ms hop"]
-    W2["Fixed window 4.0 s<br/>401 frames @ 10 ms hop"]
-    P1 --> W1
-    P2 --> W2
+    LRN["LEARNED<br/>raw waveform, 64,000 samples"]
+    SEG["SEGMENTAL<br/>43 × 401: MFCC+Δ+ΔΔ, F1–F3, HNR"]
+    SUP["SUPRASEGMENTAL<br/>3 × 401: F0 (st), voicing, intensity"]
+    P1 --> LRN
+    P1 --> SEG
+    P2 --> SUP
 
-    SEG["SEGMENTAL branch<br/>43 × 401<br/>13 MFCC + 13 Δ + 13 ΔΔ<br/>+ F1, F2, F3 + HNR"]
-    LRN["LEARNED branch<br/>raw waveform<br/>64,000 samples"]
-    SUP["SUPRASEGMENTAL branch<br/>3 × 401<br/>F0 semitones + voicing mask<br/>+ intensity dB"]
-
-    W1 --> SEG
-    W1 --> LRN
-    W2 --> SUP
-
-    ESEG["1D-CNN ×3 + masked mean-pool<br/>bottleneck → 64"]
-    ELRN["wav2vec2-base-960h + LoRA<br/>q_proj / k_proj / v_proj · r=8, α=16<br/>masked mean-pool · 768 → 128"]
-    ESUP["1D-CNN ×2 + masked mean-pool<br/>bottleneck → 64"]
-
-    SEG --> ESEG
+    ELRN["wav2vec2-base-960h + LoRA (q/k/v, r=8)<br/>masked mean-pool · 768 → 128"]
+    ESEG["1D-CNN ×3 · masked pool · → 64"]
+    ESUP["1D-CNN ×2 · masked pool · → 64"]
     LRN --> ELRN
+    SEG --> ESEG
     SUP --> ESUP
 
-    GATE["GATED FUSION<br/>softmax gate g_learned, g_segmental, g_supra<br/>Z_unified = 128 + 64 + 64 = 256"]
-    ESEG --> GATE
+    GATE["GATED FUSION · softmax gate · Z = 256"]
     ELRN --> GATE
+    ESEG --> GATE
     ESUP --> GATE
-
-    HEAD["CORAL ordinal head<br/>4 severity classes<br/>Very Low · Low · Mid · High"]
-    SPK["Speaker head via gradient reversal<br/>training only — discarded at inference"]
-    RED["Cross-branch redundancy penalty<br/>λ_comp = 0.05"]
-
+    HEAD["CORAL ordinal head · 4 classes<br/>median decode"]
+    SPK["Speaker head via gradient reversal<br/>training only"]
+    RED["Cross-branch redundancy penalty<br/>λ = 0.05"]
     GATE --> HEAD
     GATE --> SPK
-    ESEG -.-> RED
     ELRN -.-> RED
+    ESEG -.-> RED
     ESUP -.-> RED
 
     classDef branch fill:#1a3a6b,stroke:#5b9bff,stroke-width:2px,color:#eaf1ff
@@ -93,50 +74,25 @@ flowchart TD
     class SPK,RED aux
 ```
 
-### Branch specification
-
-All dimensions below are read from `src/config.py` and verified by `tests/test_gated_fusion_shapes.py`.
-
-| Branch | Input | Preprocessing profile | Encoder | Output |
+| Branch | Input | Profile | Encoder | Output |
 |---|---|---|---|---|
-| **Segmental** | 43 ch × 401 frames — 13 MFCC + Δ + ΔΔ (39) plus framewise F1–F3 and HNR (4) | Speech-focused (30 ms) | 3-layer 1D-CNN, masked mean-pool, linear bottleneck | `Z_segmental` — **64** |
-| **Suprasegmental** | 3 ch × 401 frames — F0 (semitones), binary voicing mask, intensity (dB) | Temporal-preserving (150 ms) | 2-layer 1D-CNN, masked mean-pool, linear bottleneck | `Z_supra` — **64** |
-| **Learned** | Raw 16 kHz waveform, 64,000 samples | Speech-focused (30 ms) | `facebook/wav2vec2-base-960h` + LoRA, masked mean-pool, projection | `Z_learned` — **128** |
-| **Fusion** | The three bottlenecked embeddings | — | Learned softmax gate, weighted concatenation | `Z_unified` — **256** |
-| **Head** | `Z_unified` | — | CORAL ordinal (shared projection + K−1 thresholds) | **4** severity classes |
+| **Learned** | Raw 16 kHz waveform, 64,000 samples, per-utterance normalized | Speech-focused (30 ms) | `facebook/wav2vec2-base-960h` + LoRA, masked mean-pool, projection | **128** |
+| **Segmental** | 43 × 401: 13 MFCC + Δ + ΔΔ, framewise F1–F3, HNR | Speech-focused (30 ms) | 3-layer 1D-CNN, masked mean-pool, bottleneck | **64** |
+| **Suprasegmental** | 3 × 401: F0 (semitones, 0 when unvoiced), voicing mask, intensity (dB) | Temporal-preserving (150 ms) | 2-layer 1D-CNN, masked mean-pool, bottleneck | **64** |
+| **Fusion → head** | The three embeddings | — | Softmax gate, weighted concatenation, CORAL | **256 → 4 classes** |
 
-### Why three representations
-
-Each branch is **designed to capture** a different level of the speech signal. These are architectural design rationales, not yet empirically validated contributions — the ablation that would establish independent contribution has not been run at full scale.
-
-- **Segmental** — short-time spectral and articulatory behaviour. MFCCs describe the spectral envelope; framewise formants locate the vowel in the vowel space (F2/F1 compression is a well-documented correlate of articulatory undershoot); HNR indexes voice quality. This branch is intended to carry *how precisely the vocal tract reached its targets*.
-- **Suprasegmental** — pitch, voicing, and loudness behaviour over time. Deliberately minimal (3 channels), because UA-Speech utterances are isolated single words and cannot support phrase-level intonation or multi-word rhythm modelling. This branch is intended to carry *phonatory stability and prosodic control*.
-- **Learned** — contextual structure from self-supervised pretraining on 960 h of read English. This branch is intended to carry *what the handcrafted descriptors do not represent*.
-
-The redundancy penalty exists precisely because these roles could otherwise collapse into one another; the gate exists so that any such collapse is measurable rather than hidden.
+Dimensions are read from `src/config.py` and pinned by `tests/test_gated_fusion_shapes.py`.
 
 ## Dataset
 
-**UA-Speech** — dysarthric and control speech, 765 isolated words per speaker across three blocks (B1–B3), recorded at 16 kHz through a multi-channel microphone array.
-
-The corpus is **not redistributed here.** Obtain it from the dataset authors and place the archives in `data/raw/`:
+**UA-Speech** — dysarthric and control speech, 765 isolated words per speaker in three blocks (B1–B3). The corpus is **not redistributed here**; obtain it from its authors and place the archives in `data/raw/`:
 
 ```text
 data/raw/UASpeech_original_C.tgz     # healthy controls
 data/raw/UASpeech_original_FM.tgz    # dysarthric speakers
 ```
 
-> [!IMPORTANT]
-> **Audio variant.** UA-Speech ships three audio releases — `original`, `normalized`, and `noisereduce`. The archives used by this project contain **only `audio/original`**, and the pipeline extracts from that variant exclusively. No corpus-level loudness normalization is applied, and none is performed by this pipeline. Absolute recording level is therefore preserved in the signal — a deliberate choice, with a known open question attached (see [Limitations](#limitations-and-planned-validation)).
-
-**Protocol:** microphone channel **M6 only**, all blocks, all word categories, no word-type filtering.
-
-**Verified composition** — 28 speakers, 21,420 M6 utterances (11,475 dysarthric, 9,945 control), 765 words per speaker with no incomplete speakers.
-
-| Group | n | Speakers |
-|---|---|---|
-| Healthy control | 13 | CF02–CF05, CM01, CM04–CM06, CM08–CM10, CM12, CM13 |
-| Dysarthric | 15 | F02–F05, M01, M04, M05, M07–M12, M14, M16 |
+Only the `audio/original` release is used (no loudness normalization). Microphone channel **M6**, all blocks, all word categories. The severity task uses the 15 dysarthric speakers (11,475 utterances):
 
 | Severity | n | Speakers |
 |---|---|---|
@@ -145,280 +101,149 @@ data/raw/UASpeech_original_FM.tgz    # dysarthric speakers
 | Mid | 3 | M05, M11, F04 |
 | High | 5 | M09, M14, M10, M08, F05 |
 
-Corpus reference material (word-level MLF alignments, lexicon, license, readme) is kept in `data/uaspeech_corpus_docs/`, separate from the audio the pipeline scans.
-
-<details>
-<summary><b>Data verification note</b> — filename parsing and duplicate handling</summary>
-
-An earlier exploratory scan reported inconsistent speaker and microphone counts due to a filename-parsing defect: it extracted the microphone channel by searching for the first underscore-separated token beginning with `M`, which matched male dysarthric speaker IDs such as `M01` before reaching the trailing mic token. The scan now takes the channel **positionally** from the final token.
-
-The corrected scan also skips macOS resource-fork duplicates (`._` prefix), which the archives contain alongside the real `.wav` files and which would otherwise double the apparent file count.
-</details>
+Filename parsing takes the microphone channel positionally from the final token (searching for a token starting with `M` would match speaker IDs like `M01`), skips macOS `._` resource forks, and drops the corpus's zero-filled files by checking their RIFF/WAVE header.
 
 ## Preprocessing
 
-Every utterance passes through one deterministic chain (`src/preprocessing.py`, `src/vad.py`):
+1. Load, mix to mono, resample to **16 kHz**.
+2. **Silero VAD** trims leading and trailing non-speech; the kept region is the contiguous span from the first to the last speech segment, so **internal pauses are preserved**. Any failure falls back to the untrimmed waveform.
+3. Pad or truncate to a fixed **4.0 s / 64,000-sample** window (401 frames at a 10 ms hop), returning `valid_length` so padding is **masked** in every pooling step, never treated as silence.
 
-1. Load, mix to mono, resample to **16 kHz**
-2. **Silero VAD** — trim leading and trailing non-speech; the kept region is a *contiguous span* from first to last speech segment, so **internal pauses are preserved by construction**. Any failure (no speech detected, span too short, model error) falls back to the original waveform, recorded as `fallback_used`
-3. Pad or truncate to a fixed **4.0 s / 64,000-sample** window, returning a `valid_length` so padding is *masked*, never treated as silence
+Two VAD profiles differ only in the margin kept around speech: 30 ms for the learned and segmental branches, 150 ms for the suprasegmental branch, which needs onset/offset dynamics. **F0 contract:** voiced frames carry a semitone value; unvoiced frames are exactly 0 and flagged by the voicing channel — no contour is interpolated through them, and normalization keeps them at 0.
 
-| Parameter | Value | Source |
-|---|---|---|
-| Sample rate | 16 kHz | `config.TARGET_SR` |
-| Fixed window | 4.0 s = 64,000 samples = 401 frames | `config.CLIP_SECONDS`, `config.MAX_SAMPLES` |
-| MFCC | 13 coefficients, `n_fft=400` (25 ms), `hop_length=160` (10 ms), `n_mels=40` | `config.N_MFCC`, `config.MEL_KWARGS` |
-| VAD threshold | 0.5 | `config.VAD_THRESHOLD` |
-| Min speech / silence | 100 ms / 100 ms | `config.VAD_MIN_SPEECH_MS`, `config.VAD_MIN_SILENCE_MS` |
-| Speech-focused pad margin | 30 ms | `config.VAD_SPEECH_PAD_MS` |
-| Temporal-preserving pad margin | 150 ms | `config.SUPRA_VAD_SPEECH_PAD_MS` |
+**Fold-scoped standardization.** Segmental and suprasegmental channels are z-scored with statistics computed from each fold's *training* speakers only (over valid frames; F0 over voiced frames), so the held-out speaker never influences its own normalization.
 
-**Two VAD profiles.** The Learned and Segmental branches consume the *speech-focused* profile (30 ms margin). The Suprasegmental branch consumes a *temporal-preserving* profile (150 ms margin), which protects the onset/offset dynamics — breathiness ramp-in, voicing decay — that a prosodic encoder needs and a tight margin can clip. The two profiles carry independent valid-length values (`attention_mask` and `supra_valid_frames` respectively), and both are propagated into masked pooling.
+**Feature store.** Silero and ~2,000 Praat calls per utterance are far too slow to run per epoch. `src/feature_store.py` computes each utterance's VAD spans and both feature tensors once, in parallel, into one compressed chunk per (speaker, block) under `outputs/feature_cache/store/`. Chunks are written atomically (an interrupted build keeps every finished chunk), memory-mapped at read time (one copy shared by all DataLoader workers), and keyed by a configuration signature (a chunk built under different settings is ignored). The notebook re-runs live Silero on 300 utterances and recomputes 24 feature tensors through the original live path, requiring **bit-exact** equality.
 
-> [!NOTE]
-> **F0 representation contract.** Voiced frames carry a real F0 estimate in semitones; unvoiced frames are exactly **0**, disambiguated by an explicit binary voicing channel. No contour is interpolated or fabricated through unvoiced regions — the model is shown where pitch genuinely was not measurable. Enforced by `tests/test_supra_sequence_masking.py`.
-
-> [!NOTE]
-> **Framewise Praat feature cache.** The Segmental and Suprasegmental branches' per-frame formant/HNR/F0/voicing/intensity extraction runs on the order of 2,000 individual `parselmouth` (Praat) calls per utterance — CPU-bound and single-threaded, and by far the largest cost in the pipeline if left uncached (the GPU sits idle waiting on it). `src/preprocessing.py`'s in-memory `lru_cache` alone doesn't help across DataLoader-worker or kernel restarts, so results are additionally persisted to disk under `outputs/feature_cache/`. `precompute_framewise_feature_cache(df)` builds this cache once, in parallel, for the whole corpus (~40 minutes the first time, on the order of seconds thereafter) — run as the first real step in `notebooks/03_training.ipynb`, before any benchmarking or training begins.
-
-> [!NOTE]
-> **VAD span cache — the dataloader's dominant cost.** Both preprocessing profiles ran Silero VAD over the utterance, and both were memoized *in memory only*. Against a 9,639-utterance shuffled train split spread over four worker processes, that LRU thrashes, so `UASpeechDataset.__getitem__` ran **two neural forward passes per item, per epoch** — roughly 21,400 per epoch. Measured on the real corpus, VAD was **80.8%** of per-item CPU time (42.6 ms of 52.8 ms), and one line existed only to obtain a single integer: it opened the audio a second time and ran a second VAD pass to learn `supra_valid_length`.
->
-> The symptom was a GPU that never worked. A Kaggle T4 run measured a **flat 8.5 samples/sec at batch sizes 16, 24 and 32**, peaking at 4.2 GB of the card's 15 GB — throughput that does not move with batch size is a starved GPU, not a busy one.
->
-> `src/vad_cache.py` stores the `(start, end)` sample span per utterance per profile in `outputs/feature_cache/vad_spans.parquet` (239 KB for all 21,420 utterances, committed to the repo). This is **not an approximation**: `apply_vad`'s only effect on the signal is `waveform[:, start:end]`, and each of its five fallback branches returns the untrimmed waveform, stored as `(0, N)`. Slicing from stored integers is bit-identical to re-running the model — pinned by `tests/test_vad_span_cache.py`, which asserts `torch.equal` on waveforms, MFCC and the 43-channel segmental tensor, and array-equality on the fold-scoped standardizer statistics. `verify_vad_span_cache` additionally re-runs live Silero on a sample of real utterances; all 300 sampled spans matched exactly.
->
-> A cache that is *wrong* is worse than one that is absent, because the framewise `.npy` caches are derived from these spans — so the VAD configuration signature is written into the parquet metadata and a mismatch is refused loudly. Every lookup returns `None` on a miss and falls through to live Silero, so deleting the file changes no result, only the speed.
-
-> [!NOTE]
-> **Disk caches are keyed by filename, not by path.** `_disk_cache_path` previously hashed the *absolute* filepath. The manifest's paths are rooted at whichever checkout produced them, so a cache built on a laptop could never be read on Kaggle — every lookup missed and the whole cost was paid again. `src.preprocessing.cache_key` now keys on the basename, which UA-Speech makes unique (speaker-prefixed) and which is already this project's join key in `praat_features.csv` and `vad_stats.csv`.
-
-## Training strategy
+## Training
 
 | Aspect | Setting | Source |
 |---|---|---|
-| Backbone | `facebook/wav2vec2-base-960h`, frozen | `config.WAV2VEC_MODEL_NAME` |
-| Adaptation | LoRA — `q_proj`, `k_proj`, `v_proj` across all 12 encoder layers | `config.LORA_TARGET_MODULES` |
-| LoRA hyperparameters | r = 8, α = 16, dropout = 0.1, bias = none | `config.LORA_RANK`, `LORA_ALPHA`, `LORA_DROPOUT` |
-| Severity loss | Class-weighted CORAL ordinal loss | `src/losses.py` |
-| Severity decoding | Median of the CORAL distribution (threshold count) — not argmax, which starves Low/Mid when thresholds are close | `losses.coral_rank_from_class_probs` |
-| Redundancy penalty | λ_comp = 0.05 | `config.LAMBDA_COMP` |
-| Speaker adversarial | λ_speaker = 0.1, GRL strength 1.0 | `config.LAMBDA_SPEAKER`, `config.GRL_LAMBDA` |
-| Optimizer | AdamW — lr 1e-3 (head/branches/LoRA), 1e-4 (backbone), weight decay 1e-2 | `config.DEFAULT_LR_HEAD`, `DEFAULT_LR_BACKBONE` |
-| Schedule | `ReduceLROnPlateau`, early stopping patience 3 on validation ordinal loss | `config.DEFAULT_PATIENCE` |
-| Batch / epochs | 32 (fp16 AMP, gradient checkpointing off — measured on the training machine) / 12 max, gradient clipping 1.0 | `config.DEFAULT_BATCH_SIZE`, `DEFAULT_EPOCHS`, config *Local hardware profile* |
-| Validation | Speaker-disjoint: one speaker per severity class that keeps ≥ 2 training speakers (3–4 speakers per fold), seeded per fold | `data.speaker_disjoint_train_val_split` |
-| Seed | 42 | `config.DEFAULT_SEED` |
-| Data / runtime | All three blocks (765 utterances per dysarthric speaker, 11,475 total), 15 LOSO folds, run locally from `notebooks/training.ipynb`. Resumable: finished folds load from disk, an interrupted fold resumes from `latest.pt` | `run_training`, `session.calibrate_throughput`, `project_runtime` |
-| Memory | One persistent training DataLoader worker; validation/test load in-process. On Windows every worker commits ~2 GB (it re-imports torch's CUDA DLLs), so worker and feature-store pools are sized fold by fold to the RAM and commit free at that moment. A fold that fails is retried with an adapted configuration (CUDA OOM: half batch x 2 accumulation; host-memory failure: no workers; divergence: restart in float32) | config *Local hardware profile*, `utils.affordable_workers`, `runner._adapt_after_failure` |
+| Backbone | `facebook/wav2vec2-base-960h`, frozen; SpecAugment off (the CTC checkpoint has no pretrained `masked_spec_embed`) | `config.WAV2VEC_*` |
+| Adaptation | LoRA on `q_proj`, `k_proj`, `v_proj` of all 12 layers — r = 8, α = 16, dropout 0.1 | `config.LORA_*` |
+| Loss | Class-weighted CORAL + 0.05 × redundancy + 0.1 × adversarial speaker CE (GRL strength 1.0) | `config.LAMBDA_*` |
+| Decoding | Median of the CORAL distribution — argmax starves Low/Mid when thresholds are close | `losses.coral_rank_from_class_probs` |
+| Optimizer | AdamW, weight decay 1e-2 — **LoRA adapters 1e-4**, branches / projections / gate / heads 1e-3 | `config.DEFAULT_LR_*`, `engine.build_optimizer` |
+| Schedule | ReduceLROnPlateau (×0.5); early stopping, patience 3, on the validation ordinal loss | `config.DEFAULT_PATIENCE` |
+| Batch / epochs | 32, fp16 AMP, gradient clipping 1.0 / at most 12 | `config.DEFAULT_*` |
+| Validation | Speaker-disjoint: one speaker per class that keeps ≥ 2 training speakers (3–4 per fold), seeded per fold | `data.speaker_disjoint_train_val_split` |
+| Seed | 42, re-seeded per fold so a fold's result does not depend on which folds ran before it | `runner.run_fold` |
 
-> [!NOTE]
-> **Patience 3 / epoch ceiling 15 is a compute-budget-driven tightening, not an
-> accuracy tweak.** Early stopping on validation loss is this architecture's
-> primary anti-overfitting mechanism; a tighter patience stops training past
-> convergence on a 14-speaker-per-fold training set rather than let it run
-> longer than the point it's actually still learning something general. The
-> epoch ceiling is a ceiling early stopping is expected to trigger well
-> before, not a target. `notebooks/03_training.ipynb`'s COMPUTE BUDGET stage
-> measures real per-fold-epoch cost on the actual training machine
-> (`ExperimentBudgetManager.benchmark`) and projects it against the 10h cap
-> (`.preflight()`) before the one-shot run is ever started; the final-run
-> cell threads the resulting deadline into `run_training(..., deadline=...)`,
-> so the cap is enforced by measured wall-clock time, not merely assumed to
-> fit.
-
-> [!WARNING]
-> **SpecAugment is deliberately disabled.** `facebook/wav2vec2-base-960h` is a CTC checkpoint whose weights omit `masked_spec_embed`. Under Transformers 5.5.4, a positive masking probability would instantiate that parameter **randomly** and use it during training, injecting an unpretrained component into the learned branch. The pipeline therefore sets `apply_spec_augment=False`, `mask_time_prob=0.0`, and `mask_feature_prob=0.0` **before** model construction (`src/models/deep_pathway.py`), so the parameter is never created. The `lm_head` keys reported as unexpected at load time are the checkpoint's discarded CTC head and are expected. Regularization remains substantial without it: LayerDrop and five backbone dropouts at 0.1 (checkpoint defaults, untouched), LoRA dropout 0.1, weight decay, gradient clipping, early stopping, plus the redundancy and adversarial terms.
-
-Hyperparameters introduced by this architecture are fixed in `src/config.py` **before** the run and are never tuned against its results. `src.training.reporting.write_frozen_config` records the git commit, software versions, architecture, and hyperparameters; `check_frozen_config_guard` raises if a run with the same name is later attempted under a different configuration.
+Hyperparameters are fixed in `src/config.py` before the run. `write_frozen_config` records the configuration, git commit and software versions under `outputs/results/<run>/frozen_config.json`; `check_frozen_config_guard` refuses to re-run the same run name under a different configuration (resuming the same one is fine).
 
 ## Evaluation protocol
 
-All protocols are **speaker-disjoint**: no speaker ever appears in both the training and test side of a fold. Because UA-Speech labels are assigned at the speaker level, the effective sample size for generalization is the *speaker count*, not the utterance count — 15 for severity, not 11,475.
+**Leave-one-speaker-out over all 15 dysarthric speakers** — no speaker is dropped to balance classes; the 4/3/3/5 imbalance is handled by the class-weighted loss and macro metrics. Severity labels are speaker-level, so the effective sample size for generalization is **15 speakers**, not 11,475 utterances.
 
-| Protocol | Folds | Held out | Status | Implementation |
-|---|---|---|---|---|
-| **Detection** | 28 | One speaker (any group) | Supported | `splits.iter_loso_folds` |
-| **Severity — PRIMARY** | 15 | One dysarthric speaker | **Reported result** | `splits.iter_severity_loso_folds` |
-| **Severity — secondary** | 81 | One speaker per class | Sanity check only | `splits.build_severity_folds` |
+A held-out speaker has a single true class, so per-fold macro-F1, balanced accuracy and AUROC are undefined (reported as N/A, never 0). The reported numbers are **pooled** over every held-out utterance: accuracy, macro-F1, balanced accuracy, ordinal MAE, macro AUROC, per-class precision/recall, the confusion matrix, and a **speaker-level** decision (median of each speaker's utterance predictions).
 
-**Primary severity — full-population LOSO.** All 15 dysarthric speakers, no speaker dropped. The 4/3/3/5 class imbalance is handled at the loss and metric level (class-weighted CORAL, macro-F1, balanced accuracy, per-class recall, ordinal MAE) rather than by discarding speakers.
+## Running it on a laptop
 
-**Secondary severity — legacy balanced protocol.** `config.DROPPED_FOR_BALANCE` excludes M12, M08, and M09 to reach three speakers per class, giving 3⁴ = 81 leave-one-per-class-out iterations. This particular set of three speakers is a design choice made to reach class balance, not a canonical selection. It is retained only as an explicitly labelled secondary check and is **not** the reported number.
+Everything runs from `notebooks/training.ipynb` (**Run All**), measured on an RTX 4060 Laptop (8 GB, 88 W) with 16 GB RAM under Windows 11.
 
-> [!NOTE]
-> Validation is **speaker-disjoint** — train speakers → training, validation speakers → model selection / early stopping, the held-out speaker → the LOSO test. The earlier utterance-level 10% split (validation speakers were also training speakers) made validation a within-speaker check that could not see cross-speaker failure; it remains available as `TrainingConfig(val_protocol="utterance")` for comparison only. Validation metrics are still never reported as generalization performance.
+- **Measured, not assumed.** Section 6 times real training steps on this machine (~1 min) and projects the run time before the run starts.
+- **Thermal guard.** Between batches, training pauses when the GPU reaches **83 °C** and resumes at **72 °C**, and each fold starts cool (`config.GPU_TEMP_*`, `FOLD_COOLDOWN_S`). It reads the sensor through `nvidia-smi`; pauses change only *when* work happens, never *what* is computed.
+- **Power and sleep.** Training waits for the charger if the laptop is on battery, and keeps Windows awake while it runs. Lid closing still follows its own Windows setting — keep the lid open or set *When I close the lid → Do nothing* while plugged in.
+- **Memory.** On Windows every DataLoader worker is a spawned process costing ~2 GB of commit, so training uses one persistent worker and evaluates in-process; worker counts are re-sized to the memory free before every fold. PyTorch's VRAM share is capped at 90% so an overflow raises a clean OOM instead of silently spilling into system RAM (which slows training ~10×).
+- **Self-healing.** A failing fold is retried with an adapted configuration: CUDA OOM → half batch × 2 accumulation (same effective batch); host memory → no workers; divergence → restart in float32.
+- **Resumable.** Finished folds load from disk; an interrupted fold resumes from its `latest.pt` (saved every epoch, ~9 MB since only trainable weights are stored). Optional `SESSION_HOURS` stops cleanly before a time cap.
 
 ## Repository structure
 
-All logic lives in `src/`. Notebooks are the sole front end — they call `src/`, run training, and store artifacts, so behaviour never drifts between script and notebook. **To change behaviour, edit the module, not a notebook.**
-
 ```text
-notebooks/
-  01_data_pipeline.ipynb     Manifest build (scan → verify → M6 filter → label → split → dataset),
-                              VAD/padding diagnostics, three-branch data-pipeline audit
-  02_feature_analysis.ipynb  Praat statistical EDA (MFCC + VAD validation, feature extraction,
-                              severity-group significance testing); speech-processing EDA
-                              (VAD+GAD voiced/unvoiced/silence segmentation, formant tracks,
-                              short-time time/frequency-domain parameters, wideband/narrowband
-                              spectrograms, cepstral analysis, MFCC, Linear Prediction analysis);
-                              feature-extraction summary (per-branch inventory table, trainable-
-                              parameter counts, Z_unified composition, channel breakdown)
-  03_training.ipynb          One-shot training interface: frozen config, fold summary, model
-                              audit, measured compute-budget stage (batch-size benchmark,
-                              per-fold-epoch benchmark, wall-clock deadline wired into the real
-                              run), the one real 15-fold training run, results reporting, and a
-                              final checkpoint summary
-  04_model_analysis.ipynb    Branch embeddings, inference-time branch ablation, gate analysis,
-                              PCA/UMAP, complementarity heatmap, SHAP, permutation importance
-  05_error_analysis.ipynb    Confusion matrix, per-class and ordinal-error breakdown,
-                              representative-utterance signal panels
-  06_results.ipynb           Paper-ready tables and figures, limitations table, CSV export
+notebooks/training.ipynb   The experiment: environment, data, feature store, model audit,
+                            throughput, frozen config, training, results
 src/
-  config.py                  Paths, speaker ground truth, label maps, all hyperparameters
-  extraction.py              Archive extraction (audio/original)
-  scanning.py                Filename parsing, verification, mic filter, severity labels
-  preprocessing.py           Resampling, VAD trimming, padding, MFCC, the two VAD profiles,
-                              framewise segmental/suprasegmental extraction
-  vad.py                     Silero VAD wrapper (trim, fallback, per-utterance stats)
-  vad_cache.py               Disk-persisted VAD spans — build, verify, lookup
-  praat.py                   Utterance-level Praat features + framewise F0/voicing/intensity
-                              and formant/HNR extraction + severity-group significance
-  losses.py                  CORAL ordinal loss, cross-branch redundancy penalty, GRL
-  splits.py                  Detection LOSO, primary severity LOSO, legacy balanced 81-fold
-  dataset.py                 UASpeechDataset
-  model_analysis.py          Branch ablation, embedding projections, gate analysis, SHAP
-  error_analysis.py          Per-error diagnostics, signal panels
-  results.py                 Cross-experiment aggregation, eligibility gate, paper tables
-  visualization.py           Praat statistical EDA figures, VAD-validation panel
-  eda.py                     Speech-processing EDA: short-time time/frequency-domain
-                              parameters, wideband/narrowband spectrograms, cepstral analysis,
-                              Linear Prediction analysis, VAD+GAD three-way segmentation
-  console.py  style.py       Console formatting and the shared plot color system (per-branch,
-                              per-formant, voicing-region, and severity-sequential palettes)
+  config.py                Paths, speakers, labels, hyperparameters, hardware profile
+  extraction.py            Archive extraction (audio/original)
+  scanning.py              Filename parsing, verification, M6 filter, severity labels
+  vad.py                   Silero VAD (trim, fallback)
+  vad_cache.py             VAD spans served from the feature store + live verification
+  praat.py                 Framewise F1–F3/HNR and F0/voicing/intensity (parselmouth)
+  preprocessing.py         Loading, trimming, padding, MFCC, fold-scoped standardization
+  feature_store.py         Chunked, resumable, memory-mapped feature store + verification
+  dataset.py               UASpeechDataset
+  splits.py                Severity leave-one-speaker-out folds
+  losses.py                CORAL, cross-branch redundancy, gradient reversal
+  console.py               Console report formatting and progress bars
   models/
-    gated_fusion.py          GatedFusionModel — gate, CORAL head, GRL head, branch ablation
-    segmental_pathway.py     Segmental branch: 43 ch → 64
-    suprasegmental_pathway.py Suprasegmental branch: 3 ch → 64
-    deep_pathway.py          wav2vec 2.0 (+ LoRA) → 768
-    acoustic_pathway.py      1D-CNN over MFCC → 128          (earlier variant family)
-    concat_fusion.py         Concatenation fusion             (earlier variant family)
-    attention_fusion.py      Cross-attention fusion           (earlier variant family)
+    gated_fusion.py        GatedFusionModel: gate, CORAL head, speaker head, ablation switches
+    deep_pathway.py        wav2vec 2.0 + LoRA
+    segmental_pathway.py   43 ch → 64
+    suprasegmental_pathway.py  3 ch → 64
   training/
-    models.py                Model factory + variant registry
-    data.py                  Manifest loading, train/val split, DataLoaders, speaker map
-    runner.py                TrainingConfig + run_training(): the fold loop
-    engine.py                Train/eval epoch loop, AMP, training_step hook, gate collection
-    metrics.py               Classification metrics + ordinal MAE, NaN-safe
-    reporting.py             Artifact I/O, feature audit, frozen-config write/guard
-    baseline.py              Frozen wav2vec + linear SVM per fold
-    budget.py                ExperimentBudgetManager: wall-clock budget allocation
-    session.py               Throughput calibration + sizing the run to a wall-clock budget
+    runner.py              TrainingConfig, the fold loop, retries, laptop safeguards
+    engine.py              One epoch: AMP, accumulation, clipping, metrics, embeddings
+    data.py                Manifest, validation split, class weights, DataLoaders
+    models.py              Model registry: the full model and eight ablations
+    metrics.py             Severity metrics (undefined → NaN)
+    reporting.py           Artifacts, results rebuilt from disk, frozen config + guard
+    session.py             Throughput calibration and run-time projection
     checkpoint.py  early_stopping.py  utils.py
-tests/                       11 modules, 107 tests — architecture shapes, CORAL/redundancy/GRL
-                              numerics, LOSO fold construction, masking, frame alignment,
-                              frozen-config round-trip, experiment-validity guards, and the
-                              VAD-span-cache equality gate (bit-identical tensors with and
-                              without the cache)
-data/
-  raw/                       Place the UA-Speech .tgz archives here
-  extracted/                 Extracted .wav files (gitignored)
-  uaspeech_corpus_docs/      Corpus reference material
-outputs/                     All generated artifacts (gitignored) — checkpoints, logs,
-                              predictions, metrics, figures, embeddings, tables, results
+tests/                     Shapes, losses, masking, frame alignment, folds and validation
+                           split, metrics, frozen-config guard, feature-store and VAD-span
+                           equality gates, and a real-data end-to-end training step
 ```
 
-An earlier seven-variant detection/severity ablation ladder (`acoustic`, `deep_frozen`, `deep_lora`, `fusion_frozen`, `fusion`, `attention_fusion`, `attention_fusion_praat`) remains available through `src/training/models.py` and is still runnable via `run_training`, but its dedicated notebooks have been removed and it is **not** part of the primary severity experiment.
+Every fold writes, under `outputs/<kind>/<run_name>/`: a checkpoint, TensorBoard logs (`tensorboard --logdir outputs/logs`), a predictions CSV, a metrics JSON, a confusion matrix and an embeddings file (fused, per-branch and gate weights per utterance).
 
-## Reproducibility and environment
+### Ablations
 
-**Verified environment:** Python **3.10.20**, CUDA-enabled PyTorch. The repository declares no `python_requires`; the pinned dependency set is in `requirements.txt`.
+`MODEL` in the notebook selects the full model or one of eight controlled ablations (`src/training/models.py`). All share data, folds, validation and optimizer; each gets its own run name.
+
+| Name | Branches | Fusion | Redundancy | Speaker GRL |
+|---|---|---|---|---|
+| `ab1_wav2vec2_only` | learned | — | — | — |
+| `ab2_acoustic_only` | segmental + supra | gated | — | — |
+| `ab3_wav2vec2_acoustic_concat` | all three | concat | — | — |
+| `ab4_wav2vec2_segmental` | learned + segmental | gated | — | — |
+| `ab5_wav2vec2_suprasegmental` | learned + supra | gated | — | — |
+| `ab6_full_fusion` | all three | gated | — | — |
+| `ab7_full_complementarity` | all three | gated | ✓ | — |
+| `ab8_full_speaker_grl` | all three | gated | — | ✓ |
+| `gated_fusion_three_branch` | all three | gated | ✓ | ✓ |
+
+## Reproducibility
 
 ```bash
-# GPU wheels first (plain PyPI serves CPU-only builds under these version numbers)
+conda create -n torch-gpu python=3.10 && conda activate torch-gpu
 pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
+python -m ipykernel install --user --name torch-gpu
+pytest                       # the real-data tests skip when the corpus is absent
 ```
 
-| Package | Version |
-|---|---|
-| torch / torchaudio | 2.5.1 |
-| transformers | 5.5.4 |
-| peft | 0.19.1 |
-| numpy / pandas / scipy | 2.2.6 / 2.3.3 / 1.15.3 |
-| scikit-learn | 1.7.2 |
-| praat-parselmouth | 0.4.7 |
-| shap / umap-learn | 0.48.0 / 0.5.7 |
-| pytest | 9.1.1 |
-
-Silero VAD loads via `torch.hub` and needs internet access on first run only (~2 MB, cached thereafter). An optional `HF_TOKEN` environment variable (see `.env.example`) lifts the unauthenticated Hugging Face rate limit; the checkpoint used here is public and loads without it.
-
-```bash
-pytest                        # full suite — 107 tests
-jupyter notebook notebooks/01_data_pipeline.ipynb
-```
-
-Run the notebooks in numerical order. Notebook 03 runs the one real 15-fold training run unconditionally — no gating flag to flip.
-
-Training can also be driven directly:
-
-```python
-from src.training.runner import TrainingConfig, run_training
-
-cfg = TrainingConfig(task="severity", model="gated_fusion_three_branch")   # 15-fold LOSO
-summary, pooled = run_training(df_m6, cfg)
-```
-
-Every fold writes a checkpoint, TensorBoard log (`tensorboard --logdir outputs/logs`), predictions CSV, metrics JSON, confusion matrix, ROC curve, and embeddings (fused, per-branch, plus gate weights) under `outputs/`. `TrainingConfig(..., max_folds=1, epochs=1, limit_samples=24)` gives a fast pipeline check.
+Then open `notebooks/training.ipynb` with the `torch-gpu` kernel and Run All. `AAFA_SMOKE=1` (or `SMOKE_TEST = True`) runs a 2-fold, 1-epoch, 64-utterance end-to-end check. An optional `HF_TOKEN` in `.env` lifts the Hugging Face rate limit; the checkpoint is public.
 
 ## Current status
 
-**The architecture and training protocol are frozen.** The table below distinguishes what is implemented and verified from what has actually been run.
-
 | Component | Status |
 |---|---|
-| Three branches, bottlenecks, gated fusion | Implemented, unit-tested |
-| CORAL head, redundancy penalty, speaker-adversarial GRL | Implemented, unit-tested |
-| Data pipeline, two VAD profiles, framewise extraction | Implemented; executed against the real corpus in Notebook 01 |
-| Speech-processing EDA, feature-extraction summary (Notebook 02) | Implemented; executed against the real corpus |
-| Compute-budget stage (Notebook 03) — measured batch size, per-fold-epoch benchmark, wall-clock deadline | Implemented; **not yet measured against real hardware** — the benchmark has not been run to completion in this checkout, so the 10h cap has not been confirmed sufficient for all 15 folds |
-| Training / analysis / results notebooks | Built, import- and shape-validated |
-| Test suite | **86 passing**, 0 failed, 0 skipped |
-| **The one-shot 15-fold severity run** | **Not executed** — Notebook 03 has not yet been run end-to-end in this checkout |
-| Full 15-fold branch ablation | Not executed (see below) |
+| Architecture, losses, ablation switches | Implemented, unit-tested |
+| Data pipeline, two VAD profiles, framewise features, feature store | Implemented; store built for all 15 dysarthric speakers and verified bit-exact against the live pipeline |
+| End-to-end notebook | Smoke-tested on the target laptop (2 folds × 1 epoch) |
+| **The 15-fold severity run** | **Not yet executed** |
+| Ablations ab1–ab8 | Not yet executed |
 
-### Diagnostic findings — Notebook 01
+## Limitations and open questions
 
-Notebook 01 is a **data-pipeline and representation diagnostic**, not a source of scientific conclusions. Its observations to date, stated as diagnostics:
-
-- **The 401-frame window is unchanged and remains the frozen configuration.** Earlier padding and truncation headline figures were computed from `speech_duration_s`, which is *not* the model's `valid_length`: it excludes internal pauses on VAD successes and equals full file duration on VAD fallbacks. Those figures are therefore **not** a valid basis for resizing the window, and no resize is proposed.
-- **F0 handling was corrected** to preserve unvoiced frames as zero with an explicit voicing mask, with no fabricated contour. Verified against real audio.
-- **SpecAugment was deliberately disabled** for checkpoint compatibility, as documented above.
-- **LoRA remains the adaptation mechanism**, unchanged at q/k/v across 12 encoder layers.
-- **Further evidence is required before any architectural change.** No diagnostic to date establishes a defect in the architecture.
-
-## Limitations and planned validation
-
-Open questions, framed as validation experiments rather than known failures. None currently justifies an architectural change.
-
-| # | Question | Why it matters | Planned experiment |
+| # | Question | Why it matters | Planned check |
 |---|---|---|---|
-| 1 | **True valid-length distribution** | The window's justification currently rests on a proxy quantity, not on `valid_length` semantics | Re-derive the retained-span distribution from cached VAD statistics; report median/p75/p90/p95/p99/max, padding and truncation fractions |
-| 2 | **Duration ↔ severity relationship** | Determines whether any length-dependent effect is a confound or genuine signal | Stratify the valid-length distribution by severity class |
-| 3 | **Padding and boundary effects** | Masked pooling excludes padded frames, but convolution and pooling operate before it, so boundary behaviour is worth quantifying | Measure branch-embedding sensitivity to padding at fixed speech content |
-| 4 | **Intensity normalization sensitivity** | `audio/original` preserves absolute recording level, which is partly a device and session property | Decompose intensity variance into speaker vs severity components before deciding whether normalization is warranted |
-| 5 | **Full 15-fold branch ablation** | Branch contribution is currently evaluated on a single fold, which cannot support a claim at n = 15 speakers | Extend `evaluate_branch_ablation` across all 15 folds under the primary protocol |
-| 6 | **Checkpoint-to-speaker matching robustness** | Analysis notebooks pair the alphabetically-first checkpoint with the first fold; these agree today only because the speaker list happens to be lexicographically ordered | Bind checkpoint to fold explicitly rather than by ordering coincidence |
+| 1 | **Speaker adversary vs. speaker-level labels** | Every utterance of a speaker has the same severity, so severity is itself partly speaker information; an adversary that removes speaker identity can also remove severity cues | Compare `ab6_full_fusion` with `ab8_full_speaker_grl` before trusting the GRL |
+| 2 | **Truncation at 4 s** | ~8% of utterances exceed the window and lose their tail; long utterances are more frequent at higher severity | Stratify truncation by severity; compare a longer window |
+| 3 | **Padding and boundary effects** | Masked pooling excludes padding, but convolutions and BatchNorm see it first (on average 68% of the window is padding) | Measure embedding sensitivity to padding at fixed speech content |
+| 4 | **Recording level** | `audio/original` keeps absolute level, partly a session property | Decompose intensity variance into speaker vs. severity components |
+| 5 | **Branch contribution** | Branch value is a claim only after the ablations run across all 15 folds | Run ab1–ab8 under the same protocol |
 
-Structural limitations that no experiment removes: **15 dysarthric speakers** is a small population for a 4-class severity task (3 speakers in the smallest classes), UA-Speech contains **isolated single words** only — so phrase-level prosody and connected-speech timing cannot be modelled — and all findings are corpus-specific until validated on an independent dysarthric corpus.
+Structural limits no experiment removes: **15 dysarthric speakers** (3 in the smallest classes) is a small population for a 4-class task; UA-Speech contains **isolated words** only, so connected-speech prosody cannot be modelled; and all findings are corpus-specific until validated on an independent dysarthric corpus.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The licence covers this source code only. **The UA-Speech database carries its own separate licence and data use agreement** (academic/government research use only, no redistribution) — see `data/uaspeech_corpus_docs/UASPEECH_LICENSE.txt` once the corpus is obtained.
+MIT — see [LICENSE](LICENSE). The licence covers this source code only. **The UA-Speech database carries its own licence and data use agreement** (academic/government research use only, no redistribution).
 
 ## Acknowledgments
 
-With thanks to the creators and maintainers of the UA-Speech corpus at the University of Illinois at Urbana-Champaign, and to the participants who contributed their speech recordings to advance assistive-technology research:
+With thanks to the creators and maintainers of the UA-Speech corpus at the University of Illinois at Urbana-Champaign, and to the participants who contributed their speech recordings:
 
 > H. Kim, M. Hasegawa-Johnson, A. Perlman, J. Gunderson, T. Huang, K. Watkin, and S. Frame,
 > *Dysarthric Speech Database for Universal Access Research,* Interspeech, 2008.

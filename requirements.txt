@@ -1,42 +1,27 @@
-# GPU training: install torch/torchaudio from the CUDA-enabled index first, e.g.
-#   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-# then this file (plain PyPI has CPU-only wheels under these bare version numbers).
+# Verified environment: Python 3.10, Windows 11, RTX 4060 Laptop (CUDA 12.1 wheels).
 #
-# Silero VAD (src/vad.py) loads via torch.hub.load("snakers4/silero-vad:v6.2.1", ...)
-# — no extra pinned package needed beyond torch itself, but the FIRST run on a
-# machine needs internet access to download and cache the JIT model (~2MB, cached
-# under torch.hub's default cache dir afterward; every later run is fully offline).
+# Install the CUDA build of torch/torchaudio FIRST — plain PyPI serves CPU-only
+# wheels under the same version numbers:
+#   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#
+# Silero VAD loads through torch.hub (pinned to v6.2.1 in src/vad.py); the first
+# run needs internet access once (~2 MB), later runs are offline.
 torch==2.5.1
 torchaudio==2.5.1
-soundfile==0.14.0
-transformers==5.5.4
+soundfile==0.14.0            # torchaudio's audio backend on Windows
+transformers==4.49.0
 peft==0.19.1
-# Not a direct dependency of this project (no torchao-quantized inference anywhere in src/) --
-# pinned only because peft==0.19.1's LoRA layer dispatcher (peft/tuners/lora/model.py) probes
-# torchao at get_peft_model() time whenever it is importable at all, and hard-raises ImportError
-# if a torchao older than 0.16.0 is present (peft/import_utils.py:is_torchao_available()). Some
-# environments (e.g. Kaggle's base GPU image) preinstall an old torchao, which would otherwise
-# break LoRA injection for src/models/deep_pathway.py. See notebooks/Kaggle_Training_Pipeline.ipynb
-# Sections 3-4 for the Kaggle-specific install/preflight this same issue required there.
-torchao>=0.16.0
-pandas==2.3.3
 numpy==2.2.6
-scipy==1.15.3
-matplotlib==3.10.8
-seaborn==0.13.2
+pandas==2.3.3
 scikit-learn==1.7.2
-tensorboard==2.21.0
+matplotlib==3.10.8
+tensorboard==2.21.0          # torch.utils.tensorboard
 praat-parselmouth==0.4.7
-# tqdm is no longer a direct dependency — src/console.py's progress()
-# reports in plain lines instead of carriage-return bars (see its
-# ProgressReporter docstring). It remains installed transitively via
-# huggingface_hub/transformers; nothing in src/ imports it.
-python-dotenv==1.1.1
-umap-learn==0.5.7
-shap==0.48.0
-joblib==1.5.3          # sklearn model persistence (src/training/checkpoint.py) —
-                        # a transitive scikit-learn dependency, but imported directly
-                        # here, so pinned explicitly rather than left implicit.
+python-dotenv==1.2.2
+psutil==7.2.2                # memory sizing and the AC-power check
+tqdm==4.67.3                 # progress bars
 
-# Testing
-pytest==9.1.1           # tests/ (pytest tests/) — not needed to run the pipeline itself
+# Notebook kernel and tests
+ipykernel==7.2.0
+pytest==9.1.1
