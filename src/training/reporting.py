@@ -416,8 +416,9 @@ def build_final_run_configuration(cfg) -> Dict:
             "grl_lambda": config.GRL_LAMBDA,
             "severity_head": "CORAL, median decode",
         },
-        "validation": {"protocol": "speaker-disjoint, one speaker per eligible class",
-                       "monitored": f"validation {cfg.monitor}",
+        "validation": {"protocol": f"speaker-disjoint, up to {cfg.val_speakers_per_class} per eligible class",
+                       "monitored": (f"validation {cfg.monitor} (mean of last {cfg.monitor_smoothing} "
+                                     f"evaluations; no selection before epoch {cfg.min_epochs})"),
                        "evals_per_epoch": cfg.evals_per_epoch},
         "optimizer": {"type": "AdamW", "lr_head": cfg.lr_head, "lr_lora": cfg.lr_lora,
                       "weight_decay": cfg.weight_decay, "batch_size": cfg.batch_size,

@@ -60,6 +60,9 @@ class TrainingConfig:
     patience: int = config.DEFAULT_PATIENCE         # in epochs
     evals_per_epoch: int = config.DEFAULT_EVALS_PER_EPOCH
     monitor: str = config.DEFAULT_MONITOR           # "ordinal_mae" | "ordinal_loss"
+    min_epochs: int = config.DEFAULT_MIN_EPOCHS     # no checkpoint / patience before this
+    monitor_smoothing: int = config.DEFAULT_MONITOR_SMOOTHING   # mean of the last N evaluations
+    val_speakers_per_class: int = config.DEFAULT_VAL_SPEAKERS_PER_CLASS
     grad_clip: float = config.DEFAULT_GRAD_CLIP_NORM
     grad_accum_steps: int = 1                       # >1: same effective batch, less VRAM
     seed: int = config.DEFAULT_SEED
@@ -215,7 +218,8 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
     # which folds ran before it in this session (resuming changes nothing).
     set_seed(cfg.seed + zlib.crc32(fold_id.encode("utf-8")) % 10_000)
 
-    train_df, val_df = speaker_disjoint_train_val_split(train_df, cfg.seed, fold_id=fold_id)
+    train_df, val_df = speaker_disjoint_train_val_split(
+        train_df, cfg.seed, fold_id=fold_id, val_speakers_per_class=cfg.val_speakers_per_class)
     val_speakers = sorted(val_df["Speaker_ID"].unique())
     train_speakers = set(train_df["Speaker_ID"])
     if set(val_speakers) & train_speakers or set(test_df["Speaker_ID"]) & (train_speakers | set(val_speakers)):
@@ -246,6 +250,8 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
     common = dict(device=device, class_weights=class_weights, amp_dtype=amp_dtype,
                   amp_enabled=use_amp)
     early_stopping = EarlyStopping(patience=patience_rounds, mode="min")
+    min_rounds, smoothing = cfg.min_epochs * evals, max(1, cfg.monitor_smoothing)
+    monitor_history: List[float] = []      # raw monitored values, for the smoothed one
 
     fold_dir = config.CHECKPOINT_DIR / cfg.run_name / fold_id
     best_path, latest_path = fold_dir / "best.pt", fold_dir / "latest.pt"
@@ -270,6 +276,7 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
         early_stopping.load_state_dict(state.get("early_stopping") or {})
         best_epoch, best_monitored = state.get("best_epoch"), state.get("best_monitored")
         slowest_epoch_s = float(state.get("slowest_epoch_s") or 0.0)
+        monitor_history = list(state.get("monitor_history") or [])
         print(f"  Resumed from {latest_path.name}: {start_epoch} evaluation round(s) done "
               f"(best so far: evaluation {best_epoch}).")
 
@@ -291,8 +298,10 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
                                      description=label and f"{label} train", **common)
             val_result = run_epoch(model, val_loader, description=label and f"{label} val",
                                    **common)
-            monitored = _monitored(val_result, cfg.monitor)
-            scheduler.step(monitored)
+            monitor_history.append(_monitored(val_result, cfg.monitor))
+            window = [v for v in monitor_history[-smoothing:] if np.isfinite(v)]
+            monitored = float(np.mean(window)) if len(window) == min(smoothing, len(monitor_history))                 else float("nan")
+            scheduler.step(monitored if np.isfinite(monitored) else monitor_history[-1])
 
             for name, value in (("Loss/train", train_result.loss), ("Loss/val", val_result.loss),
                                 ("Loss/val_monitored", monitored),
@@ -304,7 +313,9 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
                 writer.add_scalar(name, value, epoch)
 
             epochs_completed = epoch + 1
-            is_best = early_stopping.step(monitored)
+            # Before min_epochs the round is neither a candidate nor a bad epoch.
+            eligible = epoch + 1 >= min_rounds
+            is_best = early_stopping.step(monitored) if eligible else False
             if is_best:
                 save_checkpoint(best_path, model, optimizer, scheduler, scaler, epoch, monitored)
                 best_epoch, best_monitored = epoch + 1, monitored
@@ -314,13 +325,14 @@ def run_fold(fold_id: str, train_df: pd.DataFrame, test_df: pd.DataFrame, cfg: T
             save_checkpoint(latest_path, model, optimizer, scheduler, scaler, epoch, monitored,
                             extra={"early_stopping": early_stopping.state_dict(),
                                    "best_epoch": best_epoch, "best_monitored": best_monitored,
-                                   "slowest_epoch_s": slowest_epoch_s, "fold_id": fold_id})
+                                   "slowest_epoch_s": slowest_epoch_s, "fold_id": fold_id,
+                                   "monitor_history": monitor_history[-smoothing:]})
 
             m = val_result.metrics
             print(f"  {(epoch + 1) / evals:>5.1f}/{cfg.epochs:<3}{train_result.loss:>11.4f}{val_result.loss:>10.4f}"
                   f"{monitored:>13.4f}{m['accuracy']:>9.3f}{_cell(m['f1'])}{_cell(m['ordinal_mae'])}"
                   f"{epoch_s / 60:>7.1f}m" + ("   * best" if is_best else ""))
-            if not (np.isfinite(train_result.loss) and np.isfinite(monitored)):
+            if eligible and not (np.isfinite(train_result.loss) and np.isfinite(monitored)):
                 print_note(f"Non-finite loss in epoch {epoch + 1} — it cannot become the best checkpoint.")
             if early_stopping.should_stop:
                 best_at = f"{best_epoch / evals:.1f}" if best_epoch else "n/a"
@@ -539,5 +551,6 @@ def run_training(df: pd.DataFrame, cfg: TrainingConfig) -> Tuple[pd.DataFrame, D
                  (("f1", "macro-F1"), ("balanced_accuracy", "balanced accuracy"),
                   ("ordinal_mae", "ordinal MAE")) if np.isfinite(pooled[key])]
     headline.append(f"speakers correct {int(speakers['Correct'].sum())}/{len(speakers)}")
+    headline.append(f"speaker-level ordinal MAE {pooled['speaker_ordinal_mae']:.3f}")
     print_kv(f"Pooled ({len(y_true):,} utterances)", " · ".join(headline))
     return summary, pooled

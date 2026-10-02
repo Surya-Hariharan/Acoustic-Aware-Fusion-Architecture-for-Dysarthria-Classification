@@ -179,7 +179,17 @@ DEFAULT_BATCH_SIZE = 32                                # measured: 76 samples/s,
 DEFAULT_LR_HEAD = 3e-4                                 # 1e-3 overfit the training speakers within one epoch
 DEFAULT_LR_LORA = 1e-4
 DEFAULT_WEIGHT_DECAY = 1e-2
-DEFAULT_PATIENCE = 3                                   # epochs without validation improvement
+DEFAULT_PATIENCE = 5                                   # epochs without validation improvement
+# Validation on 3-6 speakers is noisy (accuracy swings +-5 points between
+# evaluations), so a lucky first evaluation used to win: several folds
+# "selected" epoch 0.5, an almost untrained head. No checkpoint is eligible and
+# no patience is spent before DEFAULT_MIN_EPOCHS, and the monitored value is
+# the mean of its last DEFAULT_MONITOR_SMOOTHING evaluations.
+DEFAULT_MIN_EPOCHS = 3
+DEFAULT_MONITOR_SMOOTHING = 2
+# Validation speakers drawn per severity class (still capped so every class
+# keeps at least 2 training speakers).
+DEFAULT_VAL_SPEAKERS_PER_CLASS = 2
 # Validate this many times per training epoch: with the best model at epoch 1,
 # once-per-epoch validation skipped the checkpoints that mattered. Patience is
 # counted in epochs (scaled to evaluations internally).
