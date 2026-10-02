@@ -14,9 +14,14 @@
 
 Dysarthria is a motor speech disorder whose acoustic signature spans several levels of the speech signal at once: *articulatory precision* (consonant blurring, vowel-space centralization), *phonatory and prosodic control* (monopitch, reduced loudness variation, irregular voicing), and *higher-level contextual structure* that a handcrafted descriptor set does not capture.
 
-This repository implements and evaluates a **three-branch gated-fusion architecture** built on the premise that these levels carry *complementary* information. The claim under test is deliberately narrow: **whether combining the three representations outperforms any subset of them.** It is not yet settled — see [Current status](#current-status).
+This repository builds on the premise that these levels carry *complementary* information, and tests it in two forms under the same 15-fold leave-one-speaker-out protocol:
 
-## Key idea
+* **AAF-Lite (final model)** — the three branches on frozen representations, each expressed relative to healthy speakers saying the same word, fused late by linear models whose every hyperparameter is chosen by a nested inner leave-one-speaker-out loop. Deterministic, ~20 min for the whole evaluation including every ablation. See [Final model](#final-model-aaf-lite).
+* **The end-to-end gated-fusion network** — wav2vec 2.0 + LoRA, segmental and suprasegmental CNNs, softmax gate, CORAL head and adversarial speaker head, trained per fold (3.5–6 h per run). Kept as the comparison.
+
+The claim under test is deliberately narrow: **whether combining the three representations outperforms any subset of them**, for a speaker the model has never heard.
+
+## Key idea (end-to-end network)
 
 A self-supervised encoder (wav2vec 2.0) is strong but opaque; classical descriptors (MFCC, formants, F0, intensity, HNR) are clinically interpretable but individually weaker. Rather than choosing between them or concatenating them flatly, this architecture:
 
@@ -26,7 +31,7 @@ A self-supervised encoder (wav2vec 2.0) is strong but opaque; classical descript
 4. **Suppresses speaker identity** in the fused representation with a gradient-reversal adversarial head;
 5. **Treats severity as ordinal** with a CORAL head, since Very Low < Low < Mid < High is a real ordering.
 
-## Architecture
+## End-to-end architecture
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#1f2937", "primaryTextColor": "#f5f5f5", "primaryBorderColor": "#9aa0a6", "lineColor": "#9aa0a6", "fontSize": "14px"}}}%%
@@ -83,6 +88,24 @@ flowchart TD
 
 Dimensions are read from `src/config.py` and pinned by `tests/test_gated_fusion_shapes.py`.
 
+## Final model (AAF-Lite)
+
+`src/aaflite/` — the same three branches, nothing fitted by gradient descent:
+
+| Branch | Representation | Candidates searched in the inner loop |
+|---|---|---|
+| **Learned** | Frozen `wav2vec2-base-960h` (the end-to-end model's backbone without LoRA): every hidden state pooled over real frames into mean + std, averaged within a layer group | layer group (early 1–4, middle 5–8, late 9–12, all 1–12) × PCA 32 / 128 × C |
+| **Segmental** | Mean, std, p10, p50, p90 of the 43 stored channels (MFCC+Δ+ΔΔ, F1–F3, HNR) over valid frames | PCA 32 / 128 × C |
+| **Suprasegmental** | The same functionals of F0 (voiced frames only), voicing and intensity, plus true speech duration, voiced ratio and F0 range | C |
+
+**Control-referenced normalization** (`reference.py`). Every UA-Speech speaker reads the same 765 prompts. Each feature is expressed as a z-score against the 13 healthy controls' mean for the *same prompt* (block × word), scaled by their pooled within-prompt spread, plus one scalar per branch: the RMS distance from healthy speech. This removes *what* was said and keeps *how* it was said. It uses no labels, and control speakers are never test speakers.
+
+**Classifier and fusion** (`pipeline.py`). Each branch is `StandardScaler → whitened PCA → multinomial logistic regression` (balanced class weights). Branch probabilities are averaged with weights on a 0.1 simplex grid, and decoded either by argmax or by the ordinal **expected rank** (the probability-weighted severity, rounded).
+
+**Nested leave-one-speaker-out.** For each of the 15 outer folds, an inner leave-one-speaker-out over the 14 training speakers produces out-of-fold probabilities for every candidate configuration. The best configuration per branch (balanced accuracy, ties broken by log-loss), the fusion weights and the decoder are chosen on those, then refit on all 14 speakers and applied once to the held-out speaker. **The held-out speaker never influences any choice.**
+
+**Reported alongside the final model:** every branch subset (7 runs), the fusion without the control reference, a majority-class baseline, a **permuted-label sanity check** (severity shuffled across speakers — must fall to chance), 95% bootstrap confidence intervals over speakers, and the speaker-level decision (median of a speaker's utterance predictions).
+
 ## Dataset
 
 **UA-Speech** — dysarthric and control speech, 765 isolated words per speaker in three blocks (B1–B3). The corpus is **not redistributed here**; obtain it from its authors and place the archives in `data/raw/`:
@@ -115,7 +138,7 @@ Two VAD profiles differ only in the margin kept around speech: 30 ms for the lea
 
 **Feature store.** Silero and ~2,000 Praat calls per utterance are far too slow to run per epoch. `src/feature_store.py` computes each utterance's VAD spans and both feature tensors once, in parallel, into one compressed chunk per (speaker, block) under `outputs/feature_cache/store/`. Chunks are written atomically (an interrupted build keeps every finished chunk), memory-mapped at read time (one copy shared by all DataLoader workers), and keyed by a configuration signature (a chunk built under different settings is ignored). The notebook re-runs live Silero on 300 utterances and recomputes 24 feature tensors through the original live path, requiring **bit-exact** equality.
 
-## Training
+## End-to-end training
 
 | Aspect | Setting | Source |
 |---|---|---|
@@ -124,9 +147,9 @@ Two VAD profiles differ only in the margin kept around speech: 30 ms for the lea
 | Loss | Class-weighted CORAL + 0.05 × redundancy + 0.1 × adversarial speaker CE (GRL strength 1.0) | `config.LAMBDA_*` |
 | Decoding | Median of the CORAL distribution — argmax starves Low/Mid when thresholds are close | `losses.coral_rank_from_class_probs` |
 | Optimizer | AdamW, weight decay 1e-2 — **LoRA adapters 1e-4**, branches / projections / gate / heads 1e-3 | `config.DEFAULT_LR_*`, `engine.build_optimizer` |
-| Schedule | ReduceLROnPlateau (×0.5); early stopping, patience 3, on the validation ordinal loss | `config.DEFAULT_PATIENCE` |
+| Schedule | ReduceLROnPlateau (×0.5); early stopping on validation ordinal MAE averaged over the last 2 evaluations, patience 5, no checkpoint before epoch 3 | `config.DEFAULT_PATIENCE`, `DEFAULT_MIN_EPOCHS`, `DEFAULT_MONITOR_SMOOTHING` |
 | Batch / epochs | 32, fp16 AMP, gradient clipping 1.0 / at most 12 | `config.DEFAULT_*` |
-| Validation | Speaker-disjoint: one speaker per class that keeps ≥ 2 training speakers (3–4 per fold), seeded per fold | `data.speaker_disjoint_train_val_split` |
+| Validation | Speaker-disjoint: up to two speakers per class while every class keeps ≥ 2 training speakers (5–6 per fold), seeded per fold | `config.DEFAULT_VAL_SPEAKERS_PER_CLASS` |
 | Seed | 42, re-seeded per fold so a fold's result does not depend on which folds ran before it | `runner.run_fold` |
 
 Hyperparameters are fixed in `src/config.py` before the run. `write_frozen_config` records the configuration, git commit and software versions under `outputs/results/<run>/frozen_config.json`; `check_frozen_config_guard` refuses to re-run the same run name under a different configuration (resuming the same one is fine).
@@ -139,9 +162,9 @@ A held-out speaker has a single true class, so per-fold macro-F1, balanced accur
 
 ## Running it on a laptop
 
-Everything runs from `notebooks/training.ipynb` (**Run All**), measured on an RTX 4060 Laptop (8 GB, 88 W) with 16 GB RAM under Windows 11.
+Everything runs from `notebooks/training.ipynb` (**Run All**), measured on an RTX 4060 Laptop (8 GB, 88 W) with 16 GB RAM under Windows 11. The first run builds the feature store for all 28 speakers (~50 min) and the frozen wav2vec2 statistics (~6 min); afterwards both load from disk and the final model's full evaluation takes ~20 min on the CPU. The end-to-end network (notebook section 6) is off by default (`RUN_END_TO_END = False`); the notes below apply to it.
 
-- **Measured, not assumed.** Section 6 times real training steps on this machine (~1 min) and projects the run time before the run starts.
+- **Measured, not assumed.** Section 6.3 times real training steps on this machine (~1 min) and projects the run time before the run starts.
 - **No thermal pauses.** Training runs straight through; the GPU's own firmware throttles clocks if it runs hot. An optional pause-and-resume guard exists behind `config.THERMAL_GUARD_ENABLED` (off).
 - **Power and sleep.** Training waits for the charger if the laptop is on battery, and keeps Windows awake while it runs. Lid closing still follows its own Windows setting — keep the lid open or set *When I close the lid → Do nothing* while plugged in.
 - **Memory.** On Windows every DataLoader worker is a spawned process costing ~2 GB of commit, so training uses one persistent worker and evaluates in-process; worker counts are re-sized to the memory free before every fold. PyTorch's VRAM share is capped at 90% so an overflow raises a clean OOM instead of silently spilling into system RAM (which slows training ~10×).
@@ -151,9 +174,16 @@ Everything runs from `notebooks/training.ipynb` (**Run All**), measured on an RT
 ## Repository structure
 
 ```text
-notebooks/training.ipynb   The experiment: environment, data, feature store, model audit,
-                            throughput, frozen config, training, results
+notebooks/training.ipynb   The single notebook: environment, data, feature store, final model
+                           (AAF-Lite) and its results, then the optional end-to-end network
+docs/end_to_end_v2_log.txt Per-fold results of the two complete end-to-end runs
 src/
+  aaflite/
+    embeddings.py          Frozen wav2vec 2.0: masked mean + std of every hidden state
+    functionals.py         Utterance functionals of the stored segmental / supra features
+    reference.py           Control-referenced (same-prompt) normalization
+    pipeline.py            Nested LOSO, late fusion, decoders, bootstrap CIs, baselines
+    run.py                 Feature preparation and the full experiment set
   config.py                Paths, speakers, labels, hyperparameters, hardware profile
   extraction.py            Archive extraction (audio/original)
   scanning.py              Filename parsing, verification, M6 filter, severity labels
@@ -166,6 +196,7 @@ src/
   splits.py                Severity leave-one-speaker-out folds
   losses.py                CORAL, cross-branch redundancy, gradient reversal
   console.py               Console report formatting and progress bars
+  eda.py  style.py         Speech-processing EDA panels and the shared figure style
   models/
     gated_fusion.py        GatedFusionModel: gate, CORAL head, speaker head, ablation switches
     deep_pathway.py        wav2vec 2.0 + LoRA
@@ -182,7 +213,9 @@ src/
     checkpoint.py  early_stopping.py  utils.py
 tests/                     Shapes, losses, masking, frame alignment, folds and validation
                            split, metrics, frozen-config guard, feature-store and VAD-span
-                           equality gates, and a real-data end-to-end training step
+                           equality gates, a real-data end-to-end training step, and the
+                           AAF-Lite protocol (no held-out speaker in any fit or selection,
+                           control-only reference, determinism, permuted labels at chance)
 ```
 
 Every fold writes, under `outputs/<kind>/<run_name>/`: a checkpoint, TensorBoard logs (`tensorboard --logdir outputs/logs`), a predictions CSV, a metrics JSON, a confusion matrix and an embeddings file (fused, per-branch and gate weights per utterance).
@@ -213,22 +246,23 @@ python -m ipykernel install --user --name torch-gpu
 pytest                       # the real-data tests skip when the corpus is absent
 ```
 
-Then open `notebooks/training.ipynb` with the `torch-gpu` kernel and Run All. `AAFA_SMOKE=1` (or `SMOKE_TEST = True`) runs a 2-fold, 1-epoch, 64-utterance end-to-end check. An optional `HF_TOKEN` in `.env` lifts the Hugging Face rate limit; the checkpoint is public.
+Then open `notebooks/training.ipynb` with the `torch-gpu` kernel and Run All. `AAFA_SMOKE=1` runs the final model on 4 outer folds (one per class) under separate run names — a pipeline check, not a result. An optional `HF_TOKEN` in `.env` lifts the Hugging Face rate limit; the checkpoint is public.
 
 ## Current status
 
 | Component | Status |
 |---|---|
-| Architecture, losses, ablation switches | Implemented, unit-tested |
-| Data pipeline, two VAD profiles, framewise features, feature store | Implemented; store built for all 15 dysarthric speakers and verified bit-exact against the live pipeline |
-| End-to-end notebook | Smoke-tested on the target laptop (2 folds × 1 epoch) |
-| **The 15-fold severity run** | **Not yet executed** |
-| Ablations ab1–ab8 | Not yet executed |
+| Data pipeline, two VAD profiles, frame-wise features, feature store (all 28 speakers) | Implemented, verified bit-exact against the live pipeline |
+| Final model (AAF-Lite): frozen branches, control reference, nested-LOSO fusion, ablations, sanity checks | Implemented and unit-tested; results produced by notebook sections 4–5 |
+| End-to-end gated-fusion network | Two complete 15-fold runs: accuracy 0.453 / 0.370, macro-F1 0.312 / 0.296, 8 / 6 of 15 speakers correct (`docs/end_to_end_v2_log.txt`) |
+
+Results of a run are written to `outputs/results/aaflite_summary.json` (every model, pooled metrics, per-fold choices) and per run to `outputs/{predictions,metrics,confusion_matrix}/aaflite_*`.
 
 ## Limitations and open questions
 
 | # | Question | Why it matters | Planned check |
 |---|---|---|---|
+| 0 | **Run-to-run variance of the end-to-end network** | Its two runs differ by 8 accuracy points, and single speakers by up to 40 (M09 0.65 → 0.26) — larger than most effects one would want to measure | Reason the final model is deterministic, with every choice made by nested LOSO |
 | 1 | **Speaker adversary vs. speaker-level labels** | Every utterance of a speaker has the same severity, so severity is itself partly speaker information; an adversary that removes speaker identity can also remove severity cues | Compare `ab6_full_fusion` with `ab8_full_speaker_grl` before trusting the GRL |
 | 2 | **Truncation at 4 s** | ~8% of utterances exceed the window and lose their tail; long utterances are more frequent at higher severity | Stratify truncation by severity; compare a longer window |
 | 3 | **Padding and boundary effects** | Masked pooling excludes padding, but convolutions and BatchNorm see it first (on average 68% of the window is padding) | Measure embedding sensitivity to padding at fixed speech content |

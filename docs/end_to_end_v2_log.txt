@@ -1,0 +1,46 @@
+End-to-end gated-fusion model (wav2vec2 + LoRA, segmental CNN, suprasegmental CNN, CORAL head)
+15-fold severity leave-one-speaker-out, UA-Speech M6, 765 utterances per held-out speaker.
+
+Transcribed from the console output of notebooks/training.ipynb before that notebook was
+restructured (the executed outputs no longer exist; the outputs/ artifacts were deleted).
+
+=== v1 — patience 3, one validation speaker per class, best checkpoint by ordinal MAE (3.37 h)
+Held-out (class)    accuracy  ordinal MAE  best epoch  predicted VL / L / M / H
+F03 (Very Low)      0.942     0.085        5.5         721 /  31 /   5 /   8
+F02 (Low)           0.003     1.097        0.5         687 /   2 /   0 /  76
+F04 (Mid)           0.034     1.460        8.0         378 /  43 /  26 / 318
+F05 (High)          0.533     1.333        4.5         323 /  17 /  17 / 408
+M01 (Very Low)      0.183     2.323        3.5         140 /  34 /  30 / 561
+M07 (Low)           0.035     1.112        5.5         609 /  27 /  16 / 113
+M05 (Mid)           0.048     1.374        1.0         323 /  43 /  37 / 362
+M08 (High)          0.948     0.144        0.5          34 /   2 /   4 / 725
+M04 (Very Low)      0.876     0.359        0.5         670 /   2 /   6 /  87
+M16 (Low)           0.007     1.895        0.5          69 /   5 /   1 / 690
+M11 (Mid)           0.088     1.455        4.5         415 /  85 /  67 / 198
+M09 (High)          0.652     1.000        1.0         244 /  11 /  11 / 499
+M12 (Very Low)      0.478     1.269        3.5         366 /  68 /  90 / 241
+M10 (High)          1.000     0.000        3.0           0 /   0 /   0 / 765
+M14 (High)          0.973     0.063        5.5          11 /   5 /   5 / 744
+Pooled (11,475): accuracy 0.453 · macro-F1 0.312 · balanced accuracy 0.378 · ordinal MAE 0.998
+                 · speakers correct 8/15
+
+=== v2 — patience 5, no checkpoint before epoch 3, monitor averaged over 2 evaluations,
+===      up to two validation speakers per class (6.03 h)
+Held-out (class)    accuracy  ordinal MAE  best epoch  predicted VL / L / M / H
+F03 (Very Low)      0.910     0.169        3.0         696 /  29 /  20 /  20
+F02 (Low)           0.067     1.013        6.5         625 /  51 /  28 /  61
+F04 (Mid)           0.039     1.438        6.5         365 /  47 /  30 / 323
+F05 (High)          0.535     1.316        6.0         316 /  19 /  21 / 409
+M01 (Very Low)      0.196     2.034        9.0         150 /  95 /  99 / 421
+M07 (Low)           0.137     1.031        5.5         460 / 105 /  71 / 129
+M05 (Mid)           0.196     1.150        7.0         265 / 158 / 150 / 192
+M08 (High)          0.924     0.180        5.5          37 /   6 /  15 / 707
+M04 (Very Low)      0.410     0.858       12.0         314 / 307 /  83 /  61
+M16 (Low)           0.098     1.261        7.0         330 /  75 /  85 / 275
+M11 (Mid)           0.073     1.058        4.5         100 /  53 /  56 / 556
+M09 (High)          0.261     1.949        7.0         429 /  68 /  68 / 200
+M12 (Very Low)      0.059     2.690        5.0          45 /  18 /  66 / 636
+M10 (High)          0.962     0.082       10.0          16 /   2 /  11 / 736
+M14 (High)          0.686     0.754       12.0         153 /  31 /  56 / 525
+Pooled (11,475): accuracy 0.370 · macro-F1 0.296 · balanced accuracy 0.318 · ordinal MAE 1.132
+                 · AUROC 0.610 · speakers correct 6/15 · speaker-level ordinal MAE 1.000
