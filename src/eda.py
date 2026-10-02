@@ -4,17 +4,12 @@ wideband/narrowband spectrograms, cepstral analysis, Linear Prediction
 analysis, and a combined VAD + GAD (glottal/voicing activity) three-way
 silence/unvoiced/voiced segmentation.
 
-Deliberately separate from src/visualization.py (which houses the existing
-Praat-statistics/VAD-validation EDA) — this module is the "classical
-speech-processing technique" panel set, called from
-notebooks/02_feature_analysis.ipynb's speech-processing-EDA and feature-
-extraction-summary stages. Every function returns raw arrays as well as
-optionally plotting, so the same computation can feed a notebook table
-without recomputation.
+Every function returns raw arrays as well as optionally plotting, so the
+same computation can feed a table without recomputation.
 
 All plots use src.style's shared color system (apply_style, SEQUENTIAL_CMAP,
 VOICING_COLORS, FORMANT_COLORS) so every heatmap/segmentation panel in the
-EDA notebook is visually consistent with the rest of the project's figures.
+EDA notebook is visually consistent.
 """
 
 from typing import Dict, Optional, Tuple

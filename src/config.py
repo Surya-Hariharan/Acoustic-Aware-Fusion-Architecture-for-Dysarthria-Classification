@@ -250,6 +250,24 @@ REQUIRE_AC_POWER = True
 
 USE_TQDM = True                                        # False: throttled line log for piped output
 
+# ---------------------------------------------------------------------------
+# AAF-Lite (src/aaflite): the same three branches on FROZEN representations,
+# control-referenced per word, fused late by linear models under nested LOSO.
+# Every choice below is selected inside the training speakers of each outer
+# fold — never against the held-out speaker.
+# ---------------------------------------------------------------------------
+AAFLITE_EMBEDDING_DIR = EMBEDDINGS_DIR / "wav2vec2_layer_stats"   # one .npz per speaker
+AAFLITE_EMBED_BATCH_SIZE = 32
+# Contiguous wav2vec2 hidden-state groups (0 = CNN feature projection). Each
+# group's per-layer [mean, std] pools are averaged into one 1536-d vector.
+AAFLITE_LAYER_GROUPS = {"early": (1, 2, 3, 4), "middle": (5, 6, 7, 8), "late": (9, 10, 11, 12),
+                        "all": tuple(range(1, 13))}
+AAFLITE_PCA_DIMS = (32, 128)                           # learned + segmental branches
+AAFLITE_C_GRID = (0.003, 0.03, 0.3)                    # inverse L2 strength, LogisticRegression
+AAFLITE_FUSION_STEP = 0.1                              # simplex grid for the branch weights
+AAFLITE_BOOTSTRAP = 2000                               # speaker-level bootstrap resamples
+AAFLITE_N_JOBS = 4                                     # outer folds in parallel (CPU)
+
 
 def ensure_directories() -> None:
     """Create every directory the pipeline writes to."""
