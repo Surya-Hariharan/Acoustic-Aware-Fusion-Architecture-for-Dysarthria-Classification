@@ -16,7 +16,7 @@ Dysarthria is a motor speech disorder whose acoustic signature spans several lev
 
 This repository builds on the premise that these levels carry *complementary* information, and tests it in two forms under the same 15-fold leave-one-speaker-out protocol:
 
-* **AAF-Lite (final model)** — the three branches on frozen representations, each expressed relative to healthy speakers saying the same word, fused late by linear models whose every hyperparameter is chosen by a nested inner leave-one-speaker-out loop. Deterministic, ~20 min for the whole evaluation including every ablation. See [Final model](#final-model-aaf-lite).
+* **AAF-Lite (final model)** — four frozen branches (a *recogniser* branch added to the learned, segmental and suprasegmental ones), each expressed relative to healthy speakers saying the same word. Severity is a property of the **speaker**, so the headline decision is made per speaker (*session level*) from a few per-utterance scalars averaged over all of its recordings; a stricter utterance-level view with nested model selection is reported next to it. Deterministic; the whole evaluation takes about half an hour on a CPU. See [Final model](#final-model-aaf-lite) and [Why the first attempts plateaued](#why-the-first-attempts-plateaued).
 * **The end-to-end gated-fusion network** — wav2vec 2.0 + LoRA, segmental and suprasegmental CNNs, softmax gate, CORAL head and adversarial speaker head, trained per fold (3.5–6 h per run). Kept as the comparison.
 
 The claim under test is deliberately narrow: **whether combining the three representations outperforms any subset of them**, for a speaker the model has never heard.
@@ -88,23 +88,39 @@ flowchart TD
 
 Dimensions are read from `src/config.py` and pinned by `tests/test_gated_fusion_shapes.py`.
 
+## Why the first attempts plateaued
+
+Two complete end-to-end runs (wav2vec 2.0 + LoRA, ~3.4 h and ~6.0 h each) reached 0.453 and 0.370 accuracy (8 and 6 of 15 speakers correct), and a first frozen-feature version of AAF-Lite reached 0.369 with the same 6/15. Diagnostics on the cached features found four causes:
+
+| # | Finding | Evidence | Consequence |
+|---|---|---|---|
+| 1 | **The label belongs to the speaker, but the models classified utterances.** | Severity explains only 30–47 % of the *between-speaker* variance, which is itself only 20–31 % of the total; a 15-way speaker-ID probe on the same features scores 0.59–0.83 (chance 0.07). | Models fitted on 14 training speakers learn voices, not severity: near-perfect on a few speakers, near zero on the Low/Mid ones. |
+| 2 | **A bug degraded the learned branch.** | `wav2vec2-base` was trained on zero-padded batches *without* an attention mask; the code passed one. With the mask, its own CTC head decodes isolated words as noise (speaker-level correlation of word accuracy with severity: **+0.16**); without it, **+0.94**. | Both the end-to-end network and the first AAF-Lite used a broken representation. |
+| 3 | **The model never measured what the label measures.** | UA-Speech severity is *listener intelligibility* of these exact words, and the checkpoint already contains a CTC recogniser. | The recogniser's accuracy on the prompted word is a one-number automatic analogue; it was not used. |
+| 4 | **Capacity far beyond the data.** | The inner loop always selected the smallest PCA on offer (32) — the edge of its grid — for 1,500-dimensional inputs and 14 training speakers. | Fewer dimensions were needed, and a scalar per speaker is enough. |
+
 ## Final model (AAF-Lite)
 
-`src/aaflite/` — the same three branches, nothing fitted by gradient descent:
+`src/aaflite/` — four frozen branches, nothing fitted by gradient descent:
 
-| Branch | Representation | Candidates searched in the inner loop |
-|---|---|---|
-| **Learned** | Frozen `wav2vec2-base-960h` (the end-to-end model's backbone without LoRA): every hidden state pooled over real frames into mean + std, averaged within a layer group | layer group (early 1–4, middle 5–8, late 9–12, all 1–12) × PCA 32 / 128 × C |
-| **Segmental** | Mean, std, p10, p50, p90 of the 43 stored channels (MFCC+Δ+ΔΔ, F1–F3, HNR) over valid frames | PCA 32 / 128 × C |
-| **Suprasegmental** | The same functionals of F0 (voiced frames only), voicing and intensity, plus true speech duration, voiced ratio and F0 range | C |
+| Branch | Representation |
+|---|---|
+| **Recogniser** (`asr.py`) | A frozen CTC speech recogniser scores each utterance against its prompted word (taken from the corpus' own label files): exact match, character error rate, blank ratio, CTC likelihood per character and per frame, mean confidence. Two checkpoints: `wav2vec2-base-960h` (no attention mask) and `wav2vec2-large-960h-lv60-self` (layer norm, with mask). |
+| **Learned** (`embeddings.py`) | Every hidden state of frozen `wav2vec2-base-960h`, *without* an attention mask, pooled over real frames into mean + std and averaged within a layer group (early 1–4, middle 5–8, late 9–12, all 1–12). |
+| **Segmental** (`functionals.py`) | Mean, std, p10, p50, p90 of the 43 stored channels (MFCC+Δ+ΔΔ, F1–F3, HNR) over valid frames. |
+| **Suprasegmental** (`functionals.py`) | The same functionals of F0 (voiced frames), voicing and intensity, plus true speech duration, voiced ratio and F0 range. |
 
-**Control-referenced normalization** (`reference.py`). Every UA-Speech speaker reads the same 765 prompts. Each feature is expressed as a z-score against the 13 healthy controls' mean for the *same prompt* (block × word), scaled by their pooled within-prompt spread, plus one scalar per branch: the RMS distance from healthy speech. This removes *what* was said and keeps *how* it was said. It uses no labels, and control speakers are never test speakers.
+**Control-referenced normalization** (`reference.py`). Every UA-Speech speaker reads the same 765 prompts. Each feature is expressed as a z-score against the 13 healthy controls' mean for the *same prompt* (block × word), scaled by their pooled within-prompt spread, plus one scalar per branch: the RMS distance from healthy speech. It uses no labels, and control speakers are never test speakers.
 
-**Classifier and fusion** (`pipeline.py`). Each branch is `StandardScaler → whitened PCA → multinomial logistic regression` (balanced class weights). Branch probabilities are averaged with weights on a 0.1 simplex grid, and decoded either by argmax or by the ordinal **expected rank** (the probability-weighted severity, rounded).
+**Session level — the headline** (`speaker_level.py`). Each speaker is summarized by the mean of a few per-utterance scalars over all of its recordings and classified by a Gaussian rule (class means, one pooled within-class variance per feature, equal priors; in one dimension, nearest class mean) fitted on the 14 training speakers.
 
-**Nested leave-one-speaker-out.** For each of the 15 outer folds, an inner leave-one-speaker-out over the 14 training speakers produces out-of-fold probabilities for every candidate configuration. The best configuration per branch (balanced accuracy, ties broken by log-loss), the fusion weights and the decoder are chosen on those, then refit on all 14 speakers and applied once to the held-out speaker. **The held-out speaker never influences any choice.**
+*The model itself is chosen without the held-out speaker.* In `session_nested` — the headline — an inner leave-one-speaker-out over the 14 training speakers of each outer fold picks the recogniser checkpoint (base / large) and the scalar set (word-recognition rate, character error rate, CTC likelihood per character, or a pair) among eight pre-declared candidates (`run.NESTED_CANDIDATES`; ties go to the earlier one). That candidate is refit on the 14 and applied once to the held-out speaker, so the reported number answers *"if the procedure is decided without this speaker, how well does it classify a speaker it has never seen?"* The notebook shows which candidate each fold chose.
 
-**Reported alongside the final model:** every branch subset (7 runs), the fusion without the control reference, a majority-class baseline, a **permuted-label sanity check** (severity shuffled across speakers — must fall to chance), 95% bootstrap confidence intervals over speakers, and the speaker-level decision (median of a speaker's utterance predictions).
+*The fixed-feature rows are exploratory.* The `session_fixed_*` models (other scalars, the base recogniser, fusion with each acoustic branch's distance from healthy speech and with speech duration, acoustic branches alone) use feature sets fixed by hand after exploring all 15 speakers, so they are optimistic by construction; they are sensitivity analyses, not the headline. Every utterance of a held-out speaker carries that speaker's decision, so pooled accuracy equals the share of speakers classified correctly.
+
+**Utterance level — the strict single-word view** (`pipeline.py`). Each branch is `StandardScaler → (whitened PCA of 8 / 16 / 32 dimensions) → multinomial logistic regression`; branch probabilities are fused with weights on a 0.1 simplex grid and decoded by argmax or by the ordinal expected rank. For each of the 15 outer folds, an inner leave-one-speaker-out over the 14 training speakers chooses every configuration, the fusion weights and the decoder; the held-out speaker never influences a choice. Every branch subset is reported, with and without the control reference.
+
+**Reported alongside:** a majority-class baseline (the corpus' most frequent class; refitting it per fold would exclude the held-out speaker's own class and score exactly 0), a **permuted-label sanity check** for both views (severity shuffled across speakers — must fall to chance), 95 % bootstrap intervals over speakers, within-one-level accuracy and ordinal MAE.
 
 ## Dataset
 
@@ -162,7 +178,7 @@ A held-out speaker has a single true class, so per-fold macro-F1, balanced accur
 
 ## Running it on a laptop
 
-Everything runs from `notebooks/training.ipynb` (**Run All**), measured on an RTX 4060 Laptop (8 GB, 88 W) with 16 GB RAM under Windows 11. The first run builds the feature store for all 28 speakers (~50 min) and the frozen wav2vec2 statistics (~6 min); afterwards both load from disk and the final model's full evaluation takes ~20 min on the CPU. The end-to-end network (notebook section 6) is off by default (`RUN_END_TO_END = False`); the notes below apply to it.
+Everything runs from `notebooks/training.ipynb` (**Run All**), measured on an RTX 4060 Laptop (8 GB, 88 W) with 16 GB RAM under Windows 11. The first run builds the feature store for all 28 speakers (30–50 min), the frozen wav2vec2 statistics (~9 min) and the recogniser scores of both checkpoints (~10 min); afterwards all of it loads from disk, and the full evaluation (session-level models, every utterance-level ablation, baselines and sanity checks) takes about 30 min on the CPU. The end-to-end network (notebook section 6) is off by default (`RUN_END_TO_END = False`); the notes below apply to it.
 
 - **Measured, not assumed.** Section 6.3 times real training steps on this machine (~1 min) and projects the run time before the run starts.
 - **No thermal pauses.** Training runs straight through; the GPU's own firmware throttles clocks if it runs hot. An optional pause-and-resume guard exists behind `config.THERMAL_GUARD_ENABLED` (off).
@@ -176,13 +192,14 @@ Everything runs from `notebooks/training.ipynb` (**Run All**), measured on an RT
 ```text
 notebooks/training.ipynb   The single notebook: environment, data, feature store, final model
                            (AAF-Lite) and its results, then the optional end-to-end network
-docs/end_to_end_v2_log.txt Per-fold results of the two complete end-to-end runs
 src/
   aaflite/
-    embeddings.py          Frozen wav2vec 2.0: masked mean + std of every hidden state
+    asr.py                 Frozen CTC recogniser: word accuracy / likelihood vs. the prompted word
+    embeddings.py          Frozen wav2vec 2.0: mean + std of every hidden state over real frames
     functionals.py         Utterance functionals of the stored segmental / supra features
     reference.py           Control-referenced (same-prompt) normalization
-    pipeline.py            Nested LOSO, late fusion, decoders, bootstrap CIs, baselines
+    pipeline.py            Nested LOSO (utterance level), late fusion, decoders, CIs, baselines
+    speaker_level.py       Session-level (one decision per speaker) Gaussian classifier
     run.py                 Feature preparation and the full experiment set
   config.py                Paths, speakers, labels, hyperparameters, hardware profile
   extraction.py            Archive extraction (audio/original)
@@ -253,21 +270,23 @@ Then open `notebooks/training.ipynb` with the `torch-gpu` kernel and Run All. `A
 | Component | Status |
 |---|---|
 | Data pipeline, two VAD profiles, frame-wise features, feature store (all 28 speakers) | Implemented, verified bit-exact against the live pipeline |
-| Final model (AAF-Lite): frozen branches, control reference, nested-LOSO fusion, ablations, sanity checks | Implemented and unit-tested; results produced by notebook sections 4–5 |
-| End-to-end gated-fusion network | Two complete 15-fold runs: accuracy 0.453 / 0.370, macro-F1 0.312 / 0.296, 8 / 6 of 15 speakers correct (`docs/end_to_end_v2_log.txt`) |
+| Final model (AAF-Lite): recogniser + three acoustic branches, control reference, session-level and nested-LOSO utterance-level evaluation, ablations, sanity checks | Implemented and unit-tested; results are produced by notebook sections 4–5 |
+| End-to-end gated-fusion network | Two complete 15-fold runs before the fixes above: accuracy 0.453 / 0.370, macro-F1 0.312 / 0.296, 8 / 6 of 15 speakers correct. Its learned branch used the attention-mask path described in [Why the first attempts plateaued](#why-the-first-attempts-plateaued); it was not re-trained. |
 
-Results of a run are written to `outputs/results/aaflite_summary.json` (every model, pooled metrics, per-fold choices) and per run to `outputs/{predictions,metrics,confusion_matrix}/aaflite_*`.
+Run results are written to `outputs/results/aaflite_summary.json` (every model, pooled metrics, per-fold values and choices) and per run to `outputs/{predictions,metrics,confusion_matrix}/aaflite_*`.
 
 ## Limitations and open questions
 
 | # | Question | Why it matters | Planned check |
 |---|---|---|---|
-| 0 | **Run-to-run variance of the end-to-end network** | Its two runs differ by 8 accuracy points, and single speakers by up to 40 (M09 0.65 → 0.26) — larger than most effects one would want to measure | Reason the final model is deterministic, with every choice made by nested LOSO |
-| 1 | **Speaker adversary vs. speaker-level labels** | Every utterance of a speaker has the same severity, so severity is itself partly speaker information; an adversary that removes speaker identity can also remove severity cues | Compare `ab6_full_fusion` with `ab8_full_speaker_grl` before trusting the GRL |
-| 2 | **Truncation at 4 s** | ~8% of utterances exceed the window and lose their tail; long utterances are more frequent at higher severity | Stratify truncation by severity; compare a longer window |
-| 3 | **Padding and boundary effects** | Masked pooling excludes padding, but convolutions and BatchNorm see it first (on average 68% of the window is padding) | Measure embedding sensitivity to padding at fixed speech content |
-| 4 | **Recording level** | `audio/original` keeps absolute level, partly a session property | Decompose intensity variance into speaker vs. severity components |
-| 5 | **Branch contribution** | Branch value is a claim only after the ablations run across all 15 folds | Run ab1–ab8 under the same protocol |
+| 1 | **Run-to-run variance of the end-to-end network** | Its two runs differ by 8 accuracy points, and single speakers by up to 40 (M09 0.65 → 0.26) — larger than most effects one would want to measure | Reason the final model is deterministic |
+| 2 | **Researcher degrees of freedom** | The recogniser idea itself was found by exploring these 15 speakers. Nested selection removes the choice of checkpoint and scalar from the held-out speaker's reach, but not the choice of the candidate *family*; the `session_fixed_*` rows are optimistic | Validate on an independent dysarthric corpus (e.g. TORGO) |
+| 3 | **Two borderline speakers decide the headline** | With 15 speakers one speaker is 6.7 points; the Low speakers F02 (29 % intelligibility) and M16 (43 %) sit next to the Very Low / Mid boundaries | Report the bootstrap interval, never the point estimate alone |
+| 4 | **Speaker adversary vs. speaker-level labels** | Every utterance of a speaker has the same severity, so severity is itself partly speaker information; an adversary that removes speaker identity can also remove severity cues | Compare `ab6_full_fusion` with `ab8_full_speaker_grl` before trusting the GRL |
+| 5 | **Truncation at 4 s** | ~8% of utterances exceed the window and lose their tail; long utterances are more frequent at higher severity | Stratify truncation by severity; compare a longer window |
+| 6 | **Padding and boundary effects** | Masked pooling excludes padding, but convolutions and BatchNorm see it first (on average 68% of the window is padding) | Measure embedding sensitivity to padding at fixed speech content |
+| 7 | **Recording level** | `audio/original` keeps absolute level, partly a session property | Decompose intensity variance into speaker vs. severity components |
+| 8 | **Branch contribution** | Branch value is a claim only after the ablations run across all 15 folds | Run ab1–ab8 under the same protocol |
 
 Structural limits no experiment removes: **15 dysarthric speakers** (3 in the smallest classes) is a small population for a 4-class task; UA-Speech contains **isolated words** only, so connected-speech prosody cannot be modelled; and all findings are corpus-specific until validated on an independent dysarthric corpus.
 
