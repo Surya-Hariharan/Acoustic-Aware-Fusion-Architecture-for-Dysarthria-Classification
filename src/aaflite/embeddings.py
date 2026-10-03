@@ -3,11 +3,17 @@ Frozen wav2vec 2.0 representations: for every utterance, every hidden state
 (CNN feature projection + 12 transformer layers) pooled over real frames into
 [mean, std] — shape (13, 2, 768), stored as float16.
 
-The input is exactly the learned branch's: the speech-focused VAD profile,
-the 4 s window, per-utterance normalization over valid samples
-(DeepPathway._zero_mean_unit_var_norm) and the attention mask, so padding
-neither enters the transformer nor the pool. Nothing here depends on a fold or
-a label, so it is computed once and cached per speaker (resumable).
+The input is the learned branch's: the speech-focused VAD profile, the 4 s
+window, per-utterance normalization over valid samples
+(DeepPathway._zero_mean_unit_var_norm), then pooling over real frames only.
+
+No attention mask is passed to wav2vec2-base: that checkpoint (group-norm
+feature encoder) was trained on zero-padded batches without one, and passing
+a mask measurably breaks it — its CTC head, which recognises isolated words
+correctly without a mask, decodes them as noise with one (see
+src/aaflite/asr.py). A layer-norm checkpoint would take the mask.
+Nothing here depends on a fold or a label, so it is computed once and cached
+per speaker (resumable).
 """
 
 from pathlib import Path
@@ -55,8 +61,11 @@ def layer_stats(model: Wav2Vec2Model, waveform: torch.Tensor, lengths: torch.Ten
     """(B, samples) audio + (B,) valid lengths -> (B, 13, 2, 768) [mean, std]
     of every hidden state over the real (unpadded) frames."""
     mask = torch.arange(waveform.shape[1], device=waveform.device)[None, :] < lengths[:, None]
-    waveform = DeepPathway._zero_mean_unit_var_norm(waveform, mask)
-    hidden = model(waveform, attention_mask=mask, output_hidden_states=True).hidden_states
+    waveform = DeepPathway._zero_mean_unit_var_norm(waveform, mask)      # padding stays exactly 0
+    if model.config.feat_extract_norm == "layer":
+        hidden = model(waveform, attention_mask=mask, output_hidden_states=True).hidden_states
+    else:
+        hidden = model(waveform, output_hidden_states=True).hidden_states
     n_frames = hidden[0].shape[1]
     frame_lengths = model._get_feat_extract_output_lengths(lengths).clamp(min=1)
     keep = (torch.arange(n_frames, device=waveform.device)[None, :] < frame_lengths[:, None])

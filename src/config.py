@@ -256,13 +256,20 @@ USE_TQDM = True                                        # False: throttled line l
 # Every choice below is selected inside the training speakers of each outer
 # fold — never against the held-out speaker.
 # ---------------------------------------------------------------------------
-AAFLITE_EMBEDDING_DIR = EMBEDDINGS_DIR / "wav2vec2_layer_stats"   # one .npz per speaker
+# v2: computed without an attention mask (v1 passed one, which breaks wav2vec2-base).
+AAFLITE_EMBEDDING_DIR = EMBEDDINGS_DIR / "wav2vec2_layer_stats_v2"   # one .npz per speaker
+AAFLITE_ASR_DIR = EMBEDDINGS_DIR / "asr_scores"        # recogniser scores: <tag>/<speaker>.npz
+# Frozen CTC recognisers whose accuracy on the prompted word is an automatic
+# intelligibility measure (src/aaflite/asr.py). tag -> checkpoint.
+AAFLITE_ASR_MODELS = {"base": "facebook/wav2vec2-base-960h",
+                      "large": "facebook/wav2vec2-large-960h-lv60-self"}
 AAFLITE_EMBED_BATCH_SIZE = 32
 # Contiguous wav2vec2 hidden-state groups (0 = CNN feature projection). Each
 # group's per-layer [mean, std] pools are averaged into one 1536-d vector.
 AAFLITE_LAYER_GROUPS = {"early": (1, 2, 3, 4), "middle": (5, 6, 7, 8), "late": (9, 10, 11, 12),
                         "all": tuple(range(1, 13))}
-AAFLITE_PCA_DIMS = (32, 128)                           # learned + segmental branches
+AAFLITE_PCA_DIMS = (8, 16, 32)                         # learned + segmental branches; low on purpose:
+                                                       # 14 training speakers cannot support more
 AAFLITE_C_GRID = (0.003, 0.03, 0.3)                    # inverse L2 strength, LogisticRegression
 AAFLITE_FUSION_STEP = 0.1                              # simplex grid for the branch weights
 AAFLITE_BOOTSTRAP = 2000                               # speaker-level bootstrap resamples

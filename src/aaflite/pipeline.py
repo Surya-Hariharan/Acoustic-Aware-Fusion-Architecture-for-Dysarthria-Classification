@@ -249,7 +249,11 @@ def _finalize(run_name: str, frames, fold_rows, save: bool) -> Dict:
     y_true, y_pred = predictions["y_true"].to_numpy(), predictions["y_pred"].to_numpy()
     pooled = compute_metrics(y_true, y_pred, y_prob)
     speakers = speaker_level(predictions.assign(correct=y_true == y_pred))
-    pooled.update({"speaker_accuracy": float(speakers["Correct"].mean()),
+    session = session_level(predictions["speaker_id"].to_numpy(), y_true, y_prob)
+    pooled.update({"within1_accuracy": float((np.abs(y_pred - y_true) <= 1).mean()),
+                   "session_speakers_correct": session["correct"],
+                   "session_ordinal_mae": session["ordinal_mae"],
+                   "speaker_accuracy": float(speakers["Correct"].mean()),
                    "speakers_correct": int(speakers["Correct"].sum()), "n_speakers": len(speakers),
                    "speaker_ordinal_mae": float(speakers["Rank error"].mean()),
                    "completed_folds": len(fold_rows), "expected_folds": len(config.DYSARTHRIC_IDS),
@@ -268,14 +272,32 @@ def _finalize(run_name: str, frames, fold_rows, save: bool) -> Dict:
             "pooled": pooled, "folds": fold_rows, "speakers": speakers}
 
 
+def session_level(speaker_ids: np.ndarray, y_true: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
+    """The clinical decision: one severity class per speaker from ALL of that
+    speaker's held-out utterances (argmax of their mean class probabilities).
+    Severity is a speaker-level label, so this is the decision a clinician
+    would make from one recording session; the utterance-level metrics stay
+    the stricter single-word view."""
+    frame = pd.DataFrame(y_prob).assign(speaker=speaker_ids, y=y_true)
+    grouped = frame.groupby("speaker")
+    mean_prob = grouped[list(range(y_prob.shape[1]))].mean()
+    truth = grouped["y"].first().loc[mean_prob.index].to_numpy()
+    pred = mean_prob.to_numpy().argmax(axis=1)
+    return {"correct": int((pred == truth).sum()), "n": len(truth),
+            "ordinal_mae": float(np.abs(pred - truth).mean())}
+
+
 def majority_baseline(df: pd.DataFrame) -> Dict:
-    """Predict each fold's most frequent training class (by utterances)."""
+    """Predict the corpus' most frequent severity class for everyone (High, a
+    third of the utterances) — the standard reference. Refitting the majority
+    inside each leave-one-speaker-out fold would exclude the held-out speaker's
+    own class and score exactly 0, which says nothing about the data."""
     df = df.reset_index(drop=True)
     y = df["Severity"].map(config.SEVERITY_LABEL_MAP).to_numpy()
+    overall = int(np.bincount(y, minlength=config.NUM_CLASSES).argmax())
     frames, rows = [], []
     for fold_id, train_df, test_df in iter_severity_loso_folds(df):
-        majority = int(np.bincount(train_df["Severity"].map(config.SEVERITY_LABEL_MAP),
-                                   minlength=config.NUM_CLASSES).argmax())
+        majority = overall
         te = df.index[df["Filename"].isin(test_df["Filename"])].to_numpy()
         prob = np.zeros((len(te), config.NUM_CLASSES))
         prob[:, majority] = 1.0
@@ -304,8 +326,10 @@ def summary_table(outputs: Dict[str, Dict]) -> pd.DataFrame:
         rows.append({"Model": tag, "Accuracy": p["accuracy"],
                      "Accuracy 95% CI": "[{:.3f}, {:.3f}]".format(*p["accuracy_ci95"]),
                      "Macro F1": p["f1"], "Balanced acc.": p["balanced_accuracy"],
-                     "Ordinal MAE": p["ordinal_mae"], "AUROC": p["auroc"],
+                     "Ordinal MAE": p["ordinal_mae"], "Within ±1": p["within1_accuracy"],
+                     "AUROC": p["auroc"],
                      "Speakers correct": f"{p['speakers_correct']}/{p['n_speakers']}",
+                     "Session correct": f"{p['session_speakers_correct']}/{p['n_speakers']}",
                      "Speaker acc. 95% CI": "[{:.2f}, {:.2f}]".format(*p["speaker_accuracy_ci95"])})
     return pd.DataFrame(rows)
 

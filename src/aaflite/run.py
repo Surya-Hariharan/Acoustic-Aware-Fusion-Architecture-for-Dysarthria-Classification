@@ -16,32 +16,93 @@ import numpy as np
 import pandas as pd
 
 from src import config, feature_store
+from src.aaflite.asr import SCORE_NAMES, extract_asr_scores, load_asr_scores
 from src.aaflite.embeddings import (extract_wav2vec2_layer_stats, layer_group_features,
                                     load_wav2vec2_layer_stats)
-from src.aaflite.functionals import acoustic_functionals
+from src.aaflite.functionals import acoustic_functionals, feature_names
 from src.aaflite.pipeline import (Branch, evaluate, majority_baseline, permuted_labels,
                                   save_summary, summary_table)
 from src.aaflite.reference import ControlReference
+from src.aaflite.speaker_level import evaluate_speaker_level, evaluate_speaker_level_nested
 from src.console import print_header, print_kv, print_status
 
 FEATURE_CACHE = config.EMBEDDINGS_DIR / "aaflite_branch_features.npz"
 SUMMARY_PATH = config.RESULTS_DIR / "aaflite_summary.json"
-FINAL_TAG = "fusion_ref"
+FINAL_TAG = "fusion_ref"                  # utterance-level four-branch fusion
+PRIMARY_TAG = "session_nested"            # the headline: the model itself is chosen by nested LOSO
 # Bump when the meaning of a cached feature changes (functionals, reference, pooling).
-FEATURE_VERSION = 1
+FEATURE_VERSION = 2          # 2: wav2vec2 without attention mask; recogniser (ASR) branch added
 
 # Run tag -> branches. "_ref" = control-referenced features, "_raw" = not.
+# The final model is the full four-branch fusion — fixed before any result.
 SUBSETS = {
-    "learned": ("learned",), "segmental": ("segmental",), "supra": ("supra",),
-    "learned+segmental": ("learned", "segmental"), "learned+supra": ("learned", "supra"),
-    "segmental+supra": ("segmental", "supra"),
-    "fusion": ("learned", "segmental", "supra"),
+    "asr": ("asr",), "learned": ("learned",), "segmental": ("segmental",), "supra": ("supra",),
+    "asr+supra": ("asr", "supra"), "asr+segmental": ("asr", "segmental"),
+    "asr+learned": ("asr", "learned"), "learned+segmental": ("learned", "segmental"),
+    "learned+supra": ("learned", "supra"), "segmental+supra": ("segmental", "supra"),
+    "asr+segmental+supra": ("asr", "segmental", "supra"),
+    "learned+segmental+supra": ("learned", "segmental", "supra"),
+    "fusion": ("asr", "learned", "segmental", "supra"),
 }
+
+
+# Session-level (one decision per speaker) models: each is the Gaussian rule of
+# src.aaflite.speaker_level on the speaker means of the named per-utterance
+# scalars.
+#
+# PRIMARY (clean): NESTED_CANDIDATES. Inside every outer fold an inner
+# leave-one-speaker-out over the 14 training speakers chooses which recogniser,
+# checkpoint and scalar set to use, so the held-out speaker never influences
+# that choice. The family is the recogniser's accuracy on the prompted word —
+# the automatic analogue of how the severity classes were defined (listener
+# transcription accuracy of these words) — in two checkpoints and four scalar
+# sets, in declaration order (ties go to the earlier one).
+NESTED_CANDIDATES = {
+    "large/exact": ["exact_large"], "large/cer": ["cer_large"], "large/nll_char": ["nll_char_large"],
+    "large/exact+cer": ["exact_large", "cer_large"],
+    "base/exact": ["exact_base"], "base/cer": ["cer_base"], "base/nll_char": ["nll_char_base"],
+    "base/exact+cer": ["exact_base", "cer_base"],
+}
+# EXPLORATORY: fixed feature sets. The recogniser idea and the large checkpoint
+# were found by looking at all 15 speakers, so these are optimistic by
+# construction. They are sensitivity analyses and the fusion with the acoustic
+# branches (distance from healthy speech per branch, speech duration), never
+# the headline.
+SPEAKER_MODELS = {
+    "session_fixed_exact_large": ["exact_large"],
+    "session_fixed_cer_large": ["cer_large"],
+    "session_fixed_nllchar_large": ["nll_char_large"],
+    "session_fixed_exact+cer_large": ["exact_large", "cer_large"],
+    "session_fixed_exact_base": ["exact_base"],
+    "session_fixed_exact_large+learned": ["exact_large", "dist_learned"],
+    "session_fixed_exact_large+segmental": ["exact_large", "dist_segmental"],
+    "session_fixed_exact_large+supra": ["exact_large", "dist_supra"],
+    "session_fixed_exact_large+duration": ["exact_large", "speech_duration"],
+    "session_fixed_all_branches": ["exact_large", "dist_learned", "dist_segmental", "dist_supra"],
+    "session_fixed_acoustic_only": ["dist_learned", "dist_segmental", "dist_supra", "speech_duration"],
+}
+
+
+def speaker_scalars(features: Dict[str, Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
+    """Per-utterance scalars the session-level models average per speaker."""
+    scalars: Dict[str, np.ndarray] = {}
+    for tag in config.AAFLITE_ASR_MODELS:
+        scores = features["raw"][f"asr/{tag}"]
+        for column, name in enumerate(SCORE_NAMES):
+            scalars[f"{name}_{tag}"] = scores[:, column]
+    ref = features["ref"]
+    scalars["dist_learned"] = ref["learned/all"][:, -1]          # RMS z-distance from healthy, last column
+    scalars["dist_segmental"] = ref["segmental/functionals"][:, -1]
+    scalars["dist_supra"] = ref["supra/functionals"][:, -1]
+    supra_names = feature_names()[1]
+    scalars["speech_duration"] = features["raw"]["supra/functionals"][:, supra_names.index("speech_duration_s")]
+    return scalars
 
 
 def _feature_signature() -> str:
     """What the cached branch features depend on besides the utterance list."""
     return json.dumps({"version": FEATURE_VERSION, "wav2vec2": config.WAV2VEC_MODEL_NAME,
+                       "asr": config.AAFLITE_ASR_MODELS,
                        "layer_groups": {k: list(v) for k, v in config.AAFLITE_LAYER_GROUPS.items()},
                        "store": feature_store.store_signature()}, sort_keys=True, default=str)
 
@@ -74,6 +135,8 @@ def prepare_features(df_full: pd.DataFrame, device=None, use_cache: bool = True
         from src.training.utils import resolve_device
         device = resolve_device(None)
     extract_wav2vec2_layer_stats(df_full, device)
+    for tag, checkpoint in config.AAFLITE_ASR_MODELS.items():
+        extract_asr_scores(df_full, device, checkpoint, tag)
 
     is_control = df_full["Speaker_ID"].isin(config.CONTROL_IDS).to_numpy()
     is_dys = df_full["Speaker_ID"].isin(config.DYSARTHRIC_IDS).to_numpy()
@@ -85,6 +148,8 @@ def prepare_features(df_full: pd.DataFrame, device=None, use_cache: bool = True
         raw[f"learned/{group}"] = layer_group_features(stats, layers)
     del stats
     raw["segmental/functionals"], raw["supra/functionals"] = acoustic_functionals(df_full)
+    for tag in config.AAFLITE_ASR_MODELS:
+        raw[f"asr/{tag}"] = load_asr_scores(df_full, tag)
 
     features = {"ref": {}, "raw": {}}
     for key, X in raw.items():
@@ -101,7 +166,8 @@ def prepare_features(df_full: pd.DataFrame, device=None, use_cache: bool = True
 
 def build_branches(features: Dict[str, np.ndarray]) -> list:
     group = lambda prefix: {k.split("/", 1)[1]: X for k, X in features.items() if k.startswith(prefix)}
-    return [Branch("learned", group("learned/"), pca_dims=config.AAFLITE_PCA_DIMS),
+    return [Branch("asr", group("asr/"), pca_dims=(None,)),
+            Branch("learned", group("learned/"), pca_dims=config.AAFLITE_PCA_DIMS),
             Branch("segmental", group("segmental/"), pca_dims=config.AAFLITE_PCA_DIMS),
             Branch("supra", group("supra/"), pca_dims=(None,))]
 
@@ -114,6 +180,10 @@ def run_experiments(df_dys: pd.DataFrame, features: Dict[str, Dict[str, np.ndarr
     so it can never overwrite or be mistaken for the full result."""
     outputs: Dict[str, Dict] = {}
     prefix = "aaflite" if folds is None else "aaflite_smoke"
+    scalars = speaker_scalars(features)
+    outputs.update(evaluate_speaker_level_nested(df_dys, scalars, NESTED_CANDIDATES, prefix, PRIMARY_TAG,
+                                                 folds=folds))
+    outputs.update(evaluate_speaker_level(df_dys, scalars, SPEAKER_MODELS, prefix, folds=folds))
     referenced = evaluate(df_dys, build_branches(features["ref"]), SUBSETS, prefix,
                           folds=folds, n_jobs=n_jobs)
     outputs.update({f"{tag}_ref": out for tag, out in referenced.items()})
@@ -127,6 +197,10 @@ def run_experiments(df_dys: pd.DataFrame, features: Dict[str, Dict[str, np.ndarr
                                 "aaflite_permuted", y=permuted_labels(df_dys), n_jobs=n_jobs,
                                 save=False)
             outputs["permuted_labels_sanity"] = permuted["fusion"]
+            permuted_session = evaluate_speaker_level_nested(
+                df_dys, scalars, NESTED_CANDIDATES, "aaflite_permuted_session", PRIMARY_TAG,
+                y=permuted_labels(df_dys), save=False)
+            outputs["permuted_labels_session"] = permuted_session[PRIMARY_TAG]
     summary_path = SUMMARY_PATH if folds is None else SUMMARY_PATH.with_name("aaflite_smoke_summary.json")
     Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
     save_summary(outputs, summary_path)
